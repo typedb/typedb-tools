@@ -13,7 +13,7 @@ bazel_dep(name = "platforms", version = "0.0.10")
 bazel_dep(name = "bazel_skylib", version = "1.7.1")
 bazel_dep(name = "rules_java", version = "8.6.2")
 bazel_dep(name = "rules_jvm_external", version = "6.6")
-bazel_dep(name = "rules_python", version = "1.0.0")
+bazel_dep(name = "rules_python", version = "2.3.2")
 bazel_dep(name = "rules_kotlin", version = "2.0.0")
 bazel_dep(name = "rules_pkg", version = "1.0.1")
 bazel_dep(name = "rules_proto", version = "7.1.0")
@@ -33,14 +33,14 @@ bazel_dep(name = "typedb_bazel_distribution", version = "0.0.0")
 git_override(
     module_name = "typedb_bazel_distribution",
     remote = "https://github.com/typedb/bazel-distribution",
-    commit = "dd811cf28715bbce8374e5e0f9defaf772e7dd36",
+    commit = "87a2092926b36a5c82cada9d21e1c3a6d6e32859",
 )
 
 bazel_dep(name = "typedb_dependencies", version = "0.0.0")
 git_override(
     module_name = "typedb_dependencies",
     remote = "https://github.com/typedb/typedb-dependencies",
-    commit = "2e8abf8df1cd5a659f673396b8cfc53bd5d973cc",
+    commit = "bf924ef788fd605224383a2ea7f59599862c6bab",
 )
 
 bazel_dep(name = "typeql", version = "0.0.0")
@@ -78,6 +78,8 @@ python.toolchain(
     python_version = "3.11",
     ignore_root_user_error = True
 )
+rules_python_config = use_extension("@rules_python//python/extensions:config.bzl", "config")
+rules_python_config.explicit_init_py(default = True)
 
 # Rust rules need typedb_dependencies for patching
 bazel_dep(name = "rules_rust", version = "0.56.0")
