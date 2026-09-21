@@ -88,13 +88,13 @@
 		[workspace.dependencies.typeql]
 			features = []
 			git = "https://github.com/typedb/typeql"
-			tag = "3.13.0"
+			tag = "3.13.4"
 			default-features = false
 
 		[workspace.dependencies.typedb-driver]
 			features = []
 			git = "https://github.com/typedb/typedb-driver"
-			tag = "3.12.3"
+			tag = "3.13.6"
 			default-features = false
 
 		[workspace.dependencies.chrono]
