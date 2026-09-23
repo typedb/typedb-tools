@@ -17,7 +17,13 @@ use crate::{ExitCode, fatal, fatal_with, params::Params};
 pub(crate) async fn connect_and_initialize(params: &Params, password: &str, resuming: bool) -> TypeDBDriver {
     let driver = connect(params, password).await;
     if !resuming && params.create_db {
-        create_database_if_missing(&driver, &params.database).await;
+        let created = create_database_if_missing(&driver, &params.database).await;
+        if created && params.schema_file.is_none() {
+            eprintln!(
+                "warning: created database '{}' without a schema; rows will be rejected unless a schema is applied before loading (see --schema-file)",
+                params.database
+            );
+        }
     }
     if !resuming {
         if let Some(path) = params.schema_file.as_deref() {
@@ -40,8 +46,9 @@ async fn connect(params: &Params, password: &str) -> TypeDBDriver {
         .unwrap_or_else(|err| fatal_with(ExitCode::ConnectionError, format!("failed to connect to TypeDB: {err}")))
 }
 
-/// Creates `database` if it does not already exist. No-op when it already exists.
-async fn create_database_if_missing(driver: &TypeDBDriver, database: &str) {
+/// Creates `database` if it does not already exist; returns whether it was created.
+/// No-op when it already exists.
+async fn create_database_if_missing(driver: &TypeDBDriver, database: &str) -> bool {
     let exists = driver
         .databases()
         .contains(database.to_owned())
@@ -54,6 +61,7 @@ async fn create_database_if_missing(driver: &TypeDBDriver, database: &str) {
             .await
             .unwrap_or_else(|err| fatal(format!("failed to create database '{database}': {err}")));
     }
+    !exists
 }
 
 /// Runs the supplied schema text in a schema transaction and commits it.

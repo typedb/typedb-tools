@@ -198,7 +198,7 @@ impl CheckpointWriter {
                 fatal_with(
                     ExitCode::UserInputError,
                     format!(
-                        "checkpoint already exists at '{}': pass --resume '{}' to continue from it, --output-dir PATH to write elsewhere, or --no-checkpoint to disable checkpointing",
+                        "checkpoint already exists at '{}'.\nPossible solutions:\n  * pass '--resume {}' to continue from it\n  * pass '--output-dir <path>' to write elsewhere\n  * pass '--no-checkpoint' to disable checkpointing",
                         checkpoint_path.display(),
                         checkpoint_path.parent().unwrap().display()
                     ),

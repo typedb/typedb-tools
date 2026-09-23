@@ -42,9 +42,12 @@ pub(crate) fn resolve_in_flight_skips(in_flight: &[InFlightBatch]) -> InFlightDe
     for batch in in_flight {
         eprintln!("  - batch {} (first row: {})", batch.batch_index, format_first_row(&batch.first_row));
     }
-    eprintln!(
-        "\nOptions: [a]ll = reprocess all, [s]kip all = treat as already committed, [d]ecide each,\n         [r]estart = discard the checkpoint and start over, [q]uit = abort the loader (default: all)"
-    );
+    eprintln!("\nOptions:");
+    eprintln!("  * [a]ll     = reprocess all (default)");
+    eprintln!("  * [s]kip    = treat all as already committed");
+    eprintln!("  * [d]ecide  = decide each batch individually");
+    eprintln!("  * [r]estart = discard the checkpoint and start over");
+    eprintln!("  * [q]uit    = abort the loader");
     let mode = loop {
         let choice = prompt("Choose action").trim().to_ascii_lowercase();
         match choice.as_str() {
