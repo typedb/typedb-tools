@@ -31,7 +31,7 @@ pub(crate) fn print_summary(stats: &LoadStats, started: Instant) {
     println!("  Rows rejected:  {:>8}", stats.rows_rejected);
 }
 
-fn format_duration(d: Duration) -> String {
+pub(crate) fn format_duration(d: Duration) -> String {
     let secs = d.as_secs();
     let h = secs / 3600;
     let m = (secs % 3600) / 60;

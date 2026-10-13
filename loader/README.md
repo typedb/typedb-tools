@@ -5,6 +5,15 @@ executing a user-supplied TypeQL insert pipeline whose `given` stage names the c
 bind. Rows are read in batches, each batch is committed in its own write transaction, and
 progress is checkpointed so an interrupted run can be resumed.
 
+## Loading from database files
+
+`typedb loader --db <file>` loads a database file (DuckDB) into TypeDB: the data is
+validated against `--schema-file` and the schema's constraints, converted, and imported
+into `--database` in one run. `--dry-run` validates only; `--files-only <dir>` writes
+the data file for a later `database import` instead of loading. See
+[migration/README.md](migration/README.md) for conventions, directives, and modelling
+recommendations.
+
 ## Running TypeDB Loader
 
 Go to the directory where you have your `typedb-all` or `typedb-loader` distribution unarchived,
