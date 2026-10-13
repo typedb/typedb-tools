@@ -283,9 +283,9 @@ pub(crate) fn initialize_checkpoint(
         let hashes = hashes.as_ref().expect("resume requires checkpointing, which always produces hashes");
         let warnings = resume_warnings(params, prior, hashes);
         if !warnings.is_empty() {
-            eprintln!("\nResume warnings:");
+            eprintln!();
             for w in &warnings {
-                eprintln!("  - {w}");
+                typedb_cli_common::println_warning!("{w}");
             }
             if !confirm("Continue anyway?") {
                 fatal_with(ExitCode::UserInputError, "aborted: resume cancelled by user");

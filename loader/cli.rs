@@ -11,6 +11,38 @@ pub const USERNAME_VALUE_NAME: &str = "username";
 #[derive(Parser, Debug)]
 #[command(author, about)]
 pub struct Args {
+    /// Load from a database file instead of a CSV (DuckDB: .duckdb/.ddb/.db extensions).
+    /// The data is validated against:
+    /// `--schema-file` and the schema's constraints, converted, and imported into a new
+    /// `--database` on the server, all in one run. CSV-pipeline flags do not apply.
+    /// See loader/migration/README.md for the mapping conventions and directives.
+    #[arg(long, value_name = "path to database file (.duckdb)",
+        help_heading = "Database file loading",
+        conflicts_with_all = ["query", "data", "header", "no_header", "null_values", "max_rows",
+            "batch_rows", "parallel_batches", "stop_on_error", "no_stop_on_error", "max_rejects",
+            "create_db", "output_dir", "no_checkpoint", "resume"])]
+    pub db: Option<String>,
+
+    /// With --db: write `<database>.data.typedb` into this directory instead of importing
+    /// it, for a later `database import` with the original --schema-file. No connection
+    /// flags are needed.
+    #[arg(
+        long = "files-only",
+        value_name = "path to output directory",
+        help_heading = "Database file loading",
+        requires = "db"
+    )]
+    pub files_only: Option<String>,
+
+    /// With --db: validate the database against the schema and print the mapping report,
+    /// then stop without loading anything.
+    #[arg(long = "dry-run", default_value = "false", help_heading = "Database file loading", requires = "db")]
+    pub dry_run: bool,
+
+    /// With --db --files-only: replace an existing data file instead of refusing.
+    #[arg(long, default_value = "false", help_heading = "Database file loading", requires = "files_only")]
+    pub overwrite: bool,
+
     /// Path to a TypeQL query file used as the loading template.
     /// File path can be absolute or relative to the current directory.
     #[arg(long, value_name = "path to query file (.tql)")]
