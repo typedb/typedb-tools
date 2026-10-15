@@ -26,7 +26,7 @@ typedb_protocol_commit = "3a39f0b94fd7ea316ba5a4f74d44d5afc454cedf"
 
 typeql_tag = "3.13.4"
 typedb_protocol_tag = "3.13.4"
-typedb_driver_tag = "3.13.6"
+typedb_driver_tag = "3.14.0-rc0"
 
 # typedb ecosystem dependencies
 bazel_dep(name = "typedb_bazel_distribution", version = "0.0.0")

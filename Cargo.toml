@@ -94,7 +94,7 @@
 		[workspace.dependencies.typedb-driver]
 			features = []
 			git = "https://github.com/typedb/typedb-driver"
-			tag = "3.13.6"
+			tag = "3.14.0-rc0"
 			default-features = false
 
 		[workspace.dependencies.chrono]
