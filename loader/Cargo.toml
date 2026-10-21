@@ -41,6 +41,9 @@
 	[dependencies.typedb-driver]
 		workspace = true
 
+	[dependencies.typedb-migration]
+		workspace = true
+
 	[dependencies.typedb_cli_common]
 		workspace = true
 
@@ -49,12 +52,25 @@
 
 [dev-dependencies]
 
+	[dev-dependencies.duckdb]
+		workspace = true
+
+	[dev-dependencies.prost]
+		workspace = true
+
+	[dev-dependencies.typedb-protocol]
+		workspace = true
+
 	[dev-dependencies.typedb_binary_runner]
 		workspace = true
 
 [[bin]]
 	name = "typedb-loader"
 	path = "main.rs"
+
+[[test]]
+	name = "test-db-load-cli"
+	path = "tests/db_load/test_db_load_cli.rs"
 
 [[test]]
 	name = "test-loader"
