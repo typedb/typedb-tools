@@ -2,10 +2,15 @@
 # Do not modify this file.
 
 [workspace]
-	members = ["common", "console", "loader", "tool/runner", "typeql-check"]
+	members = ["common", "console", "loader", "loader/migration", "tool/runner", "typeql-check"]
 	resolver = "2"
 
 	[workspace.dependencies]
+
+		[workspace.dependencies.base64]
+			default-features = false
+			features = ["alloc", "default", "std"]
+			version = "0.22.1"
 
 		[workspace.dependencies.chrono]
 			default-features = false
@@ -27,6 +32,11 @@
 			features = []
 			version = "1.4.0"
 
+		[workspace.dependencies.duckdb]
+			default-features = false
+			features = ["bundled", "default"]
+			version = "1.10506.0"
+
 		[workspace.dependencies.futures]
 			default-features = false
 			features = ["alloc", "async-await", "default", "executor", "futures-executor", "std", "thread-pool"]
@@ -47,6 +57,11 @@
 			features = ["default", "use_alloc", "use_std"]
 			version = "0.14.0"
 
+		[workspace.dependencies.prost]
+			default-features = false
+			features = ["default", "derive", "prost-derive", "std"]
+			version = "0.13.5"
+
 		[workspace.dependencies.rpassword]
 			default-features = false
 			features = []
@@ -56,6 +71,11 @@
 			default-features = false
 			features = ["custom-bindings", "fd-lock", "radix_trie", "with-file-history"]
 			version = "15.0.0"
+
+		[workspace.dependencies.seahash]
+			default-features = false
+			features = ["default"]
+			version = "4.1.0"
 
 		[workspace.dependencies.sentry]
 			default-features = false
@@ -92,6 +112,17 @@
 			features = []
 			git = "https://github.com/typedb/typedb-driver"
 			tag = "3.15.0-rc3"
+
+		[workspace.dependencies.typedb-migration]
+			default-features = false
+			features = []
+			path = "loader/migration"
+
+		[workspace.dependencies.typedb-protocol]
+			default-features = false
+			features = []
+			git = "https://github.com/typedb/typedb-protocol"
+			rev = "fd631d5d4c980e8cb30e4403229862776d07b17b"
 
 		[workspace.dependencies.typedb_binary_runner]
 			default-features = false
