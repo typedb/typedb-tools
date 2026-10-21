@@ -91,7 +91,7 @@
 			default-features = false
 			features = []
 			git = "https://github.com/typedb/typedb-driver"
-			rev = "c7734c4bb6aad19e0b79ee4dd0bd6603080e1b9e"
+			tag = "3.14.0"
 
 		[workspace.dependencies.typedb_binary_runner]
 			default-features = false
@@ -107,7 +107,7 @@
 			default-features = false
 			features = []
 			git = "https://github.com/typedb/typeql"
-			rev = "fec3db1ff4b0881477f57426e8278e7e577d5656"
+			tag = "3.14.0"
 
 		[workspace.dependencies.ureq]
 			default-features = false
