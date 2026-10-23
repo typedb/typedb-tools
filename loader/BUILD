@@ -35,6 +35,7 @@ rust_binary(
         "@crates//:sha2",
         "@crates//:tokio",
     ],
+    compile_data = ["//:VERSION"],
     tags = [
         "crate-name=typedb-loader"
     ],

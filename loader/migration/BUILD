@@ -15,10 +15,8 @@ rust_library(
         "@typeql//rust:typeql",
 
         # External dependencies
-        "@crates//:base64",
         "@crates//:duckdb",
         "@crates//:prost",
-        "@crates//:seahash",
     ],
     visibility = ["//visibility:public"],
     tags = ["crate-name=typedb-migration"],

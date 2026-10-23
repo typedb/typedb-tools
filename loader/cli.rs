@@ -12,9 +12,8 @@ pub const USERNAME_VALUE_NAME: &str = "username";
 #[command(author, about)]
 pub struct Args {
     /// Load from a database file instead of a CSV (DuckDB: .duckdb/.ddb/.db extensions).
-    /// The data is validated against:
-    /// `--schema-file` and the schema's constraints, converted, and imported into a new
-    /// `--database` on the server, all in one run. CSV-pipeline flags do not apply.
+    /// The tables are mapped onto `--schema-file`, converted, and imported into a new
+    /// `--database` on the server, in one run. CSV-pipeline flags do not apply.
     /// See loader/migration/README.md for the mapping conventions and directives.
     #[arg(long, value_name = "path to database file (.duckdb)",
         help_heading = "Database file loading",
@@ -34,9 +33,15 @@ pub struct Args {
     )]
     pub files_only: Option<String>,
 
-    /// With --db: validate the database against the schema and print the mapping report,
-    /// then stop without loading anything.
-    #[arg(long = "dry-run", default_value = "false", help_heading = "Database file loading", requires = "db")]
+    /// With --db: map and convert the database against the schema, printing the mapping
+    /// and the counts, without writing or loading anything.
+    #[arg(
+        long = "dry-run",
+        default_value = "false",
+        help_heading = "Database file loading",
+        requires = "db",
+        conflicts_with = "files_only"
+    )]
     pub dry_run: bool,
 
     /// With --db --files-only: replace an existing data file instead of refusing.
