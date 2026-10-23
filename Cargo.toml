@@ -112,7 +112,7 @@
 			default-features = false
 			features = []
 			git = "https://github.com/typedb/typedb-protocol"
-			rev = "fd631d5d4c980e8cb30e4403229862776d07b17b"
+			rev = "0c9a6c46d658a1db593d57b33fc6ad4faf0a3e98"
 
 		[workspace.dependencies.typedb_binary_runner]
 			default-features = false
