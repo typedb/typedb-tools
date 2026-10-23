@@ -20,7 +20,7 @@ const SCHEMA: &str = r#"define
   entity person, owns name @card(1..1);
 "#;
 
-/// Cargo builds the binary alongside the test; Bazel passes it in as a data dependency.
+// Cargo builds the binary alongside the test; Bazel passes it in as a data dependency.
 fn loader_binary() -> PathBuf {
     std::env::var_os("TYPEDB_LOADER_BIN")
         .map(PathBuf::from)
@@ -84,7 +84,6 @@ fn files_only_writes_the_data_file() -> Result<(), Box<dyn Error>> {
     }
     assert_eq!(count, 1 + 2 + 2 + 1); // header, 2 names, 2 persons, checksums
 
-    // Refuses to overwrite without --overwrite; succeeds with it.
     let rerun = run_loader(&dir, &["--files-only", &out]);
     assert!(!rerun.status.success());
     let rerun = run_loader(&dir, &["--files-only", &out, "--overwrite"]);
@@ -152,7 +151,6 @@ fn unsupported_extensions_point_to_the_right_path() -> Result<(), Box<dyn Error>
     Ok(())
 }
 
-/// A database name the server would reject fails before the conversion, not at the import.
 #[test]
 fn invalid_database_names_fail_before_converting() -> Result<(), Box<dyn Error>> {
     let dir = setup("name")?;

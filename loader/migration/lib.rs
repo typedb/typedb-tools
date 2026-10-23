@@ -4,10 +4,6 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 
-//! Prepares TypeDB import data (the `typedb export` format) from a DuckDB database and a
-//! TypeQL schema. The mapping and the values are checked here; the schema's constraints are
-//! the server's to enforce at import. README.md describes the mapping conventions.
-
 mod catalog;
 mod emit;
 mod mapping;
@@ -23,9 +19,7 @@ use crate::mapping::MappingPlan;
 
 #[derive(Debug)]
 pub enum PrepareError {
-    /// The inputs could not be read: file access, an unopenable database, an unparseable schema.
     Setup(String),
-    /// Validation found errors; the warnings and the mapping resolved so far go with them.
     Invalid { errors: Vec<String>, warnings: Vec<String>, mapping_summary: Vec<String> },
 }
 
@@ -45,7 +39,6 @@ impl Diagnostics {
     }
 }
 
-/// A validated migration, ready to run.
 pub struct Migration {
     connection: Connection,
     plan: MappingPlan,
@@ -80,8 +73,6 @@ impl Migration {
         self.plan.summary()
     }
 
-    /// Streams the items to `output`, under a header naming the producing version and the
-    /// source; the same database and schema always produce the same bytes.
     pub fn run(&self, output: impl Write, typedb_version: &str, original_database: &str) -> Result<Checksums, String> {
         emit::emit(&self.connection, &self.plan, typedb_version, original_database, output)
     }

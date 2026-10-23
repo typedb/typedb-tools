@@ -120,7 +120,6 @@ fn write_data_file(migration: &Migration, path: &Path, original_database: &str) 
     }
 }
 
-/// Removed on drop, unless renamed into place first.
 struct PartialFile(PathBuf);
 
 impl Drop for PartialFile {

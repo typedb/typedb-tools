@@ -14,14 +14,13 @@ use typedb_protocol::{
 
 use crate::schema::ValueType;
 
-/// Days from 0001-01-01 to 1970-01-01, as chrono counts them.
+// Days from 0001-01-01 to 1970-01-01.
 pub(crate) const EPOCH_DAYS_FROM_CE: i32 = 719_163;
 pub(crate) const DECIMAL_FRACTIONAL_DIGITS: u8 = 19;
 
-/// TypeDB's date range (chrono's `NaiveDate::MIN..=MAX`), in days from the epoch.
+// chrono's `NaiveDate::MIN..=MAX` and `NaiveDateTime::MIN..=MAX`, from the epoch.
 const MIN_EPOCH_DAYS: i64 = -95_746_129 - EPOCH_DAYS_FROM_CE as i64;
 const MAX_EPOCH_DAYS: i64 = 95_745_399 - EPOCH_DAYS_FROM_CE as i64;
-/// TypeDB's datetime range (chrono's `NaiveDateTime::MIN..=MAX`), in seconds from the epoch.
 const MIN_EPOCH_SECONDS: i64 = -8_334_601_228_800;
 const MAX_EPOCH_SECONDS: i64 = 8_210_266_876_799;
 
@@ -30,28 +29,13 @@ pub(crate) enum TypeDBValue {
     Boolean(bool),
     Integer(i64),
     Double(f64),
-    Decimal {
-        integer: i64,
-        fractional: u64,
-    },
+    Decimal { integer: i64, fractional: u64 },
     String(String),
-    Date {
-        days_since_ce: i32,
-    },
-    Datetime {
-        seconds: i64,
-        nanos: u32,
-    },
-    /// DuckDB stores TIMESTAMPTZ as a UTC instant, so the zone is always UTC.
-    DatetimeTz {
-        seconds: i64,
-        nanos: u32,
-    },
-    Duration {
-        months: u32,
-        days: u32,
-        nanos: u64,
-    },
+    Date { days_since_ce: i32 },
+    Datetime { seconds: i64, nanos: u32 },
+    // DuckDB stores TIMESTAMPTZ as a UTC instant.
+    DatetimeTz { seconds: i64, nanos: u32 },
+    Duration { months: u32, days: u32, nanos: u64 },
 }
 
 impl TypeDBValue {
@@ -75,7 +59,7 @@ impl TypeDBValue {
     }
 }
 
-/// Equal values print the same, distinct values differently: the text identifies the value.
+// The text identifies the value: it makes the attributes' ids.
 impl fmt::Display for TypeDBValue {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -97,8 +81,6 @@ impl fmt::Display for TypeDBValue {
     }
 }
 
-/// Converts one cell, already read in the SQL type the mapping chose for the attribute
-/// (see `OwnsMapping::read`), to the attribute's value type. NULL converts to `None`.
 pub(crate) fn convert_cell(cell: ValueRef<'_>, target: ValueType) -> Result<Option<TypeDBValue>, String> {
     let converted = match (cell, target) {
         (ValueRef::Null, _) => return Ok(None),
@@ -146,7 +128,7 @@ pub(crate) fn convert_cell(cell: ValueRef<'_>, target: ValueType) -> Result<Opti
     Ok(Some(converted))
 }
 
-/// The mapping admits no list of these; `ValueRef::from` would panic on them.
+// `ValueRef::from` panics on these.
 pub(crate) fn convert_list_element(element: Value, target: ValueType) -> Result<Option<TypeDBValue>, String> {
     match element {
         Value::Enum(_) | Value::List(_) | Value::Struct(_) | Value::Map(_) | Value::Array(_) | Value::Union(_) => {
@@ -156,8 +138,7 @@ pub(crate) fn convert_list_element(element: Value, target: ValueType) -> Result<
     }
 }
 
-/// -0.0 is read as 0.0: DuckDB does not keep the two apart (nor does its storage), while
-/// TypeDB would store two attributes.
+// DuckDB does not keep -0.0 and 0.0 apart, while TypeDB would store two attributes.
 fn double(value: f64) -> Result<TypeDBValue, String> {
     if !value.is_finite() {
         return Err(format!("{value} is not a finite double, which TypeDB requires"));
@@ -165,8 +146,6 @@ fn double(value: f64) -> Result<TypeDBValue, String> {
     Ok(TypeDBValue::Double(if value == 0.0 { 0.0 } else { value }))
 }
 
-/// DuckDB's unscaled i128 and scale (at most 19, which the mapping ensures) to TypeDB's floor
-/// integer and 10^-19 units.
 fn decimal(unscaled: i128, scale: u32) -> Result<TypeDBValue, String> {
     let pow = 10i128.pow(scale);
     let integer = unscaled.div_euclid(pow);
@@ -179,8 +158,7 @@ fn decimal(unscaled: i128, scale: u32) -> Result<TypeDBValue, String> {
     })
 }
 
-/// DuckDB's INTERVAL text, `[N year(s)] [N month(s)] [N day(s)] [-]H:MM:SS[.ffffff]`, every
-/// part optional and possibly negative.
+// `[N year(s)] [N month(s)] [N day(s)] [-]H:MM:SS[.ffffff]`, every part optional and possibly negative.
 fn duration(text: &str) -> Result<TypeDBValue, String> {
     let (mut months, mut days, mut micros) = (0i64, 0i64, 0i128);
     let mut tokens = text.split_whitespace();
@@ -216,7 +194,7 @@ fn duration(text: &str) -> Result<TypeDBValue, String> {
     Ok(TypeDBValue::Duration { months: months as u32, days: days as u32, nanos })
 }
 
-/// DuckDB encodes ±infinity as ±`i32::MAX` days.
+// DuckDB encodes ±infinity as ±`i32::MAX` days.
 fn date(days_from_epoch: i32) -> Result<TypeDBValue, String> {
     if days_from_epoch.unsigned_abs() == i32::MAX as u32 {
         return Err("infinite DATE cannot be a TypeDB date".to_owned());
@@ -227,7 +205,7 @@ fn date(days_from_epoch: i32) -> Result<TypeDBValue, String> {
     Ok(TypeDBValue::Date { days_since_ce: days_from_epoch + EPOCH_DAYS_FROM_CE })
 }
 
-/// DuckDB encodes ±infinity as ±`i64::MAX`, whatever the unit.
+// DuckDB encodes ±infinity as ±`i64::MAX`, whatever the unit.
 fn timestamp_parts(unit: TimeUnit, raw: i64) -> Result<(i64, u32), String> {
     if raw.unsigned_abs() == i64::MAX as u64 {
         return Err("infinite TIMESTAMP cannot be a TypeDB datetime".to_owned());
@@ -252,7 +230,6 @@ mod test {
 
     #[test]
     fn decimal_conversion_floors_negatives() {
-        // -9.59 == (-10, 0.41): TypeDB decimals hold a floor integer and a non-negative fraction
         let TypeDBValue::Decimal { integer, fractional } = decimal(-959, 2).unwrap() else { panic!() };
         assert_eq!(integer, -10);
         assert_eq!(fractional, 41 * 10u64.pow(17));

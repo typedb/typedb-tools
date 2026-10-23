@@ -17,23 +17,16 @@ pub(crate) fn quoted(identifier: &str) -> String {
     format!("\"{}\"", identifier.replace('"', "\"\""))
 }
 
-/// A column populating an attribute type. The SQL expressions below read its values in
-/// the attribute's value type, the same way for attributes and ownerships, so the two agree
-/// on every id.
 #[derive(Debug)]
 pub(crate) struct OwnsMapping {
     pub(crate) column: String,
     pub(crate) attribute: String,
     pub(crate) value_type: ValueType,
-    /// A LIST column: one ownership per element.
     pub(crate) multi: bool,
-    /// The column's type, or the element type of a LIST column.
     pub(crate) column_type: ColumnType,
 }
 
 impl OwnsMapping {
-    /// A cell or list element as read and deduplicated. Strings compare byte-wise, as in
-    /// TypeDB, whatever the column's collation.
     pub(crate) fn read(&self, expr: &str) -> String {
         let value = match self.cast() {
             Some(sql_type) => format!("{expr}::{sql_type}"),
@@ -42,7 +35,6 @@ impl OwnsMapping {
         if self.value_type == ValueType::String { format!("{value} COLLATE \"binary\"") } else { value }
     }
 
-    /// The column as read with its owner's row; a list column stays whole.
     pub(crate) fn projection(&self) -> String {
         let column = quoted(&self.column);
         match (self.multi, self.cast()) {
@@ -52,13 +44,8 @@ impl OwnsMapping {
         }
     }
 
-    /// The SQL type the column is read in, unless read as is. Numeric columns of one
-    /// attribute are all read in one type, chosen to hold every value: SQL's own
-    /// unification of a UNION could round (DECIMAL(38,0) with DECIMAL(10,9) gives
-    /// DECIMAL(38,0)), and DECIMAL(38,19) holds every TypeDB decimal exactly. Intervals are
-    /// read as text: DuckDB compares them normalised (1 month = 30 days), while TypeDB keeps
-    /// months, days and nanoseconds apart, as the text does, and the binary form's 64-bit
-    /// nanoseconds wrap for long spans.
+    // A UNION's own type unification can round decimals, so every column of an attribute is read in one type.
+    // Intervals are read as text: DuckDB compares them normalised (1 month = 30 days), TypeDB does not.
     fn cast(&self) -> Option<&'static str> {
         match (&self.column_type, self.value_type) {
             (ColumnType::StringLike | ColumnType::Interval, _) => Some("VARCHAR"),
@@ -70,14 +57,11 @@ impl OwnsMapping {
     }
 }
 
-/// An FK column of a relation table, holding the players of one role.
 #[derive(Debug)]
 pub(crate) struct RoleBinding {
     pub(crate) column: String,
     pub(crate) role: String,
-    /// The role label as the import format wants it: scoped to the declaring relation.
     pub(crate) scoped_role: String,
-    /// The table the FK references, and its type.
     pub(crate) player_table: String,
     pub(crate) player_label: String,
 }
@@ -93,7 +77,6 @@ pub(crate) struct TableMapping {
 
 #[derive(Debug, Default)]
 pub(crate) struct MappingPlan {
-    /// In import order: entity tables, then relation tables after their players' tables.
     pub(crate) tables: Vec<TableMapping>,
 }
 
@@ -122,7 +105,6 @@ impl MappingPlan {
 enum TableDirective {
     Skip,
     Entity(String),
-    /// The label and the `role = column` bindings.
     Relation(String, Vec<(String, String)>),
 }
 
@@ -137,7 +119,6 @@ const DIRECTIVE_PREFIX: &str = "@typedb";
 const RELATION_IS_A_TABLE: &str = "relations are tables; stage the relation as its own table, \
      then '@typedb skip' this column (see the README's modelling section)";
 
-/// The prefix is matched case-insensitively, so that `@TypeDB` is not taken for a plain comment.
 fn strip_directive_prefix(comment: &str) -> Option<&str> {
     let comment = comment.trim();
     let prefix = comment.get(..DIRECTIVE_PREFIX.len())?;
@@ -179,7 +160,6 @@ fn parse_column_directive(table: &Table, column: &Column) -> Result<Option<Colum
     }
 }
 
-/// Parses `<label> (<key> = <value>, ...)`; the binding list is optional.
 fn parse_bindings(spec: &str) -> Result<(String, Vec<(String, String)>), String> {
     let spec = spec.trim();
     let Some(open) = spec.find('(') else { return Ok((spec.to_owned(), Vec::new())) };
@@ -193,7 +173,6 @@ fn parse_bindings(spec: &str) -> Result<(String, Vec<(String, String)>), String>
     Ok((label, bindings))
 }
 
-/// The type named exactly, else the one named with `_` read as `-`.
 fn find_by_name<'a, T>(types: &'a [T], name: &str, label: impl Fn(&T) -> &str) -> Option<&'a T> {
     types.iter().find(|t| label(t) == name).or_else(|| {
         let dashed = name.replace('_', "-");
@@ -201,13 +180,10 @@ fn find_by_name<'a, T>(types: &'a [T], name: &str, label: impl Fn(&T) -> &str) -
     })
 }
 
-/// A table with its TypeDB type decided; its columns are mapped afterwards, since role
-/// columns refer to other tables' decisions.
 struct ResolvedTable<'a> {
     table: &'a Table,
     object: &'a ObjectType,
     is_relation: bool,
-    /// `role = column` from the relation directive.
     bound_columns: Vec<(String, String)>,
 }
 
@@ -295,8 +271,6 @@ pub(crate) fn resolve(catalog: &Catalog, schema: &Schema, diagnostics: &mut Diag
     plan
 }
 
-/// A directive binding a misspelt, repeated or skipped column would otherwise silently
-/// leave the role to inference.
 fn check_role_binding_columns(target: &ResolvedTable<'_>, skipped: &[&str], diagnostics: &mut Diagnostics) {
     let bindings = &target.bound_columns;
     for (index, (role, column)) in bindings.iter().enumerate() {
@@ -318,9 +292,6 @@ fn check_role_binding_columns(target: &ResolvedTable<'_>, skipped: &[&str], diag
     }
 }
 
-/// Entity tables first, then relation tables after their players' tables, so that a
-/// relation's players are imported before it. DuckDB cannot declare foreign keys that
-/// reference each other across tables, so only self-references remain unordered.
 fn order_for_import(plan: &mut MappingPlan) {
     let (mut ordered, mut pending): (Vec<TableMapping>, Vec<TableMapping>) =
         std::mem::take(&mut plan.tables).into_iter().partition(|table| !table.is_relation);
@@ -405,8 +376,7 @@ fn resolve_tables<'a>(
     targets
 }
 
-/// `_iid UBIGINT NOT NULL UNIQUE` (or PRIMARY KEY) identifies the instances within their
-/// table; DuckDB enforces the constraints, so the values need no check.
+// DuckDB enforces these constraints, so the values themselves need no check.
 fn has_instance_id_column(table: &Table, diagnostics: &mut Diagnostics) -> bool {
     let contract = format!(
         "declare `{IID_COLUMN} UBIGINT NOT NULL` with a UNIQUE or PRIMARY KEY constraint, holding \
@@ -494,9 +464,6 @@ fn bind_role(
     mapping.roles.push(role_binding(relates, column, player));
 }
 
-/// Without a directive, an FK column binds to the one role its players' type plays in the
-/// relation; a type playing several roles binds to the one no other column binds, by the
-/// directive or by inference so far.
 fn infer_role(
     mapping: &mut TableMapping,
     target: &ResolvedTable<'_>,
@@ -552,8 +519,6 @@ fn infer_role(
     }
 }
 
-/// The FK must reference a mapped table's instance-id column, which identifies the player
-/// within its table.
 fn resolve_player<'t, 'a>(
     target: &ResolvedTable<'_>,
     column: &Column,
