@@ -46,7 +46,6 @@ impl<W: Write> Emitter<W> {
     }
 }
 
-/// Header, attributes, entities, relations, checksums: the order the importer expects.
 pub(crate) fn emit(
     conn: &Connection,
     plan: &MappingPlan,
@@ -74,18 +73,13 @@ pub(crate) fn emit(
     emitter.finish()
 }
 
-/// How a table's rows are numbered: the instances of a type get 0, 1, 2, ... in file order,
-/// table after table and by `_iid` within a table.
 struct TableNumbering {
     first_id: u64,
     iids: Iids,
 }
 
-/// A table's `_iid` values, kept to translate an FK value into the player's number.
 enum Iids {
-    /// `first..first + count`, as `row_number()` staging gives: nothing to keep.
     Consecutive { first: u64, count: u64 },
-    /// Sorted, for a table that holds players; empty for any other.
     Sorted(Vec<u64>),
 }
 
@@ -132,8 +126,6 @@ fn number_instances<'a>(conn: &Connection, plan: &'a MappingPlan) -> Result<Hash
     Ok(numbering)
 }
 
-/// The string ids, for an importer that resolves by lookup instead of by the label-scoped
-/// ids and the inline values.
 fn object_id(label: &str, label_scoped_id: u64) -> String {
     format!("{label}:{label_scoped_id}")
 }
@@ -142,7 +134,6 @@ fn attribute_id(label: &str, value: &TypeDBValue) -> String {
     format!("{label}:{value}")
 }
 
-/// One deduplicating scan per attribute type over every column populating it.
 fn emit_attributes(conn: &Connection, plan: &MappingPlan, emitter: &mut Emitter<impl Write>) -> Result<(), String> {
     struct AttributeSource<'a> {
         label: &'a str,
@@ -171,7 +162,6 @@ fn emit_attributes(conn: &Connection, plan: &MappingPlan, emitter: &mut Emitter<
     }
 
     for source in sources {
-        // UNION deduplicates across the selects; ORDER BY makes the stream deterministic.
         let sql = format!("{} ORDER BY 1", source.selects.join(" UNION "));
         let scan_error = |err: duckdb::Error| format!("attribute scan for '{}' failed: {err}", source.label);
         for_each_row(conn, &sql, scan_error, |row| {
@@ -191,12 +181,10 @@ fn emit_attributes(conn: &Connection, plan: &MappingPlan, emitter: &mut Emitter<
     Ok(())
 }
 
-/// DuckDB's row group size: a page reads one row group of a scan.
+// DuckDB's row group size.
 const PAGE_ROWS: i64 = 122_880;
 
-/// Passes the rows of `sql` to `on_row`, in the query's order. A result read whole stays in
-/// memory until dropped; kept in a temporary table, which DuckDB spills to disk, it is read
-/// a page at a time instead, by row id, which follows the order the rows were stored in.
+// A result read whole stays in memory beyond DuckDB's memory limit; a temporary table spills to disk.
 fn for_each_row(
     conn: &Connection,
     sql: &str,
@@ -230,7 +218,6 @@ fn attribute_select(table: &str, owns: &OwnsMapping) -> String {
     format!("SELECT DISTINCT {} AS v FROM {} WHERE {column} IS NOT NULL", owns.read(&element), quoted(table))
 }
 
-/// The entities or relations of one table, with their ownerships and role players.
 fn emit_objects(
     conn: &Connection,
     table: &TableMapping,
@@ -249,7 +236,6 @@ fn emit_objects(
 
     let player_numbering: Vec<&TableNumbering> =
         table.roles.iter().map(|role| &numbering[role.player_table.as_str()]).collect();
-    // Only a list column, or two columns feeding one attribute, can repeat an ownership.
     let ownerships_may_repeat =
         table.owns.iter().enumerate().any(|(index, owns)| {
             owns.multi || table.owns[..index].iter().any(|other| other.attribute == owns.attribute)
@@ -258,14 +244,12 @@ fn emit_objects(
     let mut previous_iid = None;
     for_each_row(conn, &sql, scan_error, |row| {
         let instance_id: u64 = row.get(0).map_err(scan_error)?;
-        // The numbering, and so every player reference, rests on reading the rows in `_iid` order.
         if previous_iid.is_some_and(|previous| instance_id <= previous) {
             return Err(format!("the scan of '{}' did not keep {IID_COLUMN} order at {instance_id}", table.name));
         }
         previous_iid = Some(instance_id);
         let with_context = |err: String| format!("table '{}', {IID_COLUMN} = {instance_id}: {err}", table.name);
 
-        // Ownerships and role players are sets: a repeat within a row is written once.
         let mut owned = Vec::new();
         let mut owned_ids = HashSet::new();
         let mut own = |owns: &OwnsMapping, value: TypeDBValue| {
@@ -284,7 +268,7 @@ fn emit_objects(
                 let Value::List(elements) =
                     row.get::<_, Value>(column_index).map_err(|err| with_context(err.to_string()))?
                 else {
-                    continue; // NULL list
+                    continue;
                 };
                 for element in elements {
                     if let Some(value) = convert_list_element(element, owns.value_type).map_err(&with_context)? {

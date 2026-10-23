@@ -12,9 +12,7 @@ pub const USERNAME_VALUE_NAME: &str = "username";
 #[command(author, about)]
 pub struct Args {
     /// Load from a database file instead of a CSV (DuckDB: .duckdb/.ddb/.db extensions).
-    /// The tables are mapped onto `--schema-file`, converted, and imported into a new
-    /// `--database` on the server, in one run. CSV-pipeline flags do not apply.
-    /// See loader/migration/README.md for the mapping conventions and directives.
+    /// The tables are mapped onto `--schema-file` and imported into a new `--database`.
     #[arg(long, value_name = "path to database file (.duckdb)",
         help_heading = "Database file loading",
         conflicts_with_all = ["query", "data", "header", "no_header", "null_values", "max_rows",
@@ -22,9 +20,7 @@ pub struct Args {
             "create_db", "output_dir", "no_checkpoint", "resume"])]
     pub db: Option<String>,
 
-    /// With --db: write `<database>.data.typedb` into this directory instead of importing
-    /// it, for a later `database import` with the original --schema-file. No connection
-    /// flags are needed.
+    /// With --db: write `<database>.data.typedb` into this directory instead of importing it.
     #[arg(
         long = "files-only",
         value_name = "path to output directory",
@@ -33,8 +29,8 @@ pub struct Args {
     )]
     pub files_only: Option<String>,
 
-    /// With --db: map and convert the database against the schema, printing the mapping
-    /// and the counts, without writing or loading anything.
+    /// With --db: map and convert the database, printing the mapping and the counts, without
+    /// writing or loading anything.
     #[arg(
         long = "dry-run",
         default_value = "false",

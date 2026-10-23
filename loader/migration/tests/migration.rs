@@ -4,11 +4,6 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 
-//! End-to-end tests of the migration library, without a server: a DuckDB fixture is
-//! built programmatically, converted through the public API, and the output is decoded
-//! and checked for the import format's guarantees (item ordering, scoped role labels,
-//! checksum consistency, deterministic ids).
-
 use std::{
     collections::{HashMap, HashSet},
     error::Error,
@@ -45,8 +40,6 @@ const SCHEMA: &str = r#"define
     relates mentor @card(1..1);
 "#;
 
-/// Every role the schema declares is filled: person plays three roles across two relation
-/// tables, and mentorship needs a directive because both of its FK columns target person.
 const FIXTURE: &str = r#"
     CREATE TABLE person (_iid UBIGINT PRIMARY KEY, name VARCHAR NOT NULL, age INTEGER, tags VARCHAR[]);
     COMMENT ON COLUMN person.tags IS '@typedb owns tag';
@@ -86,7 +79,6 @@ const EVENTS: &str = r#"define
   entity event, owns happened @card(0..), owns day @card(0..), owns score @card(0..), owns span, owns count;
 "#;
 
-/// A test's own database and schema, removed with it.
 struct Scratch(PathBuf);
 
 impl Drop for Scratch {
@@ -107,7 +99,6 @@ fn prepare(dir: &Scratch) -> Result<Migration, PrepareError> {
     Migration::prepare(&dir.0.join("fixture.duckdb"), &fs::read_to_string(dir.0.join("schema.tql")).expect("schema"))
 }
 
-/// The validation errors, which the test expects there to be.
 fn validation_errors(dir: &Scratch) -> Vec<String> {
     match prepare(dir) {
         Err(PrepareError::Invalid { errors, .. }) => errors,
@@ -146,11 +137,6 @@ fn assert_error(errors: &[String], fragments: &[&str]) {
     );
 }
 
-/// What the header promises the importer: attributes, then entities, then relations, so
-/// that ownerships name attributes already streamed (a player can come later: a relation
-/// can play a role in a relation of its own table); every attribute once;
-/// the instances of each type numbered 0, 1, 2, ... in file order; every owned attribute
-/// and player named by id and by value or label-scoped id, naming the same item of the file.
 fn assert_file_guarantees(items: &[item::Item]) {
     let item::Item::Header(header) = &items[0] else { panic!("the header comes first") };
     let guarantees = header.guarantees.as_ref().expect("the header states its guarantees");
@@ -226,7 +212,6 @@ fn converts_and_produces_a_well_formed_import_file() -> Result<(), Box<dyn Error
     let items = decode_items(&first)?;
     assert_file_guarantees(&items);
 
-    // Checksums match the item stream.
     let item::Item::Checksums(checksums) = items.last().unwrap() else { panic!() };
     let attributes: Vec<_> =
         items.iter().filter_map(|i| if let item::Item::Attribute(a) = i { Some(a) } else { None }).collect();
@@ -243,20 +228,16 @@ fn converts_and_produces_a_well_formed_import_file() -> Result<(), Box<dyn Error
     let role_players: usize = relations.iter().flat_map(|r| r.roles.iter().map(|role| role.players.len())).sum();
     assert_eq!(checksums.role_count, role_players as i64);
 
-    // 2 persons + 1 company; 2 employments + 1 mentorship; every distinct name/age/tag/salary value.
     assert_eq!(entities.len(), 3);
     assert_eq!(relations.len(), 3);
     assert_eq!(attributes.len(), 3 + 1 + 2 + 1); // names, age, tags, salary
 
-    // Every declared role is filled, with its relation-scoped label.
     let mut role_labels: Vec<&str> =
         relations.iter().flat_map(|r| r.roles.iter().map(|role| role.label.as_str())).collect();
     role_labels.sort();
     role_labels.dedup();
     assert_eq!(role_labels, ["employment:employee", "employment:employer", "mentorship:mentor", "mentorship:student"]);
 
-    // Objects are numbered per type from 0 in `_iid` order and named by the label and that
-    // number; attributes by the label and the value.
     let ids: Vec<(&str, Option<u64>)> = entities.iter().map(|e| (e.id.as_str(), e.label_scoped_id)).collect();
     assert_eq!(ids, [("company:0", Some(0)), ("person:0", Some(0)), ("person:1", Some(1))]);
     let ids: Vec<(&str, Option<u64>)> = relations.iter().map(|r| (r.id.as_str(), r.label_scoped_id)).collect();
@@ -268,13 +249,11 @@ fn converts_and_produces_a_well_formed_import_file() -> Result<(), Box<dyn Error
         ["age:30", "name:Acme", "name:Alice", "name:Bob", "salary:50000.2500000000000000000", "tag:a", "tag:b"]
     );
 
-    // Deterministic: converting again produces byte-identical output.
     assert_eq!(first, run(&dir)?, "migration output is not deterministic");
 
     Ok(())
 }
 
-/// A relation is a table, as in TypeDB: an FK column on an entity table has no TypeDB form.
 #[test]
 fn fk_column_on_entity_table_is_rejected() -> Result<(), Box<dyn Error>> {
     let dir = scratch(
@@ -290,7 +269,6 @@ fn fk_column_on_entity_table_is_rejected() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-/// Structure and mapping errors name the table, the column and what to do.
 #[test]
 fn structure_and_mapping_errors_name_the_table_and_the_fix() -> Result<(), Box<dyn Error>> {
     let schema = "define\n  entity person;\n  entity friend_ship;\n  relation friend-ship, relates friend;\n";
@@ -339,7 +317,6 @@ fn structure_and_mapping_errors_name_the_table_and_the_fix() -> Result<(), Box<d
     Ok(())
 }
 
-/// Skipped tables and columns are not read at all: no `_iid`, no supported type needed.
 #[test]
 fn skipped_tables_and_columns_are_not_read() -> Result<(), Box<dyn Error>> {
     let dir = scratch(
@@ -356,8 +333,6 @@ fn skipped_tables_and_columns_are_not_read() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-/// Attributes and ownerships read every column type the same way: the scan's values are
-/// the ownerships' values, cast lists and HUGEINT beside BIGINT included.
 #[test]
 fn every_column_type_feeds_attributes_and_ownerships_alike() -> Result<(), Box<dyn Error>> {
     let dir = scratch(
@@ -411,8 +386,6 @@ fn every_column_type_feeds_attributes_and_ownerships_alike() -> Result<(), Box<d
     Ok(())
 }
 
-/// TypeDB compares strings byte-wise: a NOCASE column must not merge 'Bob' and 'BOB'
-/// into one attribute, and list columns of string-like types keep every element.
 #[test]
 fn string_values_are_distinct_byte_wise() -> Result<(), Box<dyn Error>> {
     let dir = scratch(
@@ -437,9 +410,6 @@ fn string_values_are_distinct_byte_wise() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-/// Roles inherited from a super-relation must be emitted with the declaring relation's
-/// scope: a real server rejects `commenting:author` when `author` belongs to
-/// `content-engagement`. Specialised parent roles must not resurface as unfilled roles.
 #[test]
 fn inherited_roles_are_scoped_to_their_declaring_relation() -> Result<(), Box<dyn Error>> {
     let dir = scratch(
@@ -470,7 +440,6 @@ fn inherited_roles_are_scoped_to_their_declaring_relation() -> Result<(), Box<dy
     Ok(())
 }
 
-/// A relation whose players are relations is streamed after them, whatever the table names.
 #[test]
 fn relation_tables_are_streamed_after_their_players() -> Result<(), Box<dyn Error>> {
     let dir = scratch(
@@ -534,8 +503,6 @@ fn nanosecond_timestamps_and_date_lists_convert_exactly() -> Result<(), Box<dyn 
     Ok(())
 }
 
-/// Values TypeDB cannot hold fail the conversion, naming the attribute and the columns
-/// feeding it; a dry run converts too, so it finds them.
 #[test]
 fn values_typedb_cannot_hold_fail_the_conversion() -> Result<(), Box<dyn Error>> {
     let cases = [
@@ -559,7 +526,6 @@ fn values_typedb_cannot_hold_fail_the_conversion() -> Result<(), Box<dyn Error>>
     Ok(())
 }
 
-/// DuckDB rounds when reading a wider scale as DECIMAL(38,19): such columns are refused.
 #[test]
 fn decimal_columns_beyond_typedb_precision_are_rejected() -> Result<(), Box<dyn Error>> {
     let dir = scratch(
@@ -572,8 +538,6 @@ fn decimal_columns_beyond_typedb_precision_are_rejected() -> Result<(), Box<dyn 
     Ok(())
 }
 
-/// A column feeding a `double` attribute is read as DOUBLE, as SQL reads it: the nearest
-/// double, also for integers beyond 2^53.
 #[test]
 fn integers_and_decimals_feeding_doubles_round_to_the_nearest_double() -> Result<(), Box<dyn Error>> {
     let dir = scratch(
@@ -600,8 +564,6 @@ fn integers_and_decimals_feeding_doubles_round_to_the_nearest_double() -> Result
     Ok(())
 }
 
-/// The schema's constraints are the server's to enforce at import: value constraints as
-/// each attribute is created, cardinalities and keys when the import completes.
 #[test]
 fn schema_constraints_are_left_to_the_server() -> Result<(), Box<dyn Error>> {
     let dir = scratch(
@@ -628,7 +590,6 @@ fn abstract_attributes_cannot_be_populated() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-/// A name matching a type exactly wins over the `_` as `-` reading, for columns and tables.
 #[test]
 fn exact_names_win_over_dashed_readings() -> Result<(), Box<dyn Error>> {
     let dir = scratch(
@@ -652,9 +613,6 @@ fn exact_names_win_over_dashed_readings() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-/// `_iid` identifies a row within its table only: sparse, overlapping across the tables of
-/// one type and up to u64::MAX. The file numbers each type's instances densely, across empty
-/// tables and tables streamed out of name order, and every player still names its own row.
 #[test]
 fn instances_are_numbered_per_type_whatever_their_iid() -> Result<(), Box<dyn Error>> {
     let dir = scratch(
@@ -710,8 +668,6 @@ fn instances_are_numbered_per_type_whatever_their_iid() -> Result<(), Box<dyn Er
     Ok(())
 }
 
-/// Scans are read a page at a time: across pages the rows keep their order, and players
-/// their numbers.
 #[test]
 fn scans_longer_than_a_page_keep_their_order() -> Result<(), Box<dyn Error>> {
     let dir = scratch(
@@ -749,7 +705,6 @@ fn scans_longer_than_a_page_keep_their_order() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-/// Tables of other schemas and views are never read, which the user hears about.
 #[test]
 fn views_and_other_schemas_are_reported() -> Result<(), Box<dyn Error>> {
     let dir = scratch(
@@ -766,8 +721,6 @@ fn views_and_other_schemas_are_reported() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-/// Columns of different numeric types populating one attribute are deduplicated together;
-/// SQL's own type unification would round (DECIMAL(38,0) with DECIMAL(10,9) is DECIMAL(38,0)).
 #[test]
 fn mixed_numeric_columns_of_one_attribute_keep_every_value() -> Result<(), Box<dyn Error>> {
     let dir = scratch(
@@ -790,8 +743,6 @@ fn mixed_numeric_columns_of_one_attribute_keep_every_value() -> Result<(), Box<d
     Ok(())
 }
 
-/// The columns of one attribute are scanned together in one SQL type: beside a TIMESTAMP_NS
-/// column, every timestamp must fit TIMESTAMP_NS.
 #[test]
 fn timestamps_beside_nanosecond_columns_must_fit_their_range() -> Result<(), Box<dyn Error>> {
     let dir = scratch(
@@ -808,8 +759,6 @@ fn timestamps_beside_nanosecond_columns_must_fit_their_range() -> Result<(), Box
     Ok(())
 }
 
-/// DuckDB merges values TypeDB keeps apart (-0.0 and 0.0; intervals compared normalised, so
-/// 1 month = 30 days): attributes and ownerships must still agree on every id.
 #[test]
 fn values_sql_merges_but_typedb_distinguishes_stay_consistent() -> Result<(), Box<dyn Error>> {
     let dir = scratch(
@@ -834,7 +783,6 @@ fn values_sql_merges_but_typedb_distinguishes_stay_consistent() -> Result<(), Bo
     Ok(())
 }
 
-/// TypeDB ownerships and role players are sets: repeats within a row are written once.
 #[test]
 fn repeated_values_and_players_are_written_once() -> Result<(), Box<dyn Error>> {
     let dir = scratch(
@@ -863,7 +811,6 @@ fn repeated_values_and_players_are_written_once() -> Result<(), Box<dyn Error>> 
     Ok(())
 }
 
-/// A relation directive's bindings are checked, not silently dropped or trusted.
 #[test]
 fn relation_directive_bindings_are_checked() -> Result<(), Box<dyn Error>> {
     let dir = scratch(
@@ -888,8 +835,6 @@ fn relation_directive_bindings_are_checked() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-/// A directive binding part of the columns settles inference for the rest, whatever the
-/// column order.
 #[test]
 fn directive_bindings_settle_inference_of_the_other_columns() -> Result<(), Box<dyn Error>> {
     let dir = scratch(
@@ -915,7 +860,6 @@ fn directive_bindings_settle_inference_of_the_other_columns() -> Result<(), Box<
     Ok(())
 }
 
-/// A player table per role: the columns of one role may target several player tables.
 #[test]
 fn one_role_is_inferred_for_several_player_tables() -> Result<(), Box<dyn Error>> {
     let dir = scratch(
@@ -945,7 +889,6 @@ fn one_role_is_inferred_for_several_player_tables() -> Result<(), Box<dyn Error>
     Ok(())
 }
 
-/// The source is opened read-only: a pending write-ahead log is read, not checkpointed into it.
 #[test]
 fn the_source_database_is_left_untouched() -> Result<(), Box<dyn Error>> {
     let dir = scratch(

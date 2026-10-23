@@ -51,7 +51,6 @@ pub(crate) struct AttributeType {
     pub(crate) label: String,
     pub(crate) abstract_: bool,
     pub(crate) supertype: Option<String>,
-    /// Declared here or inherited from a supertype.
     pub(crate) value_type: Option<ValueType>,
 }
 
@@ -64,19 +63,16 @@ pub(crate) struct Plays {
 #[derive(Debug, Clone)]
 pub(crate) struct Relates {
     pub(crate) role: String,
-    /// The relation declaring the role: role labels are scoped to it, also when inherited.
+    // Role labels are scoped to the declaring relation, also when inherited.
     pub(crate) declared_by: String,
-    /// `relates role as parent-role`.
     pub(crate) specialises: Option<String>,
 }
 
-/// An entity or relation type with its declared and inherited capabilities.
 #[derive(Debug, Clone)]
 pub(crate) struct ObjectType {
     pub(crate) label: String,
     pub(crate) abstract_: bool,
     pub(crate) supertype: Option<String>,
-    /// The owned attribute types' labels.
     pub(crate) owns: Vec<String>,
     pub(crate) plays: Vec<Plays>,
     pub(crate) relates: Vec<Relates>,
@@ -114,8 +110,7 @@ impl Schema {
             }
         }
 
-        // Types are registered before any capability is applied, so declarations and
-        // extensions can come in any order.
+        // Types are registered first, so declarations and extensions can come in any order.
         let mut schema = Schema::default();
         for declaration in &declarations {
             schema.register(declaration)?;
@@ -250,8 +245,6 @@ impl Schema {
         types.iter().find(|o| o.label == label)
     }
 
-    /// The relation and its supertypes, nearest first: `plays` declared against any of them
-    /// covers the relation.
     pub(crate) fn relation_ancestry(&self, label: &str) -> Vec<String> {
         let mut ancestry = Vec::new();
         let mut current = Some(label.to_owned());

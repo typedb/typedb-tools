@@ -14,26 +14,19 @@ use duckdb::{
 #[derive(Debug, Clone)]
 pub(crate) enum ColumnType {
     Boolean,
-    /// TINYINT to HUGEINT, signed and unsigned, but not UHUGEINT.
+    // TINYINT to HUGEINT, signed and unsigned, but not UHUGEINT.
     Integer,
-    /// FLOAT or DOUBLE.
     Double,
-    Decimal {
-        scale: u8,
-    },
+    Decimal { scale: u8 },
     Varchar,
-    /// ENUM, UUID or JSON: read through a VARCHAR cast.
+    // ENUM, UUID or JSON.
     StringLike,
     Date,
-    /// Every precision, TIMESTAMP_S to TIMESTAMP_NS.
     Timestamp,
     TimestampTz,
     Interval,
     List(Box<ColumnType>),
-    Unsupported {
-        type_name: String,
-        hint: &'static str,
-    },
+    Unsupported { type_name: String, hint: &'static str },
 }
 
 impl ColumnType {
@@ -80,7 +73,7 @@ impl ColumnType {
     }
 }
 
-/// The scale of `DECIMAL(width,scale)`; DuckDB's default is 3.
+// DuckDB's default DECIMAL scale is 3.
 fn decimal_scale(upper: &str) -> u8 {
     upper.split(',').nth(1).and_then(|scale| scale.trim_end_matches(')').trim().parse().ok()).unwrap_or(3)
 }
@@ -121,7 +114,6 @@ impl Table {
     }
 }
 
-/// The tables of the `main` schema; views and other schemas are only listed as ignored.
 #[derive(Debug)]
 pub(crate) struct Catalog {
     pub(crate) tables: Vec<Table>,
@@ -212,7 +204,6 @@ fn read_constraints(conn: &Connection, table: &mut Table) -> duckdb::Result<()> 
     Ok(())
 }
 
-/// The VARCHAR[] of a constraint's column names; NULL for a constraint without columns.
 fn list_column(cell: ValueRef<'_>) -> Vec<String> {
     match Value::from(cell) {
         Value::List(items) => items
