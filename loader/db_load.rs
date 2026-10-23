@@ -12,9 +12,9 @@ use std::{
 
 use typedb_cli_common::{build_tls_config, parse_addresses, println_error, println_warning};
 use typedb_driver::{Credentials, DriverOptions, TypeDBDriver};
-use typedb_migration::{Checksums, Diagnostic, Migration, PrepareError};
+use typedb_migration::{Checksums, Migration, PrepareError};
 
-use crate::{ExitCode, cli::Args, fatal_with, progress::format_duration, startup::prompt_password_if_missing};
+use crate::{ExitCode, VERSION, cli::Args, fatal_with, progress::format_duration, startup::prompt_password_if_missing};
 
 pub(crate) async fn run_db_load(args: &Args) -> ! {
     let db_path = PathBuf::from(args.db.as_deref().expect("dispatched on --db"));
@@ -26,10 +26,16 @@ pub(crate) async fn run_db_load(args: &Args) -> ! {
         fatal_with(ExitCode::UserInputError, format!("failed to read schema file '{schema_path}': {err}"))
     });
     let database = database_name(args, &db_path);
+    let original_database = format!("duckdb:{}", db_path.file_name().unwrap_or_default().to_string_lossy());
 
     let migration = prepare(&db_path, &schema_text);
     if args.dry_run {
-        println!("Validation passed; nothing was loaded (--dry-run).");
+        let started = Instant::now();
+        match migration.run(io::sink(), VERSION.trim(), &original_database) {
+            Ok(checksums) => print_summary(&checksums, started),
+            Err(message) => fatal_with(ExitCode::MigrationError, message),
+        }
+        println!("Nothing was written or loaded (--dry-run).");
         std::process::exit(0);
     }
 
@@ -47,7 +53,6 @@ pub(crate) async fn run_db_load(args: &Args) -> ! {
         interrupted_leftovers.push(data_path.clone());
     }
     remove_on_interrupt(interrupted_leftovers);
-    let original_database = format!("duckdb:{}", db_path.file_name().unwrap_or_default().to_string_lossy());
     write_data_file(&migration, &data_path, &original_database);
 
     let Some(driver) = driver else {
@@ -85,7 +90,7 @@ fn prepare(db_path: &Path, schema_text: &str) -> Migration {
             print_mapping(&mapping_summary);
             print_warnings(&warnings);
             for error in &errors {
-                println_error!("{}: {}", error.stage, error.message);
+                println_error!("{error}");
             }
             fatal_with(
                 ExitCode::UserInputError,
@@ -100,7 +105,7 @@ fn write_data_file(migration: &Migration, path: &Path, original_database: &str) 
     let started = Instant::now();
     let result = fs::File::create(&partial.0)
         .map_err(|err| format!("failed to create '{}': {err}", partial.0.display()))
-        .and_then(|file| migration.run(file, original_database))
+        .and_then(|file| migration.run(file, VERSION.trim(), original_database))
         .and_then(|checksums| {
             fs::rename(&partial.0, path)
                 .map_err(|err| format!("failed to move the data file into '{}': {err}", path.display()))?;
@@ -109,13 +114,13 @@ fn write_data_file(migration: &Migration, path: &Path, original_database: &str) 
     match result {
         Ok(checksums) => print_summary(&checksums, started),
         Err(message) => {
-            drop(partial);
+            drop(partial); // exiting runs no destructors
             fatal_with(ExitCode::MigrationError, message);
         }
     }
 }
 
-// TODO: Move to common? Use an existing crate?
+/// Removed on drop, unless renamed into place first.
 struct PartialFile(PathBuf);
 
 impl Drop for PartialFile {
@@ -243,9 +248,9 @@ fn print_mapping(lines: &[String]) {
     }
 }
 
-fn print_warnings(warnings: &[Diagnostic]) {
+fn print_warnings(warnings: &[String]) {
     for warning in warnings {
-        println_warning!("{}: {}", warning.stage, warning.message);
+        println_warning!("{warning}");
     }
 }
 

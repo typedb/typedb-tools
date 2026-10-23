@@ -118,6 +118,8 @@ fn dry_run_writes_nothing() -> Result<(), Box<dyn Error>> {
     let output = run_loader(&dir, &["--dry-run"]);
     assert!(output.status.success());
     assert!(!dir.join("out").exists(), "--dry-run created the output directory");
+    let output = run_loader(&dir, &["--dry-run", "--files-only", "out"]);
+    assert!(String::from_utf8_lossy(&output.stderr).contains("cannot be used with"), "clap conflict expected");
 
     let _ = fs::remove_dir_all(&dir);
     Ok(())

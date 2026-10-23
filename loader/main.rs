@@ -33,6 +33,8 @@ mod rejects;
 mod setup;
 mod startup;
 
+pub const VERSION: &str = include_str!("../VERSION");
+
 #[tokio::main]
 async fn main() {
     let args = Args::parse();

@@ -12,16 +12,10 @@
 
 [dependencies]
 
-	[dependencies.base64]
-		workspace = true
-
 	[dependencies.duckdb]
 		workspace = true
 
 	[dependencies.prost]
-		workspace = true
-
-	[dependencies.seahash]
 		workspace = true
 
 	[dependencies.typedb-protocol]
