@@ -307,7 +307,7 @@ async fn commit_batch(
         QueryAnswer::ConceptDocumentStream(_, mut stream) => stream.next().await.is_some(),
     };
     if !has_any {
-        println!("WARNING: batch {batch_index} inserted zero rows");
+        typedb_cli_common::println_warning!("batch {batch_index} inserted zero rows");
     }
     transaction.commit().await.map_err(|err| format!("commit failed: {err}"))?;
     Ok(())

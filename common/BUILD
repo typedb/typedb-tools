@@ -12,6 +12,9 @@ rust_library(
     crate_root = "lib.rs",
     deps = [
         "@typedb_driver//rust:typedb_driver",
+
+        # External dependencies
+        "@crates//:clap",
     ],
     visibility = ["//visibility:public"],
     tags = ["crate-name=typedb_cli_common"],

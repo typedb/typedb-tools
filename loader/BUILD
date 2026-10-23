@@ -19,6 +19,7 @@ rust_binary(
     srcs = glob(["*.rs"]),
     deps = [
         "//common:typedb_cli_common",
+        "//loader/migration:typedb_migration",
         "@typedb_driver//rust:typedb_driver",
         "@typeql//rust:typeql",
 
@@ -34,6 +35,7 @@ rust_binary(
         "@crates//:sha2",
         "@crates//:tokio",
     ],
+    compile_data = ["//:VERSION"],
     tags = [
         "crate-name=typedb-loader"
     ],

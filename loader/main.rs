@@ -22,6 +22,7 @@ use crate::{
 mod checkpoint;
 mod cli;
 mod csv_reader;
+mod db_load;
 mod load;
 mod output;
 mod params;
@@ -32,9 +33,18 @@ mod rejects;
 mod setup;
 mod startup;
 
+pub const VERSION: &str = include_str!("../VERSION");
+
 #[tokio::main]
 async fn main() {
     let args = Args::parse();
+    if args.db.is_some() {
+        db_load::run_db_load(&args).await;
+    }
+    run_load_command(args).await;
+}
+
+async fn run_load_command(args: Args) {
     let shutdown = install_shutdown_handler();
 
     let resume_checkpoint = load_resume_checkpoint(&args);
@@ -78,6 +88,7 @@ pub(crate) enum ExitCode {
     GeneralError = 1,
     UserInputError = 2,
     ConnectionError = 3,
+    MigrationError = 4,
 }
 
 pub(crate) fn fatal(message: impl AsRef<str>) -> ! {
@@ -85,6 +96,6 @@ pub(crate) fn fatal(message: impl AsRef<str>) -> ! {
 }
 
 pub(crate) fn fatal_with(code: ExitCode, message: impl AsRef<str>) -> ! {
-    eprintln!("error: {}", message.as_ref());
+    typedb_cli_common::println_error!("{}", message.as_ref());
     exit(code as i32);
 }

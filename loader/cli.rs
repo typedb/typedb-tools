@@ -11,6 +11,39 @@ pub const USERNAME_VALUE_NAME: &str = "username";
 #[derive(Parser, Debug)]
 #[command(author, about)]
 pub struct Args {
+    /// Load from a database file instead of a CSV (DuckDB: .duckdb/.ddb/.db extensions).
+    /// The tables are mapped onto `--schema-file` and imported into a new `--database`.
+    #[arg(long, value_name = "path to database file (.duckdb)",
+        help_heading = "Database file loading",
+        conflicts_with_all = ["query", "data", "header", "no_header", "null_values", "max_rows",
+            "batch_rows", "parallel_batches", "stop_on_error", "no_stop_on_error", "max_rejects",
+            "create_db", "output_dir", "no_checkpoint", "resume"])]
+    pub db: Option<String>,
+
+    /// With --db: write `<database>.data.typedb` into this directory instead of importing it.
+    #[arg(
+        long = "files-only",
+        value_name = "path to output directory",
+        help_heading = "Database file loading",
+        requires = "db"
+    )]
+    pub files_only: Option<String>,
+
+    /// With --db: map and convert the database, printing the mapping and the counts, without
+    /// writing or loading anything.
+    #[arg(
+        long = "dry-run",
+        default_value = "false",
+        help_heading = "Database file loading",
+        requires = "db",
+        conflicts_with = "files_only"
+    )]
+    pub dry_run: bool,
+
+    /// With --db --files-only: replace an existing data file instead of refusing.
+    #[arg(long, default_value = "false", help_heading = "Database file loading", requires = "files_only")]
+    pub overwrite: bool,
+
     /// Path to a TypeQL query file used as the loading template.
     /// File path can be absolute or relative to the current directory.
     #[arg(long, value_name = "path to query file (.tql)")]
