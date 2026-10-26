@@ -46,13 +46,20 @@ pub struct Migration {
 }
 
 impl Migration {
-    pub fn prepare(db_path: &Path, schema_text: &str) -> Result<Migration, PrepareError> {
+    // Scans larger than memory spill into `spill_dir`, which DuckDB would otherwise put next to the database.
+    pub fn prepare(db_path: &Path, schema_text: &str, spill_dir: &Path) -> Result<Migration, PrepareError> {
         let schema = schema::Schema::parse(schema_text).map_err(PrepareError::Setup)?;
         let connection = Config::default()
             .access_mode(AccessMode::ReadOnly)
+            .and_then(|config| config.with("temp_directory", spill_dir.to_string_lossy()))
+            .and_then(|config| config.with("preserve_insertion_order", "true"))
             .and_then(|config| Connection::open_with_flags(db_path, config))
             .map_err(|err| {
-                PrepareError::Setup(format!("failed to open DuckDB database '{}': {err}", db_path.display()))
+                PrepareError::Setup(format!(
+                    "failed to open DuckDB database '{}': {err} (other formats are staged into DuckDB first; \
+                     see the loader's migration README)",
+                    db_path.display()
+                ))
             })?;
         let catalog = catalog::Catalog::read(&connection).map_err(PrepareError::Setup)?;
 

@@ -7,6 +7,7 @@
 use std::{
     fs, io,
     path::{Path, PathBuf},
+    process,
     time::Instant,
 };
 
@@ -28,7 +29,12 @@ pub(crate) async fn run_db_load(args: &Args) -> ! {
     let database = database_name(args, &db_path);
     let original_database = format!("duckdb:{}", db_path.file_name().unwrap_or_default().to_string_lossy());
 
-    let migration = prepare(&db_path, &schema_text);
+    let work_dir = match args.files_only.as_deref() {
+        _ if args.dry_run => std::env::temp_dir(),
+        Some(dir) => PathBuf::from(dir),
+        None => staging_dir(&db_path),
+    };
+    let migration = prepare(&db_path, &schema_text, &work_dir.join(format!(".{database}.{}.tmp", process::id())));
     if args.dry_run {
         let started = Instant::now();
         match migration.run(io::sink(), VERSION.trim(), &original_database) {
@@ -36,7 +42,7 @@ pub(crate) async fn run_db_load(args: &Args) -> ! {
             Err(message) => fatal_with(ExitCode::MigrationError, message),
         }
         println!("Nothing was written or loaded (--dry-run).");
-        std::process::exit(0);
+        process::exit(0);
     }
 
     let driver = match args.files_only {
@@ -46,7 +52,7 @@ pub(crate) async fn run_db_load(args: &Args) -> ! {
 
     let data_path = match args.files_only.as_deref() {
         Some(dir) => output_data_path(Path::new(dir), &database, args.overwrite),
-        None => staging_data_path(&db_path, &database),
+        None => staging_dir(&db_path).join(format!(".{database}.{}.data.typedb", process::id())),
     };
     let mut interrupted_leftovers = vec![partial_path(&data_path)];
     if driver.is_some() {
@@ -62,7 +68,7 @@ pub(crate) async fn run_db_load(args: &Args) -> ! {
             schema_path,
             data_path.display()
         );
-        std::process::exit(0);
+        process::exit(0);
     };
 
     println!("Importing into '{database}'...");
@@ -72,14 +78,14 @@ pub(crate) async fn run_db_load(args: &Args) -> ! {
     match result {
         Ok(()) => {
             println!("Imported in {}.", format_duration(started.elapsed()));
-            std::process::exit(0);
+            process::exit(0);
         }
         Err(err) => fatal_with(ExitCode::GeneralError, format!("import into '{database}' failed: {err}")),
     }
 }
 
-fn prepare(db_path: &Path, schema_text: &str) -> Migration {
-    match Migration::prepare(db_path, schema_text) {
+fn prepare(db_path: &Path, schema_text: &str, spill_dir: &Path) -> Migration {
+    match Migration::prepare(db_path, schema_text, spill_dir) {
         Ok(migration) => {
             print_mapping(&migration.mapping_summary());
             print_warnings(migration.warnings());
@@ -105,7 +111,11 @@ fn write_data_file(migration: &Migration, path: &Path, original_database: &str) 
     let started = Instant::now();
     let result = fs::File::create(&partial.0)
         .map_err(|err| format!("failed to create '{}': {err}", partial.0.display()))
-        .and_then(|file| migration.run(file, VERSION.trim(), original_database))
+        .and_then(|mut file| {
+            let checksums = migration.run(&mut file, VERSION.trim(), original_database)?;
+            file.sync_all().map_err(|err| format!("failed to write '{}': {err}", partial.0.display()))?;
+            Ok(checksums)
+        })
         .and_then(|checksums| {
             fs::rename(&partial.0, path)
                 .map_err(|err| format!("failed to move the data file into '{}': {err}", path.display()))?;
@@ -140,7 +150,7 @@ fn remove_on_interrupt(paths: Vec<PathBuf>) {
                 remove_if_exists(path);
             }
             println_error!("interrupted; nothing was loaded");
-            std::process::exit(130);
+            process::exit(130);
         }
     });
 }
@@ -159,12 +169,11 @@ fn output_data_path(dir: &Path, database: &str, overwrite: bool) -> PathBuf {
     path
 }
 
-fn staging_data_path(db_path: &Path, database: &str) -> PathBuf {
-    let dir = match db_path.parent() {
-        Some(parent) if !parent.as_os_str().is_empty() => parent,
-        _ => Path::new("."),
-    };
-    dir.join(format!(".{database}.{}.data.typedb", std::process::id()))
+fn staging_dir(db_path: &Path) -> PathBuf {
+    match db_path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
+        _ => PathBuf::from("."),
+    }
 }
 
 fn remove_if_exists(path: &Path) {

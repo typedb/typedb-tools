@@ -13,7 +13,7 @@ use std::{
 
 use duckdb::Connection;
 use prost::Message;
-use typedb_migration::{Migration, PrepareError};
+use typedb_migration::{Checksums, Migration, PrepareError};
 use typedb_protocol::migration::{Item, MigrationValue, item, migration_value};
 
 const SCHEMA: &str = r#"define
@@ -96,7 +96,8 @@ fn scratch(test_name: &str, schema: &str, sql: &str) -> Result<Scratch, Box<dyn 
 }
 
 fn prepare(dir: &Scratch) -> Result<Migration, PrepareError> {
-    Migration::prepare(&dir.0.join("fixture.duckdb"), &fs::read_to_string(dir.0.join("schema.tql")).expect("schema"))
+    let schema = fs::read_to_string(dir.0.join("schema.tql")).expect("schema");
+    Migration::prepare(&dir.0.join("fixture.duckdb"), &schema, &dir.0.join("spill"))
 }
 
 fn validation_errors(dir: &Scratch) -> Vec<String> {
@@ -179,14 +180,27 @@ fn assert_file_guarantees(items: &[item::Item]) {
     let mut values = HashSet::new();
     assert!(attributes.values().all(|a| values.insert((a.label.as_str(), encoded(&a.value)))), "an attribute repeats");
 
+    let mut counts = Checksums::default();
     for item in items {
         let (owned, players) = match item {
-            item::Item::Entity(entity) => (&entity.attributes, Vec::new()),
+            item::Item::Entity(entity) => {
+                counts.entity_count += 1;
+                (&entity.attributes, Vec::new())
+            }
             item::Item::Relation(relation) => {
+                counts.relation_count += 1;
+                for role in &relation.roles {
+                    let ids: HashSet<&str> = role.players.iter().map(|player| player.id.as_str()).collect();
+                    assert_eq!(ids.len(), role.players.len(), "{} repeats a player in {}", relation.id, role.label);
+                }
                 (&relation.attributes, relation.roles.iter().flat_map(|role| role.players.iter()).collect())
             }
             _ => continue,
         };
+        let owned_ids: HashSet<&str> = owned.iter().map(|ownership| ownership.id.as_str()).collect();
+        assert_eq!(owned_ids.len(), owned.len(), "an item repeats an ownership");
+        counts.ownership_count += owned.len() as i64;
+        counts.role_count += players.len() as i64;
         for ownership in owned {
             let attribute =
                 attributes.get(ownership.id.as_str()).unwrap_or_else(|| panic!("missing attribute {}", ownership.id));
@@ -203,6 +217,9 @@ fn assert_file_guarantees(items: &[item::Item]) {
             assert_eq!((by_id.label.as_str(), by_id.label_scoped_id), *object, "{} differs", player.id);
         }
     }
+    counts.attribute_count = attributes.len() as i64;
+    let item::Item::Checksums(checksums) = items.last().expect("the checksums come last") else { panic!() };
+    assert_eq!(*checksums, counts);
 }
 
 #[test]
@@ -441,9 +458,9 @@ fn inherited_roles_are_scoped_to_their_declaring_relation() -> Result<(), Box<dy
 }
 
 #[test]
-fn relation_tables_are_streamed_after_their_players() -> Result<(), Box<dyn Error>> {
+fn relations_may_play_in_relations_streamed_before_them() -> Result<(), Box<dyn Error>> {
     let dir = scratch(
-        "players-first",
+        "forward-reference",
         NESTED,
         "CREATE TABLE node (_iid UBIGINT PRIMARY KEY, name VARCHAR);
          CREATE TABLE zbase (_iid UBIGINT PRIMARY KEY, n_id UBIGINT NOT NULL REFERENCES node(_iid));
@@ -454,14 +471,19 @@ fn relation_tables_are_streamed_after_their_players() -> Result<(), Box<dyn Erro
          INSERT INTO zbase VALUES (5, 1);
          INSERT INTO aref VALUES (7, 5, 'r');",
     )?;
-    let labels: Vec<String> = convert(&dir)?
+    let items = convert(&dir)?;
+    assert_file_guarantees(&items);
+    let relations: Vec<String> = items
         .into_iter()
         .filter_map(|item| match item {
-            item::Item::Relation(relation) => Some(relation.label),
+            item::Item::Relation(relation) => {
+                let players = relation.roles.iter().flat_map(|role| role.players.iter().map(|player| &player.id));
+                Some(format!("{} <- {}", relation.id, players.cloned().collect::<Vec<_>>().join(" ")))
+            }
             _ => None,
         })
         .collect();
-    assert_eq!(labels, ["base", "ref"]);
+    assert_eq!(relations, ["ref:0 <- base:0", "base:0 <- node:0"]);
     Ok(())
 }
 
@@ -649,10 +671,9 @@ fn instances_are_numbered_per_type_whatever_their_iid() -> Result<(), Box<dyn Er
         };
         names.insert(id.clone(), owned[0].id.trim_start_matches("name:").to_owned());
     }
-    // Entity tables in name order (alumni is empty), relation tables after the tables they
-    // reference: knows before aknows.
+    // Tables in name order, entity tables first (alumni is empty), rows by _iid.
     let expected = [("person:0", "Cid"), ("person:1", "Dee"), ("person:2", "Bob"), ("person:3", "Ann")];
-    let relations = [("knows:0", "k3"), ("knows:1", "k7"), ("knows:2", "k9"), ("knows:3", "ak")];
+    let relations = [("knows:0", "ak"), ("knows:1", "k3"), ("knows:2", "k7"), ("knows:3", "k9")];
     for (id, name) in expected.into_iter().chain(relations) {
         assert_eq!(names[id], name, "{id}");
     }
@@ -664,7 +685,7 @@ fn instances_are_numbered_per_type_whatever_their_iid() -> Result<(), Box<dyn Er
             friends.push(format!("{}: {}", names[&relation.id], players.collect::<Vec<_>>().join(" ")));
         }
     }
-    assert_eq!(friends, ["k3: Bob Cid k7", "k7: Ann Dee", "k9: k3", "ak: Ann k7"]);
+    assert_eq!(friends, ["ak: Ann k7", "k3: Bob Cid k7", "k7: Ann Dee", "k9: k3"]);
     Ok(())
 }
 
@@ -755,7 +776,8 @@ fn timestamps_beside_nanosecond_columns_must_fit_their_range() -> Result<(), Box
          INSERT INTO old_event VALUES (2, '1500-01-01'), (3, '2020-01-01');",
     )?;
     let error = convert(&dir).expect_err("1500-01-01 does not fit TIMESTAMP_NS").to_string();
-    assert!(error.contains("attribute scan for 'happened' failed") && error.contains("Timestamp(NS)"), "{error}");
+    assert!(error.contains("'happened' (from [\"event.happened\", \"old_event.happened\"])"), "{error}");
+    assert!(error.contains("Timestamp(NS)"), "{error}");
     Ok(())
 }
 
@@ -886,6 +908,75 @@ fn one_role_is_inferred_for_several_player_tables() -> Result<(), Box<dyn Error>
         })
         .collect::<Vec<_>>();
     assert_eq!(owner_roles, [1, 1]);
+    Ok(())
+}
+
+#[test]
+fn a_column_named_rowid_does_not_disturb_the_scan() -> Result<(), Box<dyn Error>> {
+    let dir = scratch(
+        "rowid",
+        "define\n  attribute rowid value integer;\n  entity node, owns rowid, plays link:end;\n  \
+         relation link, relates end @card(1..2);\n",
+        "CREATE TABLE node (_iid UBIGINT PRIMARY KEY, rowid INTEGER);
+         CREATE TABLE link (_iid UBIGINT PRIMARY KEY, rowid UBIGINT REFERENCES node(_iid),
+                            b UBIGINT REFERENCES node(_iid));
+         COMMENT ON TABLE link IS '@typedb relation link (end = rowid, end = b)';
+         INSERT INTO node VALUES (1, NULL), (2, -1), (3, 200000);
+         INSERT INTO link VALUES (1, 1, 2), (2, NULL, 3), (3, 3, 1);",
+    )?;
+    let items = convert(&dir)?;
+    assert_file_guarantees(&items);
+    let item::Item::Checksums(checksums) = items.last().unwrap() else { panic!() };
+    assert_eq!((checksums.entity_count, checksums.relation_count, checksums.role_count), (3, 3, 5));
+    Ok(())
+}
+
+#[test]
+fn foreign_keys_are_matched_as_duckdb_resolves_them() -> Result<(), Box<dyn Error>> {
+    let dir = scratch(
+        "fk-case",
+        "define\n  entity person, plays link:end;\n  entity company, plays link:end;\n  relation link, relates end;\n",
+        "CREATE TABLE person (_iid UBIGINT PRIMARY KEY);
+         CREATE TABLE company (_iid UBIGINT PRIMARY KEY);
+         CREATE TABLE link (_iid UBIGINT PRIMARY KEY, a UBIGINT REFERENCES Person(_IID), b UBIGINT,
+                            FOREIGN KEY (b) REFERENCES person(_iid), FOREIGN KEY (b) REFERENCES company(_iid));
+         INSERT INTO person VALUES (1);",
+    )?;
+    let errors = validation_errors(&dir);
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert_error(&errors, &["column 'b' is in several FOREIGN KEYs"]);
+    Ok(())
+}
+
+#[test]
+fn role_inference_does_not_depend_on_column_order() -> Result<(), Box<dyn Error>> {
+    let schema = "define\n  entity person, plays r:a, plays r:b;\n  entity company, plays r:b;\n  \
+                  relation r, relates a, relates b;\n";
+    let tables = "CREATE TABLE person (_iid UBIGINT PRIMARY KEY); CREATE TABLE company (_iid UBIGINT PRIMARY KEY);";
+    for (name, columns) in [
+        ("order-1", "company_id UBIGINT REFERENCES company(_iid), person_id UBIGINT REFERENCES person(_iid)"),
+        ("order-2", "person_id UBIGINT REFERENCES person(_iid), company_id UBIGINT REFERENCES company(_iid)"),
+    ] {
+        let dir = scratch(name, schema, &format!("{tables} CREATE TABLE r (_iid UBIGINT PRIMARY KEY, {columns});"))?;
+        assert_error(&validation_errors(&dir), &["FK column 'person_id' is ambiguous", "(a = <column>, b = <column>)"]);
+    }
+    Ok(())
+}
+
+#[test]
+fn directives_take_any_whitespace_and_keyword_case() -> Result<(), Box<dyn Error>> {
+    let dir = scratch(
+        "directive-forms",
+        "define\n  attribute name value string;\n  entity person, owns name;\n",
+        "CREATE TABLE people (_iid UBIGINT PRIMARY KEY, full_name VARCHAR, extra INTEGER);
+         COMMENT ON TABLE people IS '@TypeDB\tEntity\tperson';
+         COMMENT ON COLUMN people.full_name IS ' @typedb OWNS   name ';
+         COMMENT ON COLUMN people.extra IS '@typedb Skip';
+         INSERT INTO people VALUES (1, 'Ann', 1);",
+    )?;
+    let items = convert(&dir)?;
+    assert_file_guarantees(&items);
+    assert!(items.iter().any(|item| matches!(item, item::Item::Entity(entity) if entity.id == "person:0")));
     Ok(())
 }
 

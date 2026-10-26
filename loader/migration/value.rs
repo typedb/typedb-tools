@@ -15,7 +15,7 @@ use typedb_protocol::{
 use crate::schema::ValueType;
 
 // Days from 0001-01-01 to 1970-01-01.
-pub(crate) const EPOCH_DAYS_FROM_CE: i32 = 719_163;
+const EPOCH_DAYS_FROM_CE: i32 = 719_163;
 pub(crate) const DECIMAL_FRACTIONAL_DIGITS: u8 = 19;
 
 // chrono's `NaiveDate::MIN..=MAX` and `NaiveDateTime::MIN..=MAX`, from the epoch.

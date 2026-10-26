@@ -9,7 +9,7 @@ use std::collections::{HashMap, HashSet};
 use typeql::{
     annotation::Annotation,
     common::token,
-    query::{QueryStructure, SchemaQuery},
+    query::{Query, QueryStructure, SchemaQuery},
     schema::definable::{
         Definable,
         type_::{Capability, CapabilityBase},
@@ -87,10 +87,11 @@ pub(crate) struct Schema {
 
 impl Schema {
     pub(crate) fn parse(schema_text: &str) -> Result<Self, String> {
-        let query =
-            typeql::parse_query(schema_text).map_err(|err| format!("failed to parse the TypeDB schema: {err}"))?;
-        let QueryStructure::Schema(SchemaQuery::Define(define)) = query.structure else {
-            return Err("the schema file must contain a single `define` query".to_owned());
+        let queries =
+            typeql::parse_queries(schema_text).map_err(|err| format!("failed to parse the TypeDB schema: {err}"))?;
+        let define = match <[Query; 1]>::try_from(queries) {
+            Ok([Query { structure: QueryStructure::Schema(SchemaQuery::Define(define)), .. }]) => define,
+            _ => return Err("the schema file must contain a single `define` query".to_owned()),
         };
 
         let mut declarations = Vec::new();
