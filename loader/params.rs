@@ -68,7 +68,7 @@ pub(crate) fn resolve_params(args: &Args, checkpoint: Option<&CheckpointParams>)
     if let (Some(cli_batch), Some(prior)) = (args.batch_rows, checkpoint) {
         if cli_batch != prior.batch_rows {
             return Err(format!(
-                "--batch-rows ({cli_batch}) differs from the checkpoint ({}); changing --batch-rows is not supported on resume",
+                "--batch-rows ({cli_batch}) differs from the checkpoint ({}); it cannot change on resume.\nPossible solutions:\n  * omit --batch-rows to reuse the checkpoint's value\n  * start a fresh run (without '--resume') to change the batch size",
                 prior.batch_rows
             ));
         }

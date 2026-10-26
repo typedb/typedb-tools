@@ -8,8 +8,15 @@ use clap::Parser;
 
 pub const USERNAME_VALUE_NAME: &str = "username";
 
+/// The two invocation modes: a fresh load (connection, database, query, and data are required),
+/// and a resume (everything is carried by the checkpoint). Clap can't derive this because
+/// required-ness is only resolved after merging CLI args with the checkpoint.
+const USAGE: &str = "\
+typedb-loader --address <host:port> --username <user> --database <db> --query <query.tql> --data <data.csv> [OPTIONS]
+       typedb-loader --resume <output-dir> [OPTIONS]";
+
 #[derive(Parser, Debug)]
-#[command(author, about)]
+#[command(author, about, override_usage = USAGE)]
 pub struct Args {
     /// Path to a TypeQL query file used as the loading template.
     /// File path can be absolute or relative to the current directory.
