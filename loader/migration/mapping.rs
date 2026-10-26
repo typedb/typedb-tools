@@ -125,38 +125,46 @@ fn strip_directive_prefix(comment: &str) -> Option<&str> {
     prefix.eq_ignore_ascii_case(DIRECTIVE_PREFIX).then(|| comment[DIRECTIVE_PREFIX.len()..].trim())
 }
 
+// A directive is `@typedb <keyword> [<argument>]`; the keyword is case-insensitive.
+fn parse_directive(comment: Option<&str>) -> Option<(String, &str)> {
+    let rest = comment.and_then(strip_directive_prefix)?;
+    let (keyword, argument) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
+    Some((keyword.to_ascii_lowercase(), argument.trim()))
+}
+
 fn parse_table_directive(table: &Table) -> Result<Option<TableDirective>, String> {
-    let Some(rest) = table.comment.as_deref().and_then(strip_directive_prefix) else { return Ok(None) };
-    if rest == "skip" {
-        Ok(Some(TableDirective::Skip))
-    } else if let Some(label) = rest.strip_prefix("entity ") {
-        Ok(Some(TableDirective::Entity(label.trim().to_owned())))
-    } else if let Some(spec) = rest.strip_prefix("relation ") {
-        let (label, bindings) = parse_bindings(spec)
-            .map_err(|err| format!("table '{}': malformed @typedb relation directive: {err}", table.name))?;
-        Ok(Some(TableDirective::Relation(label, bindings)))
-    } else {
-        Err(format!(
-            "table '{}': unrecognised directive '@typedb {rest}' \
+    let Some((keyword, argument)) = parse_directive(table.comment.as_deref()) else { return Ok(None) };
+    match (keyword.as_str(), argument) {
+        ("skip", "") => Ok(Some(TableDirective::Skip)),
+        ("entity", label) if !label.is_empty() => Ok(Some(TableDirective::Entity(label.to_owned()))),
+        ("relation", spec) if !spec.is_empty() => {
+            let (label, bindings) = parse_bindings(spec)
+                .map_err(|err| format!("table '{}': malformed @typedb relation directive: {err}", table.name))?;
+            Ok(Some(TableDirective::Relation(label, bindings)))
+        }
+        _ => Err(format!(
+            "table '{}': unrecognised directive '{}' \
              (expected: skip | entity <label> | relation <label> (<role> = <column>, ...))",
-            table.name
-        ))
+            table.name,
+            table.comment.as_deref().unwrap_or_default().trim()
+        )),
     }
 }
 
 fn parse_column_directive(table: &Table, column: &Column) -> Result<Option<ColumnDirective>, String> {
-    let Some(rest) = column.comment.as_deref().and_then(strip_directive_prefix) else { return Ok(None) };
-    if rest == "skip" {
-        Ok(Some(ColumnDirective::Skip))
-    } else if let Some(label) = rest.strip_prefix("owns ") {
-        Ok(Some(ColumnDirective::Owns(label.trim().to_owned())))
-    } else if rest.starts_with("relation ") {
-        Err(format!("table '{}': column '{}' cannot be a relation: {RELATION_IS_A_TABLE}", table.name, column.name))
-    } else {
-        Err(format!(
-            "table '{}': column '{}': unrecognised directive '@typedb {rest}' (expected: skip | owns <label>)",
-            table.name, column.name
-        ))
+    let Some((keyword, argument)) = parse_directive(column.comment.as_deref()) else { return Ok(None) };
+    match (keyword.as_str(), argument) {
+        ("skip", "") => Ok(Some(ColumnDirective::Skip)),
+        ("owns", label) if !label.is_empty() => Ok(Some(ColumnDirective::Owns(label.to_owned()))),
+        ("relation", _) => {
+            Err(format!("table '{}': column '{}' cannot be a relation: {RELATION_IS_A_TABLE}", table.name, column.name))
+        }
+        _ => Err(format!(
+            "table '{}': column '{}': unrecognised directive '{}' (expected: skip | owns <label>)",
+            table.name,
+            column.name,
+            column.comment.as_deref().unwrap_or_default().trim()
+        )),
     }
 }
 
@@ -267,7 +275,7 @@ pub(crate) fn resolve(catalog: &Catalog, schema: &Schema, diagnostics: &mut Diag
     }
 
     unmapped_schema_warnings(&plan, schema, diagnostics);
-    order_for_import(&mut plan);
+    plan.tables.sort_by_key(|table| table.is_relation);
     plan
 }
 
@@ -290,23 +298,6 @@ fn check_role_binding_columns(target: &ResolvedTable<'_>, skipped: &[&str], diag
             target.table.name
         ));
     }
-}
-
-fn order_for_import(plan: &mut MappingPlan) {
-    let (mut ordered, mut pending): (Vec<TableMapping>, Vec<TableMapping>) =
-        std::mem::take(&mut plan.tables).into_iter().partition(|table| !table.is_relation);
-    pending.sort_by(|a, b| a.name.cmp(&b.name));
-    while !pending.is_empty() {
-        let placed = |name: &str| ordered.iter().any(|table| table.name == name);
-        let next = pending
-            .iter()
-            .position(|table| {
-                table.roles.iter().all(|role| role.player_table == table.name || placed(&role.player_table))
-            })
-            .expect("foreign keys cannot form cycles across DuckDB tables");
-        ordered.push(pending.remove(next));
-    }
-    plan.tables = ordered;
 }
 
 fn resolve_tables<'a>(
@@ -409,7 +400,7 @@ fn has_instance_id_column(table: &Table, diagnostics: &mut Diagnostics) -> bool 
     let is_unique = is_pk || table.unique_column_sets.iter().any(|set| set.as_slice() == [IID_COLUMN]);
     if !is_unique {
         diagnostics.error(format!(
-            "table '{}': {IID_COLUMN} must carry a declared UNIQUE or PRIMARY KEY constraint: {contract}",
+            "table '{}': {IID_COLUMN} must carry a declared UNIQUE or PRIMARY KEY constraint of its own: {contract}",
             table.name
         ));
         return false;
@@ -485,14 +476,12 @@ fn infer_role(
         })
         .collect();
     let plays_none = played_roles.is_empty();
+    // Only the directive's bindings settle a role: inference must not depend on column order.
     let candidate_roles: Vec<&Relates> = match played_roles.as_slice() {
         [_] => played_roles,
         _ => played_roles
             .into_iter()
-            .filter(|relates| {
-                !mapping.roles.iter().any(|bound| bound.role == relates.role)
-                    && !target.bound_columns.iter().any(|(bound, _)| *bound == relates.role)
-            })
+            .filter(|relates| !target.bound_columns.iter().any(|(bound, _)| *bound == relates.role))
             .collect(),
     };
     match candidate_roles.as_slice() {
@@ -502,8 +491,8 @@ fn infer_role(
             target.table.name, column.name, fk.referenced_table, player.object.label
         )),
         [] => diagnostics.error(format!(
-            "table '{}': FK column '{}' targets '{}', whose type '{}' plays no role of relation '{relation}' that \
-             another column does not already fill",
+            "table '{}': FK column '{}' targets '{}', whose type '{}' plays only roles of relation '{relation}' \
+             that the directive binds to other columns",
             target.table.name, column.name, fk.referenced_table, player.object.label
         )),
         _ => diagnostics.error(format!(
@@ -534,14 +523,22 @@ fn resolve_player<'t, 'a>(
         ));
         return None;
     }
-    let Some(player) = targets.iter().find(|t| t.table.name == fk.referenced_table) else {
+    if target.table.foreign_keys.iter().filter(|other| other.columns.contains(&column.name)).count() > 1 {
+        diagnostics.error(format!(
+            "table '{}': column '{}' is in several FOREIGN KEYs, so its players' table is ambiguous",
+            target.table.name, column.name
+        ));
+        return None;
+    }
+    // DuckDB resolves identifiers case-insensitively but records the reference as written.
+    let Some(player) = targets.iter().find(|t| t.table.name.eq_ignore_ascii_case(&fk.referenced_table)) else {
         diagnostics.error(format!(
             "table '{}': FK column '{}' references table '{}', which is not mapped (is it skipped or invalid?)",
             target.table.name, column.name, fk.referenced_table
         ));
         return None;
     };
-    if fk.referenced_columns.as_slice() != [IID_COLUMN] {
+    if !matches!(fk.referenced_columns.as_slice(), [referenced] if referenced.eq_ignore_ascii_case(IID_COLUMN)) {
         diagnostics.error(format!(
             "table '{}': FK column '{}' must reference '{}.{IID_COLUMN}' (the instance-id column); found {:?}",
             target.table.name, column.name, fk.referenced_table, fk.referenced_columns

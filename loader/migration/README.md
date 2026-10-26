@@ -62,8 +62,8 @@ columns onto it by name and refuses to guess:
 
 - Anything in **DuckDB without a schema counterpart is an error**: an unmapped table or
   column fails the run, unless marked `@typedb skip`.
-- Anything in the **schema without a DuckDB counterpart is a warning**: those types and
-  ownerships produce no instances.
+- Anything in the **schema without a DuckDB counterpart is a warning**: those types
+  produce no instances.
 
 Table and column names match exactly (case included), or with `_` read as `-`
 (`country_code` matches `country-code`); names given in directives are taken as written.
@@ -74,9 +74,9 @@ types take no table.
 ## Modelling
 
 Every mapped table identifies its rows by a column `_iid UBIGINT` declared `NOT NULL
-UNIQUE` or `PRIMARY KEY` (see [Ids](#ids)), and foreign keys reference it. The examples
-below leave the attribute declarations out: every column name is an attribute of the
-matching name, e.g. `attribute name value string;`.
+UNIQUE` or `PRIMARY KEY` on its own (see [Ids](#ids)), and foreign keys reference it. The
+examples below leave the attribute declarations out: every column name is an attribute of
+the matching name, e.g. `attribute name value string;`.
 
 **An entity type is a table**; its columns are the attributes it owns. `NULL` is no
 ownership.
@@ -253,11 +253,11 @@ For data without natural 64-bit ids, `row_number() OVER ()` at staging time is a
 ## What is checked, and what is the server's
 
 Before anything is written, the loader checks the structure (the `_iid` contract, FKs
-referencing `_iid`, supported column types, well-formed directives) and the mapping (every mapped type, attribute and role exists in the
-schema, with the right kind and a compatible value type). Values TypeDB cannot hold (see the
-table above) fail the conversion, which names the attribute and the columns feeding it. A
-dry run converts too, so it finds them. Any error stops the run with nothing written;
-warnings are printed and the run proceeds.
+referencing `_iid`, supported column types, well-formed directives) and the mapping (every
+mapped type, attribute and role exists in the schema, with the right kind and a compatible
+value type). Values TypeDB cannot hold (see the table above) fail the conversion, which
+names the attribute and the columns feeding it. A dry run converts too, so it finds them.
+Any error stops the run with nothing written; warnings are printed and the run proceeds.
 
 Everything the schema constrains is enforced by the server at import, as for any other
 data: `@regex`, `@values` and `@range` as each attribute is created, which the import does
@@ -283,8 +283,8 @@ messages, in the order `database import` expects: a header stating the file's gu
 attribute, every entity, every relation, then checksums. The schema is not copied: import
 the data file with the schema file it was prepared against.
 
-Relation tables come after the tables they reference, so a relation's players are imported
-before it, except players from the relation's own table. A one-shot load stages the data
-file next to the DuckDB file and removes it after the import; `--files-only` writes it
-into the given directory instead. The file is written under a temporary name and renamed
-on completion, and an interrupted run removes it.
+Tables are written in name order, entity tables first. A relation that plays a role may
+come after the relation it plays in; the import links such players once every relation is
+read. A one-shot load stages the data file next to the DuckDB file and removes it after
+the import; `--files-only` writes it into the given directory instead. The file is written
+under a temporary name and renamed on completion, and an interrupted run removes it.

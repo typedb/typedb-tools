@@ -75,6 +75,7 @@ pub(crate) fn emit(
 
 struct TableNumbering {
     first_id: u64,
+    count: u64,
     iids: Iids,
 }
 
@@ -95,6 +96,8 @@ impl TableNumbering {
 
 fn number_instances<'a>(conn: &Connection, plan: &'a MappingPlan) -> Result<HashMap<&'a str, TableNumbering>, String> {
     let iid = quoted(IID_COLUMN);
+    let player_tables: HashSet<&str> =
+        plan.tables.iter().flat_map(|table| table.roles.iter().map(|role| role.player_table.as_str())).collect();
     let mut next_ids: HashMap<&str, u64> = HashMap::new();
     let mut numbering = HashMap::new();
     for table in &plan.tables {
@@ -103,14 +106,12 @@ fn number_instances<'a>(conn: &Connection, plan: &'a MappingPlan) -> Result<Hash
         let sql = format!("SELECT count(*)::UBIGINT, min({iid}), max({iid}) FROM {}", quoted(&table.name));
         let (count, min, max): (u64, Option<u64>, Option<u64>) =
             conn.query_row(&sql, [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?))).map_err(read_error)?;
-        let holds_players =
-            plan.tables.iter().any(|other| other.roles.iter().any(|role| role.player_table == table.name));
         let iids = match (min, max) {
             // `_iid` is unique, so a span as wide as the count has no gaps.
             (Some(min), Some(max)) if u128::from(max - min) + 1 == u128::from(count) => {
                 Iids::Consecutive { first: min, count }
             }
-            _ if holds_players => {
+            _ if player_tables.contains(table.name.as_str()) => {
                 let mut iids = Vec::with_capacity(count as usize);
                 let sql = format!("SELECT {iid} FROM {}", quoted(&table.name));
                 for_each_row(conn, &sql, read_error, |row| Ok(iids.push(row.get(0).map_err(read_error)?)))?;
@@ -120,7 +121,7 @@ fn number_instances<'a>(conn: &Connection, plan: &'a MappingPlan) -> Result<Hash
             _ => Iids::Sorted(Vec::new()),
         };
         let next_id = next_ids.entry(&table.type_label).or_default();
-        numbering.insert(table.name.as_str(), TableNumbering { first_id: *next_id, iids });
+        numbering.insert(table.name.as_str(), TableNumbering { first_id: *next_id, count, iids });
         *next_id += count;
     }
     Ok(numbering)
@@ -163,7 +164,8 @@ fn emit_attributes(conn: &Connection, plan: &MappingPlan, emitter: &mut Emitter<
 
     for source in sources {
         let sql = format!("{} ORDER BY 1", source.selects.join(" UNION "));
-        let scan_error = |err: duckdb::Error| format!("attribute scan for '{}' failed: {err}", source.label);
+        let scan_error =
+            |err: duckdb::Error| format!("attribute '{}' (from {:?}): {err}", source.label, source.columns);
         for_each_row(conn, &sql, scan_error, |row| {
             let cell = row.get_ref(0).map_err(scan_error)?;
             let with_context = |err: String| format!("attribute '{}' (from {:?}): {err}", source.label, source.columns);
@@ -192,7 +194,7 @@ fn for_each_row(
     mut on_row: impl FnMut(&Row<'_>) -> Result<(), String>,
 ) -> Result<(), String> {
     const SCAN: &str = "temp.typedb_loader_scan";
-    conn.execute_batch(&format!("CREATE OR REPLACE TEMP TABLE typedb_loader_scan AS {sql}")).map_err(&scan_error)?;
+    conn.execute_batch(&format!("CREATE OR REPLACE TEMP TABLE {SCAN} AS {sql}")).map_err(&scan_error)?;
     let mut read_pages = || {
         let count: i64 =
             conn.query_row(&format!("SELECT count(*) FROM {SCAN}"), [], |row| row.get(0)).map_err(&scan_error)?;
@@ -224,13 +226,11 @@ fn emit_objects(
     numbering: &HashMap<&str, TableNumbering>,
     emitter: &mut Emitter<impl Write>,
 ) -> Result<(), String> {
-    let mut selects = vec![quoted(IID_COLUMN)];
-    for owns in &table.owns {
-        selects.push(owns.projection());
-    }
-    for role in &table.roles {
-        selects.push(quoted(&role.column));
-    }
+    let columns = std::iter::once(quoted(IID_COLUMN))
+        .chain(table.owns.iter().map(OwnsMapping::projection))
+        .chain(table.roles.iter().map(|role| quoted(&role.column)));
+    // Loader-owned aliases keep a column named `rowid` from shadowing the scan's rowid.
+    let selects: Vec<String> = columns.enumerate().map(|(index, column)| format!("{column} AS c{index}")).collect();
     let sql = format!("SELECT {} FROM {} ORDER BY 1", selects.join(", "), quoted(&table.name));
     let scan_error = |err: duckdb::Error| format!("scan of '{}' failed: {err}", table.name);
 
@@ -240,7 +240,8 @@ fn emit_objects(
         table.owns.iter().enumerate().any(|(index, owns)| {
             owns.multi || table.owns[..index].iter().any(|other| other.attribute == owns.attribute)
         });
-    let mut label_scoped_id = numbering[table.name.as_str()].first_id;
+    let TableNumbering { first_id, count, .. } = numbering[table.name.as_str()];
+    let mut label_scoped_id = first_id;
     let mut previous_iid = None;
     for_each_row(conn, &sql, scan_error, |row| {
         let instance_id: u64 = row.get(0).map_err(scan_error)?;
@@ -329,5 +330,10 @@ fn emit_objects(
         }
         label_scoped_id += 1;
         Ok(())
-    })
+    })?;
+    let scanned = label_scoped_id - first_id;
+    if scanned != count {
+        return Err(format!("the scan of '{}' returned {scanned} of its {count} rows", table.name));
+    }
+    Ok(())
 }
