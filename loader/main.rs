@@ -22,8 +22,8 @@ use crate::{
 mod checkpoint;
 mod cli;
 mod csv_reader;
-mod db_load;
 mod load;
+mod migration;
 mod output;
 mod params;
 mod progress;
@@ -33,13 +33,13 @@ mod rejects;
 mod setup;
 mod startup;
 
-pub const VERSION: &str = include_str!("../VERSION");
+pub(crate) const VERSION: &str = include_str!("../VERSION");
 
 #[tokio::main]
 async fn main() {
     let args = Args::parse();
-    if args.db.is_some() {
-        db_load::run_db_load(&args).await;
+    if args.duckdb.is_some() {
+        migration::run_migration(&args).await;
     }
     run_load_command(args).await;
 }

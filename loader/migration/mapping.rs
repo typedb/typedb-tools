@@ -24,29 +24,42 @@ pub(crate) struct OwnsMapping {
     pub(crate) value_type: ValueType,
     pub(crate) multi: bool,
     pub(crate) column_type: ColumnType,
+    pub(crate) raw_type: String,
 }
 
 impl OwnsMapping {
-    pub(crate) fn read(&self, expr: &str) -> String {
-        let value = match self.cast() {
+    pub(crate) fn typed(&self, expr: &str) -> String {
+        match self.cast() {
             Some(sql_type) => format!("{expr}::{sql_type}"),
             None => expr.to_owned(),
-        };
+        }
+    }
+
+    pub(crate) fn read(&self, expr: &str) -> String {
+        let value = self.typed(expr);
         if self.value_type == ValueType::String { format!("{value} COLLATE \"binary\"") } else { value }
     }
 
-    pub(crate) fn projection(&self) -> String {
+    pub(crate) fn projection(&self, table_alias: &str) -> String {
+        let column = format!("{table_alias}.{}", quoted(&self.column));
+        if self.multi { self.list(&column) } else { self.read(&column) }
+    }
+
+    pub(crate) fn element(&self) -> String {
         let column = quoted(&self.column);
-        match (self.multi, self.cast()) {
-            (true, Some(sql_type)) => format!("{column}::{sql_type}[]"),
-            (true, None) => column,
-            (false, _) => self.read(&column),
+        if self.multi { format!("unnest({column})") } else { column }
+    }
+
+    fn list(&self, column: &str) -> String {
+        match self.cast() {
+            Some(sql_type) => format!("{column}::{sql_type}[]"),
+            None => column.to_owned(),
         }
     }
 
     // A UNION's own type unification can round decimals, so every column of an attribute is read in one type.
     // Intervals are read as text: DuckDB compares them normalised (1 month = 30 days), TypeDB does not.
-    fn cast(&self) -> Option<&'static str> {
+    pub(crate) fn cast(&self) -> Option<&'static str> {
         match (&self.column_type, self.value_type) {
             (ColumnType::StringLike | ColumnType::Interval, _) => Some("VARCHAR"),
             (ColumnType::Double, ValueType::Double) => None,
@@ -263,8 +276,14 @@ pub(crate) fn resolve(catalog: &Catalog, schema: &Schema, diagnostics: &mut Diag
         }
         check_role_binding_columns(target, &skipped, diagnostics);
 
+        if target.is_relation && mapping.roles.is_empty() {
+            diagnostics.error(format!(
+                "relation table '{}' fills no role, so every row would be a relation without players",
+                target.table.name
+            ));
+        }
         for relates in &target.object.relates {
-            if !mapping.roles.iter().any(|r| r.role == relates.role) {
+            if !mapping.roles.is_empty() && !mapping.roles.iter().any(|r| r.role == relates.role) {
                 diagnostics.warning(format!(
                     "relation table '{}' never fills role '{}:{}'",
                     target.table.name, target.object.label, relates.role
@@ -647,6 +666,7 @@ fn bind_owns(
         value_type,
         multi,
         column_type: element_type.clone(),
+        raw_type: column.raw_type.clone(),
     });
 }
 

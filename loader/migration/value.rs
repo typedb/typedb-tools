@@ -19,10 +19,10 @@ const EPOCH_DAYS_FROM_CE: i32 = 719_163;
 pub(crate) const DECIMAL_FRACTIONAL_DIGITS: u8 = 19;
 
 // chrono's `NaiveDate::MIN..=MAX` and `NaiveDateTime::MIN..=MAX`, from the epoch.
-const MIN_EPOCH_DAYS: i64 = -95_746_129 - EPOCH_DAYS_FROM_CE as i64;
-const MAX_EPOCH_DAYS: i64 = 95_745_399 - EPOCH_DAYS_FROM_CE as i64;
-const MIN_EPOCH_SECONDS: i64 = -8_334_601_228_800;
-const MAX_EPOCH_SECONDS: i64 = 8_210_266_876_799;
+pub(crate) const MIN_EPOCH_DAYS: i64 = -95_746_129 - EPOCH_DAYS_FROM_CE as i64;
+pub(crate) const MAX_EPOCH_DAYS: i64 = 95_745_399 - EPOCH_DAYS_FROM_CE as i64;
+pub(crate) const MIN_EPOCH_SECONDS: i64 = -8_334_601_228_800;
+pub(crate) const MAX_EPOCH_SECONDS: i64 = 8_210_266_876_799;
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum TypeDBValue {

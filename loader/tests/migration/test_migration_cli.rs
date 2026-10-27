@@ -9,6 +9,7 @@ use std::{
     fs,
     path::{Path, PathBuf},
     process::Command,
+    time::{Duration, Instant},
 };
 
 use duckdb::Connection;
@@ -29,7 +30,7 @@ fn loader_binary() -> PathBuf {
 }
 
 fn setup(test_name: &str) -> Result<std::path::PathBuf, Box<dyn Error>> {
-    let dir = std::env::temp_dir().join(format!("typedb-loader-db-cli-{test_name}-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("typedb-migration-cli-{test_name}-{}", std::process::id()));
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir)?;
     let conn = Connection::open(dir.join("fixture.duckdb"))?;
@@ -41,17 +42,20 @@ fn setup(test_name: &str) -> Result<std::path::PathBuf, Box<dyn Error>> {
     Ok(dir)
 }
 
+fn loader_command(dir: &Path, extra: &[&str]) -> Command {
+    let mut command = Command::new(loader_binary());
+    command
+        .arg("--duckdb")
+        .arg(dir.join("fixture.duckdb"))
+        .arg("--schema-file")
+        .arg(dir.join("schema.tql"))
+        .args(["--database", "fixture"])
+        .args(extra);
+    command
+}
+
 fn run_loader(dir: &Path, extra: &[&str]) -> std::process::Output {
-    let mut args = vec![
-        "--db".to_owned(),
-        dir.join("fixture.duckdb").to_string_lossy().into_owned(),
-        "--schema-file".to_owned(),
-        dir.join("schema.tql").to_string_lossy().into_owned(),
-        "--database".to_owned(),
-        "fixture".to_owned(),
-    ];
-    args.extend(extra.iter().map(|s| s.to_string()));
-    Command::new(loader_binary()).args(&args).output().expect("failed to run the loader binary")
+    loader_command(dir, extra).output().expect("failed to run the loader binary")
 }
 
 #[test]
@@ -125,7 +129,7 @@ fn dry_run_writes_nothing() -> Result<(), Box<dyn Error>> {
 }
 
 #[test]
-fn csv_flags_conflict_with_db() -> Result<(), Box<dyn Error>> {
+fn csv_options_conflict_with_duckdb() -> Result<(), Box<dyn Error>> {
     let dir = setup("conflict")?;
     let output = run_loader(&dir, &["--data", "rows.csv"]);
     assert!(!output.status.success());
@@ -142,7 +146,7 @@ fn unsupported_extensions_point_to_the_right_path() -> Result<(), Box<dyn Error>
     fs::write(dir.join("rows.csv"), "a,b\n")?;
     let csv = dir.join("rows.csv").to_string_lossy().into_owned();
     let output = Command::new(loader_binary())
-        .args(["--db", &csv, "--schema-file", &dir.join("schema.tql").to_string_lossy()])
+        .args(["--duckdb", &csv, "--schema-file", &dir.join("schema.tql").to_string_lossy()])
         .output()?;
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("--data"), "CSV hint expected");
@@ -156,7 +160,7 @@ fn invalid_database_names_fail_before_converting() -> Result<(), Box<dyn Error>>
     let dir = setup("name")?;
     let out = dir.join("out").to_string_lossy().into_owned();
     let output = Command::new(loader_binary())
-        .args(["--db", &dir.join("fixture.duckdb").to_string_lossy(), "--schema-file"])
+        .args(["--duckdb", &dir.join("fixture.duckdb").to_string_lossy(), "--schema-file"])
         .arg(dir.join("schema.tql"))
         .args(["--database", "my data", "--files-only", &out])
         .output()?;
@@ -164,6 +168,46 @@ fn invalid_database_names_fail_before_converting() -> Result<(), Box<dyn Error>>
     assert!(String::from_utf8_lossy(&output.stderr).contains("'my data' is not a valid TypeDB database name"));
     assert!(!dir.join("out").exists(), "nothing is written for an invalid name");
 
+    let _ = fs::remove_dir_all(&dir);
+    Ok(())
+}
+
+#[test]
+fn a_staged_data_file_is_refused_before_connecting() -> Result<(), Box<dyn Error>> {
+    let dir = setup("staged")?;
+    let staged = dir.join("fixture.data.typedb");
+    fs::write(&staged, b"left by an earlier run whose import failed")?;
+    let connection = ["--address", "127.0.0.1:1", "--username", "admin", "--password", "x", "--tls-disabled"];
+    let output = run_loader(&dir, &connection);
+    assert_eq!(output.status.code(), Some(2), "user-input error exit code expected");
+    assert!(String::from_utf8_lossy(&output.stderr).contains("pass --overwrite"));
+    let output = run_loader(&dir, &[&connection[..], &["--overwrite"]].concat());
+    assert_eq!(output.status.code(), Some(3), "with --overwrite the run proceeds to connect");
+    assert!(String::from_utf8_lossy(&output.stderr).contains("failed to connect"));
+    assert_eq!(fs::read(&staged)?, b"left by an earlier run whose import failed", "untouched until converted");
+    let _ = fs::remove_dir_all(&dir);
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn a_termination_signal_removes_the_partial_file() -> Result<(), Box<dyn Error>> {
+    let dir = setup("sigterm")?;
+    Connection::open(dir.join("fixture.duckdb"))?
+        .execute_batch("INSERT INTO person SELECT 10 + i, 'name' || i FROM range(2000000) t(i);")?;
+    let out = dir.join("out");
+    let mut loader = loader_command(&dir, &["--files-only", out.to_str().unwrap()]).spawn()?;
+    let partial = out.join(".fixture.data.typedb.partial");
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !partial.exists() {
+        assert!(loader.try_wait()?.is_none(), "the loader finished before the signal");
+        assert!(Instant::now() < deadline, "the conversion did not start in time");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(Command::new("kill").args(["-TERM", &loader.id().to_string()]).status()?.success());
+    assert_eq!(loader.wait()?.code(), Some(143));
+    assert!(!partial.exists(), "the partial file was left behind");
+    assert!(!out.join("fixture.data.typedb").exists());
     let _ = fs::remove_dir_all(&dir);
     Ok(())
 }

@@ -7,7 +7,7 @@ progress is checkpointed so an interrupted run can be resumed.
 
 ## Loading from database files
 
-`typedb loader --db <file>` loads a database file (DuckDB) into TypeDB: the tables are
+`typedb loader --duckdb <file>` migrates a DuckDB database into TypeDB: the tables are
 mapped onto `--schema-file`, converted, and imported into `--database` in one run, with
 the schema's constraints enforced by the server. `--dry-run` converts without writing;
 `--files-only <dir>` writes the data file for a later `database import` instead of

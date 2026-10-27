@@ -69,8 +69,8 @@
 	path = "main.rs"
 
 [[test]]
-	name = "test-db-load-cli"
-	path = "tests/db_load/test_db_load_cli.rs"
+	name = "test-migration-cli"
+	path = "tests/migration/test_migration_cli.rs"
 
 [[test]]
 	name = "test-loader"

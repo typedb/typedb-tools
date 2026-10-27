@@ -1,25 +1,25 @@
 # Loading DuckDB databases into TypeDB
 
-`typedb loader --db` loads a DuckDB database into TypeDB: it maps the tables onto a
+`typedb loader --duckdb` migrates a DuckDB database into TypeDB: it maps the tables onto a
 hand-written TypeDB schema, converts the data to the server's import format and imports
 it, in one run. The schema's constraints are enforced by the server at import. The DuckDB
 file is opened read-only.
 
 ```bash
 # load into a server
-typedb loader --db my-data.duckdb --schema-file my-schema.tql \
+typedb loader --duckdb my-data.duckdb --schema-file my-schema.tql \
   --database mydb --address localhost:1729 --username admin
 
 # check the mapping and convert without writing or loading anything
-typedb loader --db my-data.duckdb --schema-file my-schema.tql --dry-run
+typedb loader --duckdb my-data.duckdb --schema-file my-schema.tql --dry-run
 
 # write the data file instead of loading (offline; --overwrite replaces an existing file)
-typedb loader --db my-data.duckdb --schema-file my-schema.tql --database mydb --files-only out/
+typedb loader --duckdb my-data.duckdb --schema-file my-schema.tql --database mydb --files-only out/
 # → out/mydb.data.typedb, importable together with the original schema file:
 #   typedb console --command="database import mydb my-schema.tql out/mydb.data.typedb"
 ```
 
-The source kind is recognised from the file extension (`.duckdb`, `.ddb`, `.db`). The
+The file is opened as a DuckDB database whatever its extension. The
 target database is created by the import and must not exist yet; `--database` defaults to
 the file's stem.
 
@@ -255,16 +255,18 @@ For data without natural 64-bit ids, `row_number() OVER ()` at staging time is a
 Before anything is written, the loader checks the structure (the `_iid` contract, FKs
 referencing `_iid`, supported column types, well-formed directives) and the mapping (every
 mapped type, attribute and role exists in the schema, with the right kind and a compatible
-value type). Values TypeDB cannot hold (see the table above) fail the conversion, which
-names the attribute and the columns feeding it. A dry run converts too, so it finds them.
-Any error stops the run with nothing written; warnings are printed and the run proceeds.
+value type). It then checks, with one DuckDB query per column, what would make the data
+file invalid: values TypeDB cannot hold (see the table above) and relation rows filling no
+role, since a relation cannot exist without players. Each violation is reported with its
+count and the first `_iid`s, so a dry run finds them all in minutes, not after hours of
+conversion. Any error stops the run with nothing written; warnings are printed and the run
+proceeds.
 
 Everything the schema constrains is enforced by the server at import, as for any other
 data: `@regex`, `@values` and `@range` as each attribute is created, which the import does
 first; `@card` of ownerships, roles and `plays`, `@key` and `@unique` when the import
 completes. Equal values are one attribute, and a player named twice in a role is one
-player. A row filling no role is rejected by the server: a relation cannot exist without
-players.
+player. A relation table without a role column fails validation.
 
 ## Ids
 
@@ -285,6 +287,12 @@ the data file with the schema file it was prepared against.
 
 Tables are written in name order, entity tables first. A relation that plays a role may
 come after the relation it plays in; the import links such players once every relation is
-read. A one-shot load stages the data file next to the DuckDB file and removes it after
-the import; `--files-only` writes it into the given directory instead. The file is written
-under a temporary name and renamed on completion, and an interrupted run removes it.
+read. A one-shot load stages the data file as `<database>.data.typedb` next to the DuckDB
+file and removes it once the import has succeeded; `--files-only` writes it into the given
+directory instead. Either way an existing file is refused unless `--overwrite` is passed.
+The file is written under a temporary name and renamed on completion, and an interrupted
+conversion (Ctrl+C or SIGTERM) removes it. The import starts once the file is complete; if
+the connection opened at the start did not survive the conversion, the loader reconnects (up
+to twelve attempts, ten seconds apart) and starts the import over. If the import still fails, or
+is interrupted, the data file is kept and the loader prints the `typedb console` command
+that imports it, so the conversion need not be repeated.
