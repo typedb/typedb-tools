@@ -49,13 +49,13 @@ impl<W: Write> Emitter<W> {
 pub(crate) fn emit(
     conn: &Connection,
     plan: &MappingPlan,
-    typedb_version: &str,
+    loader_version: &str,
     original_database: &str,
     output: impl Write,
 ) -> Result<Checksums, String> {
     let mut emitter = Emitter::new(output);
     emitter.write_item(item::Item::Header(item::Header {
-        typedb_version: typedb_version.to_owned(),
+        typedb_version: loader_version.to_owned(),
         original_database: original_database.to_owned(),
         guarantees: Some(item::header::Guarantees {
             ordering: item::header::guarantees::Ordering::AttributesEntitiesRelations.into(),
@@ -76,19 +76,19 @@ pub(crate) fn emit(
 struct TableNumbering {
     first_id: u64,
     count: u64,
-    iids: Iids,
+    iids: Option<Iids>,
 }
 
 enum Iids {
-    Consecutive { first: u64, count: u64 },
-    Sorted(Vec<u64>),
+    Consecutive { first: u64 },
+    Ranked(String),
 }
 
 impl TableNumbering {
-    fn id_of(&self, iid: u64) -> Option<u64> {
-        let rank = match &self.iids {
-            Iids::Consecutive { first, count } => iid.checked_sub(*first).filter(|rank| rank < count),
-            Iids::Sorted(iids) => iids.binary_search(&iid).ok().map(|rank| rank as u64),
+    fn id_of(&self, iid: u64, rank: Option<i64>) -> Option<u64> {
+        let rank = match self.iids.as_ref().expect("iids are collected for the tables that play roles") {
+            Iids::Consecutive { first } => iid.checked_sub(*first).filter(|rank| *rank < self.count),
+            Iids::Ranked(_) => rank.map(|rank| rank as u64),
         };
         rank.map(|rank| self.first_id + rank)
     }
@@ -100,25 +100,28 @@ fn number_instances<'a>(conn: &Connection, plan: &'a MappingPlan) -> Result<Hash
         plan.tables.iter().flat_map(|table| table.roles.iter().map(|role| role.player_table.as_str())).collect();
     let mut next_ids: HashMap<&str, u64> = HashMap::new();
     let mut numbering = HashMap::new();
-    for table in &plan.tables {
+    for (index, table) in plan.tables.iter().enumerate() {
         let read_error =
             |err: duckdb::Error| format!("failed to read the {IID_COLUMN} values of '{}': {err}", table.name);
         let sql = format!("SELECT count(*)::UBIGINT, min({iid}), max({iid}) FROM {}", quoted(&table.name));
         let (count, min, max): (u64, Option<u64>, Option<u64>) =
             conn.query_row(&sql, [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?))).map_err(read_error)?;
         let iids = match (min, max) {
+            _ if !player_tables.contains(table.name.as_str()) => None,
             // `_iid` is unique, so a span as wide as the count has no gaps.
             (Some(min), Some(max)) if u128::from(max - min) + 1 == u128::from(count) => {
-                Iids::Consecutive { first: min, count }
+                Some(Iids::Consecutive { first: min })
             }
-            _ if player_tables.contains(table.name.as_str()) => {
-                let mut iids = Vec::with_capacity(count as usize);
-                let sql = format!("SELECT {iid} FROM {}", quoted(&table.name));
-                for_each_row(conn, &sql, read_error, |row| Ok(iids.push(row.get(0).map_err(read_error)?)))?;
-                iids.sort_unstable();
-                Iids::Sorted(iids)
+            _ => {
+                let ranks = format!("temp.typedb_loader_rank_{index}");
+                let sql = format!(
+                    "CREATE OR REPLACE TEMP TABLE {ranks} AS \
+                     SELECT {iid}, row_number() OVER (ORDER BY {iid}) - 1 AS rank FROM {}",
+                    quoted(&table.name)
+                );
+                conn.execute_batch(&sql).map_err(read_error)?;
+                Some(Iids::Ranked(ranks))
             }
-            _ => Iids::Sorted(Vec::new()),
         };
         let next_id = next_ids.entry(&table.type_label).or_default();
         numbering.insert(table.name.as_str(), TableNumbering { first_id: *next_id, count, iids });
@@ -215,9 +218,12 @@ fn for_each_row(
 }
 
 fn attribute_select(table: &str, owns: &OwnsMapping) -> String {
-    let column = quoted(&owns.column);
-    let element = if owns.multi { format!("unnest({column})") } else { column.clone() };
-    format!("SELECT DISTINCT {} AS v FROM {} WHERE {column} IS NOT NULL", owns.read(&element), quoted(table))
+    format!(
+        "SELECT DISTINCT {} AS v FROM {} WHERE {} IS NOT NULL",
+        owns.read(&owns.element()),
+        quoted(table),
+        quoted(&owns.column)
+    )
 }
 
 fn emit_objects(
@@ -226,12 +232,32 @@ fn emit_objects(
     numbering: &HashMap<&str, TableNumbering>,
     emitter: &mut Emitter<impl Write>,
 ) -> Result<(), String> {
-    let columns = std::iter::once(quoted(IID_COLUMN))
-        .chain(table.owns.iter().map(OwnsMapping::projection))
-        .chain(table.roles.iter().map(|role| quoted(&role.column)));
     // Loader-owned aliases keep a column named `rowid` from shadowing the scan's rowid.
-    let selects: Vec<String> = columns.enumerate().map(|(index, column)| format!("{column} AS c{index}")).collect();
-    let sql = format!("SELECT {} FROM {} ORDER BY 1", selects.join(", "), quoted(&table.name));
+    let mut selects = vec![format!("t.{} AS c0", quoted(IID_COLUMN))];
+    for owns in &table.owns {
+        selects.push(format!("{} AS c{}", owns.projection("t"), selects.len()));
+    }
+    let mut joins = String::new();
+    let mut role_columns: Vec<(usize, Option<usize>)> = Vec::new();
+    for (index, role) in table.roles.iter().enumerate() {
+        let column = selects.len();
+        selects.push(format!("t.{} AS c{column}", quoted(&role.column)));
+        let rank_column = match &numbering[role.player_table.as_str()].iids {
+            Some(Iids::Ranked(ranks)) => {
+                let alias = format!("r{index}");
+                joins += &format!(
+                    " LEFT JOIN {ranks} {alias} ON t.{} = {alias}.{}",
+                    quoted(&role.column),
+                    quoted(IID_COLUMN)
+                );
+                selects.push(format!("{alias}.rank AS c{}", selects.len()));
+                Some(selects.len() - 1)
+            }
+            _ => None,
+        };
+        role_columns.push((column, rank_column));
+    }
+    let sql = format!("SELECT {} FROM {} t{joins} ORDER BY 1", selects.join(", "), quoted(&table.name));
     let scan_error = |err: duckdb::Error| format!("scan of '{}' failed: {err}", table.name);
 
     let player_numbering: Vec<&TableNumbering> =
@@ -288,10 +314,14 @@ fn emit_objects(
         if table.is_relation {
             let mut roles: Vec<item::relation::Role> = Vec::new();
             for (index, (role, players)) in table.roles.iter().zip(&player_numbering).enumerate() {
-                let column_index = 1 + table.owns.len() + index;
+                let (column_index, rank_index) = role_columns[index];
                 let player_iid: Option<u64> = row.get(column_index).map_err(|err| with_context(err.to_string()))?;
                 let Some(player_iid) = player_iid else { continue };
-                let player_id = players.id_of(player_iid).ok_or_else(|| {
+                let rank: Option<i64> = rank_index
+                    .map(|rank_index| row.get(rank_index))
+                    .transpose()
+                    .map_err(|err| with_context(err.to_string()))?;
+                let player_id = players.id_of(player_iid, rank).ok_or_else(|| {
                     with_context(format!(
                         "column '{}' holds {IID_COLUMN} {player_iid}, which table '{}' does not have",
                         role.column, role.player_table
@@ -310,6 +340,9 @@ fn emit_objects(
                     None => roles.push(item::relation::Role { label: role.scoped_role.clone(), players: vec![player] }),
                 }
                 emitter.checksums.role_count += 1;
+            }
+            if roles.is_empty() {
+                return Err(with_context("no role is filled; a relation cannot exist without players".to_owned()));
             }
             emitter.write_item(item::Item::Relation(item::Relation {
                 id: object_id(&table.type_label, label_scoped_id),

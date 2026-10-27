@@ -12,7 +12,7 @@
 
 use std::fs;
 
-use typedb_migration::{Migration, PrepareError};
+use typedb_migration::{Migration, PrepareError, Source};
 
 #[test]
 fn parse_all_behaviour_schemas() {
@@ -31,7 +31,7 @@ fn parse_all_behaviour_schemas() {
             continue;
         }
         let schema = fs::read_to_string(&path).unwrap();
-        match Migration::prepare(&empty_db, &schema, &std::env::temp_dir()) {
+        match Migration::prepare(&Source::DuckDb(empty_db.clone()), &schema, &std::env::temp_dir()) {
             Ok(_) | Err(PrepareError::Invalid { .. }) => ok += 1,
             Err(PrepareError::Setup(message)) => {
                 setup_failures.push((path.file_name().unwrap().to_string_lossy().into_owned(), message));

@@ -4,44 +4,60 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 
-use clap::Parser;
+use clap::{ArgGroup, Parser};
 
 pub const USERNAME_VALUE_NAME: &str = "username";
 
-#[derive(Parser, Debug)]
-#[command(author, about)]
-pub struct Args {
-    /// Load from a database file instead of a CSV (DuckDB: .duckdb/.ddb/.db extensions).
-    /// The tables are mapped onto `--schema-file` and imported into a new `--database`.
-    #[arg(long, value_name = "path to database file (.duckdb)",
-        help_heading = "Database file loading",
-        conflicts_with_all = ["query", "data", "header", "no_header", "null_values", "max_rows",
-            "batch_rows", "parallel_batches", "stop_on_error", "no_stop_on_error", "max_rejects",
-            "create_db", "output_dir", "no_checkpoint", "resume"])]
-    pub db: Option<String>,
+const CSV_OPTIONS: [&str; 15] = [
+    "query",
+    "data",
+    "header",
+    "no_header",
+    "null_values",
+    "max_rows",
+    "batch_rows",
+    "parallel_batches",
+    "stop_on_error",
+    "no_stop_on_error",
+    "max_rejects",
+    "create_db",
+    "output_dir",
+    "no_checkpoint",
+    "resume",
+];
 
-    /// With --db: write `<database>.data.typedb` into this directory instead of importing it.
+#[derive(Parser, Debug)]
+#[command(author, about, group = ArgGroup::new("migration_options").multiple(true).conflicts_with_all(CSV_OPTIONS))]
+pub struct Args {
+    /// Migrate a DuckDB database instead of loading a CSV: its tables are mapped onto `--schema-file`,
+    /// converted and imported into a new `--database`.
+    #[arg(long, value_name = "path to DuckDB file", help_heading = "Migration", group = "migration_options")]
+    pub duckdb: Option<String>,
+
+    /// With --duckdb: write `<database>.data.typedb` into this directory instead of importing it.
     #[arg(
         long = "files-only",
         value_name = "path to output directory",
-        help_heading = "Database file loading",
-        requires = "db"
+        help_heading = "Migration",
+        requires = "duckdb",
+        group = "migration_options"
     )]
     pub files_only: Option<String>,
 
-    /// With --db: map and convert the database, printing the mapping and the counts, without
+    /// With --duckdb: map and convert the database, printing the mapping and the counts, without
     /// writing or loading anything.
     #[arg(
         long = "dry-run",
         default_value = "false",
-        help_heading = "Database file loading",
-        requires = "db",
-        conflicts_with = "files_only"
+        help_heading = "Migration",
+        requires = "duckdb",
+        conflicts_with = "files_only",
+        group = "migration_options"
     )]
     pub dry_run: bool,
 
-    /// With --db --files-only: replace an existing data file instead of refusing.
-    #[arg(long, default_value = "false", help_heading = "Database file loading", requires = "files_only")]
+    /// With --duckdb: replace an existing data file instead of refusing.
+    #[arg(long, default_value = "false", help_heading = "Migration", requires = "duckdb", group = "migration_options")]
     pub overwrite: bool,
 
     /// Path to a TypeQL query file used as the loading template.
@@ -50,7 +66,7 @@ pub struct Args {
     pub query: Option<String>,
 
     /// Name of the database to load data into.
-    #[arg(long, value_name = "database")]
+    #[arg(long, visible_alias = "db", value_name = "database")]
     pub database: Option<String>,
 
     /// Path to the data file to load.
@@ -157,4 +173,34 @@ pub struct Args {
     /// overridden on the command line.
     #[arg(long = "resume", value_name = "path to previous output directory")]
     pub resume: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::{CommandFactory, error::ErrorKind};
+
+    use super::{Args, CSV_OPTIONS};
+
+    #[test]
+    fn every_csv_option_conflicts_with_migration_options() {
+        let shared = ["database", "schema_file", "addresses", "username", "password", "tls_disabled", "tls_root_ca"];
+        let mut command = Args::command();
+        command.build(); // the group learns its members here
+        let group = command.get_groups().find(|group| group.get_id() == "migration_options").unwrap();
+        let migration: Vec<&str> = group.get_args().map(|id| id.as_str()).collect();
+        for arg in command.get_arguments().filter(|arg| arg.get_long() != Some("help")) {
+            let id = arg.get_id().as_str();
+            if shared.contains(&id) || migration.contains(&id) {
+                continue;
+            }
+            assert!(CSV_OPTIONS.contains(&id), "'{id}' is in neither list; add it to CSV_OPTIONS or to this test");
+            let option = format!("--{}", arg.get_long().unwrap());
+            let mut argv = vec!["typedb-loader", "--duckdb", "x.duckdb", &option];
+            if arg.get_action().takes_values() && arg.get_num_args().is_none_or(|range| range.min_values() > 0) {
+                argv.push("1");
+            }
+            let err = Args::command().try_get_matches_from(&argv).expect_err(&format!("{option} was accepted"));
+            assert_eq!(err.kind(), ErrorKind::ArgumentConflict, "{option}: {err}");
+        }
+    }
 }

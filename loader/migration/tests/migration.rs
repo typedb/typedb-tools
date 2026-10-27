@@ -13,7 +13,7 @@ use std::{
 
 use duckdb::Connection;
 use prost::Message;
-use typedb_migration::{Checksums, Migration, PrepareError};
+use typedb_migration::{Checksums, Migration, PrepareError, Source};
 use typedb_protocol::migration::{Item, MigrationValue, item, migration_value};
 
 const SCHEMA: &str = r#"define
@@ -97,7 +97,7 @@ fn scratch(test_name: &str, schema: &str, sql: &str) -> Result<Scratch, Box<dyn 
 
 fn prepare(dir: &Scratch) -> Result<Migration, PrepareError> {
     let schema = fs::read_to_string(dir.0.join("schema.tql")).expect("schema");
-    Migration::prepare(&dir.0.join("fixture.duckdb"), &schema, &dir.0.join("spill"))
+    Migration::prepare(&Source::DuckDb(dir.0.join("fixture.duckdb")), &schema, &dir.0.join("spill"))
 }
 
 fn validation_errors(dir: &Scratch) -> Vec<String> {
@@ -526,25 +526,67 @@ fn nanosecond_timestamps_and_date_lists_convert_exactly() -> Result<(), Box<dyn 
 }
 
 #[test]
-fn values_typedb_cannot_hold_fail_the_conversion() -> Result<(), Box<dyn Error>> {
+fn values_typedb_cannot_hold_are_found_before_the_conversion() -> Result<(), Box<dyn Error>> {
     let cases = [
-        ("happened TIMESTAMP_NS", "'infinity'", "infinite TIMESTAMP"),
-        ("happened TIMESTAMP", "'1500-01-01'::TIMESTAMP - INTERVAL 280000 YEARS", "timestamp -8850778329600 seconds"),
-        ("day DATE", "'-infinity'", "infinite DATE"),
-        ("score DOUBLE[]", "['nan'::DOUBLE, 1.5]", "NaN is not a finite double"),
-        ("span INTERVAL", "INTERVAL '1 month -2 days'", "negative INTERVAL"),
-        ("span INTERVAL[]", "[INTERVAL '5124096 hours']", "INTERVAL '5124096:00:00' has a time part beyond"),
-        ("count UBIGINT", "18446744073709551615", "UBIGINT value 18446744073709551615 does not fit"),
+        ("happened TIMESTAMP_NS", "'infinity'", "hold a timestamp that is infinite or outside"),
+        ("happened TIMESTAMP", "'1500-01-01'::TIMESTAMP - INTERVAL 280000 YEARS", "hold a timestamp that is"),
+        (
+            "happened TIMESTAMP",
+            "(DATE '1970-01-01' + (-96465292))::TIMESTAMP - INTERVAL 1 MICROSECOND",
+            "hold a timestamp",
+        ),
+        ("day DATE", "'-infinity'", "hold a date that is infinite or outside TypeDB's range"),
+        ("score DOUBLE[]", "['nan'::DOUBLE, 1.5]", "hold a double that is not finite"),
+        ("span INTERVAL", "INTERVAL '1 month -2 days'", "hold an interval with a negative part or a time part"),
+        ("span INTERVAL[]", "[INTERVAL '5124096 hours']", "hold an interval with a negative part or a time part"),
+        ("span INTERVAL", "INTERVAL '5124095:34:33.709552'", "hold an interval with a negative part or a time part"),
+        ("count UBIGINT", "18446744073709551615", "hold an integer that does not fit TypeDB's 64-bit integer"),
     ];
     for (column, value, fragment) in cases {
-        let sql =
-            format!("CREATE TABLE event (_iid UBIGINT PRIMARY KEY, {column}); INSERT INTO event VALUES (1, {value});");
+        let sql = format!(
+            "CREATE TABLE event (_iid UBIGINT PRIMARY KEY, {column}); INSERT INTO event VALUES (2, NULL), (7, {value});"
+        );
         let dir = scratch("unstorable", EVENTS, &sql)?;
-        let error = convert(&dir).expect_err(&format!("{value} must fail the conversion")).to_string();
         let attribute = column.split(' ').next().unwrap();
-        let context = format!("attribute '{attribute}' (from [\"event.{attribute}\"]): {fragment}");
-        assert!(error.contains(&context), "{error:?} does not contain {context:?}");
+        let context = format!("table 'event': column '{attribute}': 1 row(s) {fragment}");
+        assert_error(&validation_errors(&dir), &[&context, "e.g. _iid 7"]);
     }
+
+    // The edges themselves are inside the range, in exact microseconds.
+    let dir = scratch(
+        "storable-edges",
+        EVENTS,
+        "CREATE TABLE event (_iid UBIGINT PRIMARY KEY, happened TIMESTAMP, span INTERVAL);
+         INSERT INTO event VALUES
+           (1, (DATE '1970-01-01' + 95026236)::TIMESTAMP + INTERVAL '23:59:59.999999', INTERVAL '5124095:34:33.709551'),
+           (2, (DATE '1970-01-01' + (-96465292))::TIMESTAMP, INTERVAL '0 seconds');",
+    )?;
+    assert_eq!(convert(&dir)?.len(), 2 + 4 + 2);
+    Ok(())
+}
+
+#[test]
+fn decimal_integer_parts_beyond_typedb_are_found_before_the_conversion() -> Result<(), Box<dyn Error>> {
+    let dir = scratch(
+        "decimal-integer-part",
+        "define\n  attribute amount value decimal;\n  entity item, owns amount;\n",
+        "CREATE TABLE item (_iid UBIGINT PRIMARY KEY, amount DECIMAL(38,2));
+         INSERT INTO item VALUES (1, 99999999999999999999.5), (2, 1.5), (3, 9223372036854775807.99),
+                                (4, -9223372036854775808.00), (5, -9223372036854775808.01);",
+    )?;
+    let errors = validation_errors(&dir);
+    let fragment = "column 'amount': 2 row(s) hold a decimal whose integer part is beyond TypeDB's 64-bit range";
+    assert_error(&errors, &[fragment, "_iid 1, 5"]);
+
+    // Wide integers and decimals feeding doubles are rounded, not refused.
+    let dir = scratch(
+        "wide-to-double",
+        "define\n  attribute score value double;\n  entity item, owns score @card(0..);\n",
+        "CREATE TABLE item (_iid UBIGINT PRIMARY KEY, big UBIGINT, wide DECIMAL(38,19));
+         COMMENT ON COLUMN item.big IS '@typedb owns score'; COMMENT ON COLUMN item.wide IS '@typedb owns score';
+         INSERT INTO item VALUES (1, 18446744073709551615, 9999999999999999999.5);",
+    )?;
+    convert(&dir)?;
     Ok(())
 }
 
@@ -994,5 +1036,41 @@ fn the_source_database_is_left_untouched() -> Result<(), Box<dyn Error>> {
     let entities = convert(&dir)?.into_iter().filter(|item| matches!(item, item::Item::Entity(_))).count();
     assert_eq!(entities, 1);
     assert!(before == (fs::read(&db)?, fs::read(&wal)?), "the source database files changed");
+    Ok(())
+}
+
+#[test]
+fn relations_without_players_are_rejected() -> Result<(), Box<dyn Error>> {
+    let schema = "define\n  entity person, plays friendship:friend;\n  relation friendship, relates friend;\n";
+    let dir = scratch(
+        "no_role_column",
+        schema,
+        "CREATE TABLE person (_iid UBIGINT PRIMARY KEY);
+         CREATE TABLE friendship (_iid UBIGINT PRIMARY KEY);
+         COMMENT ON TABLE friendship IS '@typedb relation friendship';",
+    )?;
+    assert_error(&validation_errors(&dir), &["relation table 'friendship' fills no role"]);
+
+    let dir = scratch(
+        "skipped_role_column",
+        schema,
+        "CREATE TABLE person (_iid UBIGINT PRIMARY KEY);
+         CREATE TABLE friendship (_iid UBIGINT PRIMARY KEY, a UBIGINT REFERENCES person(_iid));
+         COMMENT ON TABLE friendship IS '@typedb relation friendship';
+         COMMENT ON COLUMN friendship.a IS '@typedb skip';",
+    )?;
+    assert_error(&validation_errors(&dir), &["relation table 'friendship' fills no role"]);
+
+    let dir = scratch(
+        "playerless",
+        schema,
+        "CREATE TABLE person (_iid UBIGINT PRIMARY KEY);
+         CREATE TABLE friendship (_iid UBIGINT PRIMARY KEY, a UBIGINT REFERENCES person(_iid),
+                                  b UBIGINT REFERENCES person(_iid));
+         COMMENT ON TABLE friendship IS '@typedb relation friendship (friend = a, friend = b)';
+         INSERT INTO person VALUES (1);
+         INSERT INTO friendship VALUES (1, 1, NULL), (2, NULL, NULL);",
+    )?;
+    assert_error(&validation_errors(&dir), &["relation table 'friendship': 1 row(s) fill no role", "e.g. _iid 2"]);
     Ok(())
 }

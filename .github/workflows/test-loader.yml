@@ -44,7 +44,7 @@ jobs:
             build --remote_cache https://storage.googleapis.com/typedb-engineers-bazel-remote-cache-europe-west1
       - run: bazel test //loader:loader-unit-tests --test_output=streamed
       - run: bazel test //loader/migration:unit-tests //loader/migration:test-migration --test_output=streamed
-      - run: bazel test //loader/tests/db_load:test-db-load-cli --test_output=streamed
+      - run: bazel test //loader/tests/migration:test-migration-cli --test_output=streamed
 
   assembly-tests:
     name: Loader assembly tests
