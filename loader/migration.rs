@@ -8,10 +8,7 @@ use std::{
     fs, io,
     path::{self, Path, PathBuf},
     process,
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
@@ -47,9 +44,9 @@ pub(crate) async fn run_migration(args: &Args) -> ! {
     let spill_dir = work_dir.join(format!(".{database}.{}.tmp", process::id()));
     let source = Source::DuckDb(db_path.clone());
     println!("Migrating from {source}");
+    let cleanup = on_interrupt(spill_dir.clone());
     let migration = prepare(&source, &schema_text, &spill_dir);
     if args.dry_run {
-        on_interrupt(vec![spill_dir], None);
         let started = Instant::now();
         let result = migration.run(io::sink(), VERSION.trim(), &original_database);
         drop(migration); // closing DuckDB removes its spill directory; exiting would not
@@ -71,7 +68,11 @@ pub(crate) async fn run_migration(args: &Args) -> ! {
         "The prepared data file is kept: {}\nRetry the import without converting again with:\n  {import_command}",
         data_path.display()
     );
-    let importing = on_interrupt(vec![spill_dir, partial_path(&data_path)], Some(retry_hint.clone()));
+    {
+        let mut cleanup = cleanup.lock().expect("the interrupt handler never panics while holding the lock");
+        cleanup.leftovers.push(partial_path(&data_path));
+        cleanup.retry_hint = Some(retry_hint.clone());
+    }
     if let Err(message) = write_data_file(migration, &data_path, &original_database) {
         fatal_with(ExitCode::MigrationError, message);
     }
@@ -84,7 +85,7 @@ pub(crate) async fn run_migration(args: &Args) -> ! {
 
     println!("Importing into '{database}' from {} (kept if the import fails)...", data_path.display());
     let started = Instant::now();
-    importing.store(true, Ordering::SeqCst);
+    cleanup.lock().expect("the interrupt handler never panics while holding the lock").importing = true;
     match import(&connection, driver, &database, &schema_text, &data_path).await {
         Ok(()) => {
             remove_if_exists(&data_path);
@@ -217,25 +218,33 @@ fn console_import_command(args: &Args, database: &str, schema_path: &str, data_p
     format!("{command} --command=\"database import {database} {} {}\"", schema_path.display(), data_path.display())
 }
 
-// An interrupt during the import keeps the data file for a retry, as a failed import does; the server discards
-// the broken-off import. The returned flag tells the handler that the import has started.
-fn on_interrupt(leftovers: Vec<PathBuf>, retry_hint: Option<String>) -> Arc<AtomicBool> {
-    let importing = Arc::new(AtomicBool::new(false));
+// What an interrupt removes and says grows as the run proceeds: the spill directory from the start, the partial
+// data file once the conversion writes, and during the import the data file is kept for a retry, as after a
+// failed import (the server discards the broken-off import).
+struct Cleanup {
+    leftovers: Vec<PathBuf>,
+    retry_hint: Option<String>,
+    importing: bool,
+}
+
+fn on_interrupt(spill_dir: PathBuf) -> Arc<Mutex<Cleanup>> {
+    let cleanup = Arc::new(Mutex::new(Cleanup { leftovers: vec![spill_dir], retry_hint: None, importing: false }));
     let mut signals = match Termination::listen() {
         Ok(signals) => signals,
         Err(err) => {
             println_warning!("interrupts will not be handled: {err}");
-            return importing;
+            return cleanup;
         }
     };
-    let importing_signal = importing.clone();
+    let state = cleanup.clone();
     tokio::spawn(async move {
         let Some(exit_code) = signals.recv().await else { return };
-        for path in &leftovers {
+        let cleanup = state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        for path in &cleanup.leftovers {
             remove_if_exists(path);
         }
-        match retry_hint {
-            Some(retry_hint) if importing_signal.load(Ordering::SeqCst) => {
+        match &cleanup.retry_hint {
+            Some(retry_hint) if cleanup.importing => {
                 println_error!("interrupted during the import; the server discards the partial database");
                 println!("{retry_hint}");
             }
@@ -243,7 +252,7 @@ fn on_interrupt(leftovers: Vec<PathBuf>, retry_hint: Option<String>) -> Arc<Atom
         }
         process::exit(exit_code);
     });
-    importing
+    cleanup
 }
 
 fn output_data_path(dir: &Path, database: &str, overwrite: bool) -> PathBuf {

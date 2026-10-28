@@ -40,8 +40,9 @@ async fn main() {
     let args = Args::parse();
     if args.duckdb.is_some() {
         migration::run_migration(&args).await;
+    } else {
+        run_load_command(args).await;
     }
-    run_load_command(args).await;
 }
 
 async fn run_load_command(args: Args) {

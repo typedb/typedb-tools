@@ -4,12 +4,14 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 
+use std::collections::HashSet;
+
 use duckdb::Connection;
 
 use crate::{
     Diagnostics,
     catalog::ColumnType,
-    mapping::{IID_COLUMN, MappingPlan, OwnsMapping, TableMapping, quoted},
+    mapping::{IID_COLUMN, MappingPlan, OwnsMapping, RoleBinding, TableKind, TableMapping, quoted},
     schema::ValueType,
     value::{MAX_EPOCH_DAYS, MAX_EPOCH_SECONDS, MIN_EPOCH_DAYS, MIN_EPOCH_SECONDS},
 };
@@ -20,12 +22,21 @@ const EXAMPLES: usize = 3;
 // which DuckDB answers far faster than the conversion runs. The schema's constraints are the server's to
 // enforce at import.
 pub(crate) fn check_data(conn: &Connection, plan: &MappingPlan, diagnostics: &mut Diagnostics) {
+    // An attribute read from a TIMESTAMP_NS column anywhere is read in nanoseconds from every column.
+    let nanosecond_attributes: HashSet<&str> = plan
+        .tables
+        .iter()
+        .flat_map(|table| table.owns.iter())
+        .filter(|owns| owns.column_type == ColumnType::Timestamp { nanoseconds: true })
+        .map(|owns| owns.attribute.as_str())
+        .collect();
     for table in &plan.tables {
-        if table.is_relation {
-            check_playerless_rows(conn, table, diagnostics);
+        if let TableKind::Relation { roles } = &table.kind {
+            check_playerless_rows(conn, table, roles, diagnostics);
         }
         for owns in &table.owns {
-            check_value_domain(conn, table, owns, diagnostics);
+            let nanoseconds = nanosecond_attributes.contains(owns.attribute.as_str());
+            check_value_domain(conn, table, owns, nanoseconds, diagnostics);
         }
     }
 }
@@ -67,8 +78,13 @@ impl Check {
     }
 }
 
-fn check_playerless_rows(conn: &Connection, table: &TableMapping, diagnostics: &mut Diagnostics) {
-    let all_null: Vec<String> = table.roles.iter().map(|role| format!("{} IS NULL", quoted(&role.column))).collect();
+fn check_playerless_rows(
+    conn: &Connection,
+    table: &TableMapping,
+    roles: &[RoleBinding],
+    diagnostics: &mut Diagnostics,
+) {
+    let all_null: Vec<String> = roles.iter().map(|role| format!("{} IS NULL", quoted(&role.column))).collect();
     Check {
         subject: format!("relation table '{}'", table.name),
         predicate: "fill no role (every role column is NULL), and a relation cannot exist without players",
@@ -82,19 +98,23 @@ fn check_playerless_rows(conn: &Connection, table: &TableMapping, diagnostics: &
     .report(conn, diagnostics);
 }
 
-// Mirrors the limits of `value::convert_cell`, so that no value fails the conversion after hours of it.
+// Mirrors the limits of `value::Cells::value`, so that no value fails the conversion after hours of it.
 // Timestamps and intervals are compared in integer microseconds: `epoch()` is a double and rounds at the edges.
-fn check_value_domain(conn: &Connection, table: &TableMapping, owns: &OwnsMapping, diagnostics: &mut Diagnostics) {
-    let raw = owns.raw_type.as_str();
-    let wide_integer = raw.starts_with("UBIGINT") || raw.starts_with("HUGEINT");
+fn check_value_domain(
+    conn: &Connection,
+    table: &TableMapping,
+    owns: &OwnsMapping,
+    nanoseconds: bool,
+    diagnostics: &mut Diagnostics,
+) {
     let to_double = owns.value_type == ValueType::Double;
     let (predicate, condition) = match &owns.column_type {
-        ColumnType::Integer if wide_integer && !to_double => (
+        ColumnType::Integer { .. } if !owns.column_type.fits_i64() && !to_double => (
             "hold an integer that does not fit TypeDB's 64-bit integer",
             "e NOT BETWEEN -9223372036854775808 AND 9223372036854775807".to_owned(),
         ),
         // The integer part is the floor: -0.5 is (-1, 0.5), so -9223372036854775808.5 does not fit.
-        ColumnType::Decimal { scale } if !to_double && decimal_precision(raw) - u32::from(*scale) > 18 => (
+        ColumnType::Decimal { precision, scale } if !to_double && precision - scale > 18 => (
             "hold a decimal whose integer part is beyond TypeDB's 64-bit range",
             "e < -9223372036854775808 OR e >= 9223372036854775808".to_owned(),
         ),
@@ -106,7 +126,15 @@ fn check_value_domain(conn: &Connection, table: &TableMapping, owns: &OwnsMappin
                  {MAX_EPOCH_DAYS} END"
             ),
         ),
-        ColumnType::Timestamp | ColumnType::TimestampTz => (
+        ColumnType::Timestamp { nanoseconds: false } if nanoseconds => (
+            "hold a timestamp outside the nanosecond range that the attribute's TIMESTAMP_NS columns impose",
+            format!(
+                "CASE WHEN isinf(e) THEN true ELSE epoch_us(e) NOT BETWEEN {} AND {} END",
+                i64::MIN / 1000,
+                i64::MAX / 1000
+            ),
+        ),
+        ColumnType::Timestamp { .. } | ColumnType::TimestampTz => (
             "hold a timestamp that is infinite or outside TypeDB's datetime range",
             format!(
                 "CASE WHEN isinf(e) THEN true ELSE epoch_us(e) NOT BETWEEN {} AND {} END",
@@ -136,25 +164,4 @@ fn check_value_domain(conn: &Connection, table: &TableMapping, owns: &OwnsMappin
         ),
     }
     .report(conn, diagnostics);
-}
-
-// DuckDB's default DECIMAL precision is 18.
-fn decimal_precision(raw_type: &str) -> u32 {
-    raw_type
-        .split_once('(')
-        .and_then(|(_, rest)| rest.split([',', ')']).next())
-        .and_then(|precision| precision.trim().parse().ok())
-        .unwrap_or(18)
-}
-
-#[cfg(test)]
-mod test {
-    use super::*;
-
-    #[test]
-    fn decimal_precision_is_read_from_the_declared_type() {
-        assert_eq!(decimal_precision("DECIMAL(38,2)"), 38);
-        assert_eq!(decimal_precision("DECIMAL(10, 3)"), 10);
-        assert_eq!(decimal_precision("DECIMAL"), 18);
-    }
 }

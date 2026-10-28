@@ -7,8 +7,11 @@
 use std::{
     collections::{HashMap, HashSet},
     error::Error,
-    fs,
+    fs, io,
     path::PathBuf,
+    sync::mpsc,
+    thread,
+    time::Duration,
 };
 
 use duckdb::Connection;
@@ -817,9 +820,10 @@ fn timestamps_beside_nanosecond_columns_must_fit_their_range() -> Result<(), Box
          INSERT INTO event VALUES (1, '2020-01-01 00:00:00.000000001');
          INSERT INTO old_event VALUES (2, '1500-01-01'), (3, '2020-01-01');",
     )?;
-    let error = convert(&dir).expect_err("1500-01-01 does not fit TIMESTAMP_NS").to_string();
-    assert!(error.contains("'happened' (from [\"event.happened\", \"old_event.happened\"])"), "{error}");
-    assert!(error.contains("Timestamp(NS)"), "{error}");
+    let errors = validation_errors(&dir);
+    let fragment = "table 'old_event': column 'happened': 1 row(s) hold a timestamp outside the nanosecond range";
+    assert_error(&errors, &[fragment, "e.g. _iid 2"]);
+    assert_eq!(errors.len(), 1, "{errors:#?}");
     Ok(())
 }
 
@@ -1072,5 +1076,36 @@ fn relations_without_players_are_rejected() -> Result<(), Box<dyn Error>> {
          INSERT INTO friendship VALUES (1, 1, NULL), (2, NULL, NULL);",
     )?;
     assert_error(&validation_errors(&dir), &["relation table 'friendship': 1 row(s) fill no role", "e.g. _iid 2"]);
+    Ok(())
+}
+
+#[test]
+fn an_output_error_ends_a_large_conversion() -> Result<(), Box<dyn Error>> {
+    // More rows than the pipeline holds in flight, so that the workers outlive the writer's failure.
+    let dir = scratch(
+        "output-error",
+        "define\n  attribute name value string;\n  entity person, owns name;\n",
+        "CREATE TABLE person (_iid UBIGINT PRIMARY KEY, name VARCHAR);
+         INSERT INTO person SELECT i, 'p' || i FROM range(1500000) t(i);",
+    )?;
+    struct Failing;
+    impl io::Write for Failing {
+        fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+            Err(io::Error::other("disk full"))
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    let (sender, receiver) = mpsc::channel();
+    thread::spawn(move || {
+        let result = prepare(&dir)
+            .map_err(|err| format!("{err:?}"))
+            .and_then(|migration| migration.run(Failing, "3.0.0-test", "duckdb:fixture.duckdb").map(|_| ()));
+        let _ = sender.send(result);
+    });
+    let result = receiver.recv_timeout(Duration::from_secs(120)).expect("the conversion must end, not hang");
+    let error = result.expect_err("a failing output must fail the conversion");
+    assert!(error.contains("failed to write the output file: disk full"), "{error}");
     Ok(())
 }

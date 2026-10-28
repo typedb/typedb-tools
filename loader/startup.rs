@@ -13,6 +13,8 @@ use std::{
     },
 };
 
+use typedb_cli_common::println_warning;
+
 use crate::{ExitCode, checkpoint::Checkpoint, cli::Args, fatal, fatal_with, output::CHECKPOINT_FILENAME};
 
 /// Installs the interrupt handler. The first interrupt flips the returned flag so the main loop can
@@ -22,7 +24,7 @@ pub(crate) fn install_shutdown_handler() -> Arc<AtomicBool> {
     let mut signals = match Termination::listen() {
         Ok(signals) => signals,
         Err(err) => {
-            eprintln!("warning: interrupts will not be handled: {err}");
+            println_warning!("interrupts will not be handled: {err}");
             return shutdown;
         }
     };
