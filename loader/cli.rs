@@ -8,7 +8,7 @@ use clap::{ArgGroup, Parser};
 
 pub const USERNAME_VALUE_NAME: &str = "username";
 
-const CSV_OPTIONS: [&str; 15] = [
+const CSV_OPTIONS: [&str; 14] = [
     "query",
     "data",
     "header",
@@ -21,7 +21,6 @@ const CSV_OPTIONS: [&str; 15] = [
     "no_stop_on_error",
     "max_rejects",
     "create_db",
-    "output_dir",
     "no_checkpoint",
     "resume",
 ];
@@ -34,15 +33,15 @@ pub struct Args {
     #[arg(long, value_name = "path to DuckDB file", help_heading = "Migration", group = "migration_options")]
     pub duckdb: Option<String>,
 
-    /// With --duckdb: write `<database>.data.typedb` into this directory instead of importing it.
+    /// With --duckdb: write `<database>.data.typedb` into `--output-dir` without importing it.
     #[arg(
         long = "files-only",
-        value_name = "path to output directory",
+        default_value = "false",
         help_heading = "Migration",
         requires = "duckdb",
         group = "migration_options"
     )]
-    pub files_only: Option<String>,
+    pub files_only: bool,
 
     /// With --duckdb: map and convert the database, printing the mapping and the counts, without
     /// writing or loading anything.
@@ -51,7 +50,7 @@ pub struct Args {
         default_value = "false",
         help_heading = "Migration",
         requires = "duckdb",
-        conflicts_with = "files_only",
+        conflicts_with_all = ["files_only", "output_dir"],
         group = "migration_options"
     )]
     pub dry_run: bool,
@@ -158,9 +157,10 @@ pub struct Args {
     #[arg(long = "tls-root-ca", value_name = "path")]
     pub tls_root_ca: Option<String>,
 
-    /// Directory to write the loader's output into: `rejects.csv`, `rejects.log`, and
-    /// `checkpoint.json`. Created if it does not already exist.
-    /// Defaults to `loader_<data-file-stem>_progress` next to the data file.
+    /// Directory to write the loader's output into, created if it does not already exist.
+    /// From a CSV: `rejects.csv`, `rejects.log` and `checkpoint.json`, by default in
+    /// `loader_<data-file-stem>_progress` next to the data file.
+    /// With --duckdb: `<database>.data.typedb`, by default next to the DuckDB file.
     #[arg(long = "output-dir", value_name = "path to output directory")]
     pub output_dir: Option<String>,
 
@@ -183,7 +183,16 @@ mod tests {
 
     #[test]
     fn every_csv_option_conflicts_with_migration_options() {
-        let shared = ["database", "schema_file", "addresses", "username", "password", "tls_disabled", "tls_root_ca"];
+        let shared = [
+            "database",
+            "schema_file",
+            "addresses",
+            "username",
+            "password",
+            "tls_disabled",
+            "tls_root_ca",
+            "output_dir",
+        ];
         let mut command = Args::command();
         command.build(); // the group learns its members here
         let group = command.get_groups().find(|group| group.get_id() == "migration_options").unwrap();
