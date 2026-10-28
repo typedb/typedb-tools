@@ -92,8 +92,14 @@ impl Migration {
         self.plan.summary()
     }
 
-    pub fn run(&self, output: impl Write, loader_version: &str, original_database: &str) -> Result<Checksums, String> {
-        emit::emit(&self.connection, &self.plan, loader_version, original_database, output)
+    // The loader stands in for the server in the header: they release in lockstep.
+    pub fn run(
+        &self,
+        output: impl Write + Send,
+        typedb_version: &str,
+        original_database: &str,
+    ) -> Result<Checksums, String> {
+        emit::emit(&self.connection, &self.plan, typedb_version, original_database, output)
     }
 }
 

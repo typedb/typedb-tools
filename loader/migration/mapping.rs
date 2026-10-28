@@ -24,7 +24,6 @@ pub(crate) struct OwnsMapping {
     pub(crate) value_type: ValueType,
     pub(crate) multi: bool,
     pub(crate) column_type: ColumnType,
-    pub(crate) raw_type: String,
 }
 
 impl OwnsMapping {
@@ -80,12 +79,30 @@ pub(crate) struct RoleBinding {
 }
 
 #[derive(Debug)]
+pub(crate) enum TableKind {
+    Entity,
+    Relation { roles: Vec<RoleBinding> },
+}
+
+#[derive(Debug)]
 pub(crate) struct TableMapping {
     pub(crate) name: String,
     pub(crate) type_label: String,
-    pub(crate) is_relation: bool,
+    pub(crate) kind: TableKind,
     pub(crate) owns: Vec<OwnsMapping>,
-    pub(crate) roles: Vec<RoleBinding>,
+}
+
+impl TableMapping {
+    pub(crate) fn is_relation(&self) -> bool {
+        matches!(self.kind, TableKind::Relation { .. })
+    }
+
+    pub(crate) fn roles(&self) -> &[RoleBinding] {
+        match &self.kind {
+            TableKind::Relation { roles } => roles,
+            TableKind::Entity => &[],
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -101,13 +118,13 @@ impl MappingPlan {
                 format!(
                     "table '{}' -> {} '{}' ({} attribute column(s){})",
                     table.name,
-                    if table.is_relation { "relation" } else { "entity" },
+                    if table.is_relation() { "relation" } else { "entity" },
                     table.type_label,
                     table.owns.len(),
-                    if table.roles.is_empty() {
+                    if table.roles().is_empty() {
                         String::new()
                     } else {
-                        format!(", {} role column(s)", table.roles.len())
+                        format!(", {} role column(s)", table.roles().len())
                     },
                 )
             })
@@ -218,13 +235,8 @@ pub(crate) fn resolve(catalog: &Catalog, schema: &Schema, diagnostics: &mut Diag
     let mut plan = MappingPlan::default();
 
     for target in &targets {
-        let mut mapping = TableMapping {
-            name: target.table.name.clone(),
-            type_label: target.object.label.clone(),
-            is_relation: target.is_relation,
-            owns: Vec::new(),
-            roles: Vec::new(),
-        };
+        let mut owns = Vec::new();
+        let mut roles = Vec::new();
         let mut skipped = Vec::new();
         for column in &target.table.columns {
             if column.name == IID_COLUMN {
@@ -256,10 +268,10 @@ pub(crate) fn resolve(catalog: &Catalog, schema: &Schema, diagnostics: &mut Diag
                     target.table.name, column.name
                 ));
             } else if let Some((role, _)) = explicit_role {
-                bind_role(&mut mapping, target, column, role, &targets, schema, diagnostics);
+                bind_role(&mut roles, target, column, role, &targets, schema, diagnostics);
             } else if let Some(fk) = target.table.fk_of_column(&column.name) {
                 if target.is_relation {
-                    infer_role(&mut mapping, target, column, fk, &targets, schema, diagnostics);
+                    infer_role(&mut roles, target, column, fk, &targets, schema, diagnostics);
                 } else {
                     diagnostics.error(format!(
                         "table '{}': FK column '{}' on an entity table has no TypeDB form: {RELATION_IS_A_TABLE}",
@@ -271,30 +283,36 @@ pub(crate) fn resolve(catalog: &Catalog, schema: &Schema, diagnostics: &mut Diag
                     Some(ColumnDirective::Owns(label)) => Some(label.as_str()),
                     _ => None,
                 };
-                bind_owns(&mut mapping, target, column, explicit_attribute, schema, diagnostics);
+                bind_owns(&mut owns, target, column, explicit_attribute, schema, diagnostics);
             }
         }
         check_role_binding_columns(target, &skipped, diagnostics);
 
-        if target.is_relation && mapping.roles.is_empty() {
+        if target.is_relation && roles.is_empty() {
             diagnostics.error(format!(
                 "relation table '{}' fills no role, so every row would be a relation without players",
                 target.table.name
             ));
         }
         for relates in &target.object.relates {
-            if !mapping.roles.is_empty() && !mapping.roles.iter().any(|r| r.role == relates.role) {
+            if !roles.is_empty() && !roles.iter().any(|r| r.role == relates.role) {
                 diagnostics.warning(format!(
                     "relation table '{}' never fills role '{}:{}'",
                     target.table.name, target.object.label, relates.role
                 ));
             }
         }
-        plan.tables.push(mapping);
+        let kind = if target.is_relation { TableKind::Relation { roles } } else { TableKind::Entity };
+        plan.tables.push(TableMapping {
+            name: target.table.name.clone(),
+            type_label: target.object.label.clone(),
+            kind,
+            owns,
+        });
     }
 
     unmapped_schema_warnings(&plan, schema, diagnostics);
-    plan.tables.sort_by_key(|table| table.is_relation);
+    plan.tables.sort_by_key(|table| table.is_relation());
     plan
 }
 
@@ -404,7 +422,7 @@ fn has_instance_id_column(table: &Table, diagnostics: &mut Diagnostics) -> bool 
         ));
         return false;
     }
-    if column.raw_type != "UBIGINT" {
+    if column.column_type != ColumnType::INSTANCE_ID {
         diagnostics.error(format!(
             "table '{}': {IID_COLUMN} must be UBIGINT (an instance id is unsigned 64-bit), found {}: {contract}",
             table.name, column.raw_type
@@ -438,7 +456,7 @@ fn role_binding(relates: &Relates, column: &Column, player: &ResolvedTable<'_>) 
 }
 
 fn bind_role(
-    mapping: &mut TableMapping,
+    roles: &mut Vec<RoleBinding>,
     target: &ResolvedTable<'_>,
     column: &Column,
     role: &str,
@@ -471,11 +489,11 @@ fn bind_role(
         ));
         return;
     }
-    mapping.roles.push(role_binding(relates, column, player));
+    roles.push(role_binding(relates, column, player));
 }
 
 fn infer_role(
-    mapping: &mut TableMapping,
+    roles: &mut Vec<RoleBinding>,
     target: &ResolvedTable<'_>,
     column: &Column,
     fk: &ForeignKey,
@@ -504,7 +522,7 @@ fn infer_role(
             .collect(),
     };
     match candidate_roles.as_slice() {
-        [relates] => mapping.roles.push(role_binding(relates, column, player)),
+        [relates] => roles.push(role_binding(relates, column, player)),
         [] if plays_none => diagnostics.error(format!(
             "table '{}': FK column '{}' targets '{}', whose type '{}' plays no role of relation '{relation}'",
             target.table.name, column.name, fk.referenced_table, player.object.label
@@ -568,7 +586,7 @@ fn resolve_player<'t, 'a>(
 }
 
 fn bind_owns(
-    mapping: &mut TableMapping,
+    owns: &mut Vec<OwnsMapping>,
     target: &ResolvedTable<'_>,
     column: &Column,
     explicit_attribute: Option<&str>,
@@ -607,8 +625,9 @@ fn bind_owns(
     if attribute.abstract_ {
         diagnostics.error(format!(
             "table '{}': column '{}' maps to attribute '{attribute_label}', which is abstract and cannot \
-             have instances; map the column to a concrete subtype with '@typedb owns <label>'",
-            target.table.name, column.name
+             have instances; declare a concrete subtype, let '{}' own it, and map the column to it with \
+             '@typedb owns <label>'",
+            target.table.name, column.name, target.object.label
         ));
         return;
     }
@@ -638,7 +657,7 @@ fn bind_owns(
         ));
         return;
     }
-    if let ColumnType::Decimal { scale } = element_type
+    if let ColumnType::Decimal { scale, .. } = element_type
         && *scale > DECIMAL_FRACTIONAL_DIGITS
     {
         diagnostics.error(format!(
@@ -660,13 +679,12 @@ fn bind_owns(
         return;
     }
 
-    mapping.owns.push(OwnsMapping {
+    owns.push(OwnsMapping {
         column: column.name.clone(),
         attribute: attribute_label,
         value_type,
         multi,
         column_type: element_type.clone(),
-        raw_type: column.raw_type.clone(),
     });
 }
 
@@ -674,12 +692,12 @@ fn is_compatible(column_type: &ColumnType, value_type: ValueType) -> bool {
     use ValueType as V;
     match column_type {
         ColumnType::Boolean => value_type == V::Boolean,
-        ColumnType::Integer => matches!(value_type, V::Integer | V::Double | V::Decimal),
+        ColumnType::Integer { .. } => matches!(value_type, V::Integer | V::Double | V::Decimal),
         ColumnType::Double => value_type == V::Double,
         ColumnType::Decimal { .. } => matches!(value_type, V::Decimal | V::Double),
         ColumnType::Varchar | ColumnType::StringLike => value_type == V::String,
         ColumnType::Date => value_type == V::Date,
-        ColumnType::Timestamp => value_type == V::Datetime,
+        ColumnType::Timestamp { .. } => value_type == V::Datetime,
         ColumnType::TimestampTz => value_type == V::DatetimeTz,
         ColumnType::Interval => value_type == V::Duration,
         ColumnType::List(_) | ColumnType::Unsupported { .. } => false,

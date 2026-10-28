@@ -4,9 +4,16 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 
-use std::fmt;
+use std::{fmt, ops::Range};
 
-use duckdb::types::{TimeUnit, Value, ValueRef};
+use duckdb::arrow::{
+    array::{
+        Array, AsArray, BooleanArray, Date32Array, Decimal128Array, Float32Array, Float64Array, GenericListArray,
+        Int8Array, Int16Array, Int32Array, Int64Array, LargeStringArray, OffsetSizeTrait, PrimitiveArray, StringArray,
+        UInt8Array, UInt16Array, UInt32Array, UInt64Array,
+    },
+    datatypes::{ArrowTimestampType, DataType, TimeUnit},
+};
 use typedb_protocol::{
     migration::{MigrationValue, migration_value},
     value as proto_value,
@@ -81,61 +88,141 @@ impl fmt::Display for TypeDBValue {
     }
 }
 
-pub(crate) fn convert_cell(cell: ValueRef<'_>, target: ValueType) -> Result<Option<TypeDBValue>, String> {
-    let converted = match (cell, target) {
-        (ValueRef::Null, _) => return Ok(None),
-        (ValueRef::Boolean(value), ValueType::Boolean) => TypeDBValue::Boolean(value),
-
-        (ValueRef::TinyInt(value), ValueType::Integer) => TypeDBValue::Integer(value.into()),
-        (ValueRef::SmallInt(value), ValueType::Integer) => TypeDBValue::Integer(value.into()),
-        (ValueRef::Int(value), ValueType::Integer) => TypeDBValue::Integer(value.into()),
-        (ValueRef::BigInt(value), ValueType::Integer) => TypeDBValue::Integer(value),
-        (ValueRef::UTinyInt(value), ValueType::Integer) => TypeDBValue::Integer(value.into()),
-        (ValueRef::USmallInt(value), ValueType::Integer) => TypeDBValue::Integer(value.into()),
-        (ValueRef::UInt(value), ValueType::Integer) => TypeDBValue::Integer(value.into()),
-        (ValueRef::UBigInt(value), ValueType::Integer) => TypeDBValue::Integer(
-            i64::try_from(value).map_err(|_| format!("UBIGINT value {value} does not fit TypeDB's 64-bit integer"))?,
-        ),
-        (ValueRef::HugeInt(value), ValueType::Integer) => TypeDBValue::Integer(
-            i64::try_from(value).map_err(|_| format!("HUGEINT value {value} does not fit TypeDB's 64-bit integer"))?,
-        ),
-
-        (ValueRef::Float(value), ValueType::Double) => double(value.into())?,
-        (ValueRef::Double(value), ValueType::Double) => double(value)?,
-        (ValueRef::Decimal(value), ValueType::Decimal) => decimal(value.value(), value.scale() as u32)?,
-
-        (ValueRef::Text(bytes), ValueType::String) => TypeDBValue::String(
-            String::from_utf8(bytes.to_vec()).map_err(|_| "invalid UTF-8 in VARCHAR value".to_owned())?,
-        ),
-
-        (ValueRef::Date32(days), ValueType::Date) => date(days)?,
-        (ValueRef::Timestamp(unit, raw), ValueType::Datetime) => {
-            let (seconds, nanos) = timestamp_parts(unit, raw)?;
-            TypeDBValue::Datetime { seconds, nanos }
-        }
-        (ValueRef::Timestamp(unit, raw), ValueType::DatetimeTz) => {
-            let (seconds, nanos) = timestamp_parts(unit, raw)?;
-            TypeDBValue::DatetimeTz { seconds, nanos }
-        }
-        (ValueRef::Text(bytes), ValueType::Duration) => {
-            duration(std::str::from_utf8(bytes).map_err(|_| "invalid UTF-8 in INTERVAL text".to_owned())?)?
-        }
-
-        (cell, target) => {
-            return Err(format!("cannot convert a {cell:?} cell to TypeDB value type '{}'", target.name()));
-        }
-    };
-    Ok(Some(converted))
+// A column of a record batch, downcast once, so that its rows are read without a type check each.
+pub(crate) struct Cells<'a> {
+    array: &'a dyn Array,
+    pub(crate) typed: Typed<'a>,
 }
 
-// `ValueRef::from` panics on these.
-pub(crate) fn convert_list_element(element: Value, target: ValueType) -> Result<Option<TypeDBValue>, String> {
-    match element {
-        Value::Enum(_) | Value::List(_) | Value::Struct(_) | Value::Map(_) | Value::Array(_) | Value::Union(_) => {
-            Err(format!("cannot convert list element {element:?} to value type '{}'", target.name()))
+pub(crate) enum Typed<'a> {
+    Boolean(&'a BooleanArray),
+    Int8(&'a Int8Array),
+    Int16(&'a Int16Array),
+    Int32(&'a Int32Array),
+    Int64(&'a Int64Array),
+    UInt8(&'a UInt8Array),
+    UInt16(&'a UInt16Array),
+    UInt32(&'a UInt32Array),
+    UInt64(&'a UInt64Array),
+    Float32(&'a Float32Array),
+    Float64(&'a Float64Array),
+    // HUGEINT arrives as a decimal of scale 0.
+    Decimal(&'a Decimal128Array),
+    Utf8(&'a StringArray),
+    LargeUtf8(&'a LargeStringArray),
+    Date32(&'a Date32Array),
+    Timestamp { unit: TimeUnit, values: &'a [i64] },
+    List { large: bool, elements: Box<Cells<'a>> },
+}
+
+impl<'a> Cells<'a> {
+    pub(crate) fn of(array: &'a dyn Array) -> Result<Cells<'a>, String> {
+        fn timestamp<'a, T: ArrowTimestampType>(array: &'a dyn Array) -> Typed<'a> {
+            let primitive: &PrimitiveArray<T> = array.as_primitive();
+            Typed::Timestamp { unit: T::UNIT, values: primitive.values() }
         }
-        scalar => convert_cell(ValueRef::from(&scalar), target),
+        fn list<'a, O: OffsetSizeTrait>(array: &'a dyn Array) -> Result<Typed<'a>, String> {
+            let list: &GenericListArray<O> = array.as_list();
+            Ok(Typed::List { large: O::IS_LARGE, elements: Box::new(Cells::of(list.values().as_ref())?) })
+        }
+        use duckdb::arrow::datatypes as types;
+        let typed = match array.data_type() {
+            DataType::Boolean => Typed::Boolean(array.as_boolean()),
+            DataType::Int8 => Typed::Int8(array.as_primitive()),
+            DataType::Int16 => Typed::Int16(array.as_primitive()),
+            DataType::Int32 => Typed::Int32(array.as_primitive()),
+            DataType::Int64 => Typed::Int64(array.as_primitive()),
+            DataType::UInt8 => Typed::UInt8(array.as_primitive()),
+            DataType::UInt16 => Typed::UInt16(array.as_primitive()),
+            DataType::UInt32 => Typed::UInt32(array.as_primitive()),
+            DataType::UInt64 => Typed::UInt64(array.as_primitive()),
+            DataType::Float32 => Typed::Float32(array.as_primitive()),
+            DataType::Float64 => Typed::Float64(array.as_primitive()),
+            DataType::Decimal128(_, _) => Typed::Decimal(array.as_primitive()),
+            DataType::Utf8 => Typed::Utf8(array.as_string()),
+            DataType::LargeUtf8 => Typed::LargeUtf8(array.as_string()),
+            DataType::Date32 => Typed::Date32(array.as_primitive()),
+            DataType::Timestamp(TimeUnit::Second, _) => timestamp::<types::TimestampSecondType>(array),
+            DataType::Timestamp(TimeUnit::Millisecond, _) => timestamp::<types::TimestampMillisecondType>(array),
+            DataType::Timestamp(TimeUnit::Microsecond, _) => timestamp::<types::TimestampMicrosecondType>(array),
+            DataType::Timestamp(TimeUnit::Nanosecond, _) => timestamp::<types::TimestampNanosecondType>(array),
+            DataType::List(_) => list::<i32>(array)?,
+            DataType::LargeList(_) => list::<i64>(array)?,
+            other => {
+                return Err(format!("DuckDB returned a column of Arrow type {other}, which the loader does not read"));
+            }
+        };
+        Ok(Cells { array, typed })
     }
+
+    // The elements of a list cell, or None for a NULL list.
+    pub(crate) fn list_range(&self, row: usize) -> Result<Option<(&Cells<'a>, Range<usize>)>, String> {
+        let Typed::List { large, elements } = &self.typed else {
+            return Err(format!("cannot read list elements from a {} column", self.array.data_type()));
+        };
+        if self.array.is_null(row) {
+            return Ok(None);
+        }
+        fn range<O: OffsetSizeTrait>(list: &GenericListArray<O>, row: usize) -> Range<usize> {
+            let offsets = list.value_offsets();
+            offsets[row].as_usize()..offsets[row + 1].as_usize()
+        }
+        let range =
+            if *large { range(self.array.as_list::<i64>(), row) } else { range(self.array.as_list::<i32>(), row) };
+        Ok(Some((elements, range)))
+    }
+
+    pub(crate) fn value(&self, row: usize, target: ValueType) -> Result<Option<TypeDBValue>, String> {
+        if self.array.is_null(row) {
+            return Ok(None);
+        }
+        let integer = |value: i64| TypeDBValue::Integer(value);
+        // TODO: Think if we can make it prettier
+        let converted = match (&self.typed, target) {
+            (Typed::Boolean(cells), ValueType::Boolean) => TypeDBValue::Boolean(cells.value(row)),
+
+            (Typed::Int8(cells), ValueType::Integer) => integer(cells.value(row).into()),
+            (Typed::Int16(cells), ValueType::Integer) => integer(cells.value(row).into()),
+            (Typed::Int32(cells), ValueType::Integer) => integer(cells.value(row).into()),
+            (Typed::Int64(cells), ValueType::Integer) => integer(cells.value(row)),
+            (Typed::UInt8(cells), ValueType::Integer) => integer(cells.value(row).into()),
+            (Typed::UInt16(cells), ValueType::Integer) => integer(cells.value(row).into()),
+            (Typed::UInt32(cells), ValueType::Integer) => integer(cells.value(row).into()),
+            (Typed::UInt64(cells), ValueType::Integer) => integer(fit_i64(cells.value(row), "UBIGINT")?),
+            (Typed::Decimal(cells), ValueType::Integer) if cells.scale() == 0 => {
+                integer(fit_i64(cells.value(row), "HUGEINT")?)
+            }
+
+            (Typed::Float32(cells), ValueType::Double) => double(cells.value(row).into())?,
+            (Typed::Float64(cells), ValueType::Double) => double(cells.value(row))?,
+            (Typed::Decimal(cells), ValueType::Decimal) => decimal(cells.value(row), cells.scale() as u32)?,
+
+            (Typed::Utf8(cells), ValueType::String) => TypeDBValue::String(cells.value(row).to_owned()),
+            (Typed::LargeUtf8(cells), ValueType::String) => TypeDBValue::String(cells.value(row).to_owned()),
+            (Typed::Utf8(cells), ValueType::Duration) => duration(cells.value(row))?,
+            (Typed::LargeUtf8(cells), ValueType::Duration) => duration(cells.value(row))?,
+
+            (Typed::Date32(cells), ValueType::Date) => date(cells.value(row))?,
+            (Typed::Timestamp { unit, values }, ValueType::Datetime) => {
+                let (seconds, nanos) = timestamp_parts(*unit, values[row])?;
+                TypeDBValue::Datetime { seconds, nanos }
+            }
+            (Typed::Timestamp { unit, values }, ValueType::DatetimeTz) => {
+                let (seconds, nanos) = timestamp_parts(*unit, values[row])?;
+                TypeDBValue::DatetimeTz { seconds, nanos }
+            }
+
+            (_, target) => {
+                let (cell, target) = (self.array.data_type(), target.name());
+                return Err(format!("cannot convert a {cell} cell to TypeDB value type '{target}'"));
+            }
+        };
+        Ok(Some(converted))
+    }
+}
+
+fn fit_i64<T: TryInto<i64> + fmt::Display + Copy>(value: T, kind: &str) -> Result<i64, String> {
+    value.try_into().map_err(|_| format!("{kind} value {value} does not fit TypeDB's 64-bit integer"))
 }
 
 // DuckDB does not keep -0.0 and 0.0 apart, while TypeDB would store two attributes.
@@ -226,7 +313,13 @@ fn timestamp_parts(unit: TimeUnit, raw: i64) -> Result<(i64, u32), String> {
 
 #[cfg(test)]
 mod test {
+    use duckdb::arrow::array::{ListArray, TimestampNanosecondArray};
+
     use super::*;
+
+    fn single(array: &dyn Array, target: ValueType) -> Result<Option<TypeDBValue>, String> {
+        Cells::of(array)?.value(0, target)
+    }
 
     #[test]
     fn decimal_conversion_floors_negatives() {
@@ -261,12 +354,15 @@ mod test {
 
     #[test]
     fn values_typedb_cannot_hold_are_rejected() {
-        assert!(convert_cell(ValueRef::Date32(i32::MAX), ValueType::Date).unwrap_err().contains("infinite"));
-        assert!(convert_cell(ValueRef::Date32(-100_000_000), ValueType::Date).unwrap_err().contains("range"));
-        assert!(convert_cell(ValueRef::Double(f64::NAN), ValueType::Double).is_err());
-        assert!(convert_cell(ValueRef::Double(f64::INFINITY), ValueType::Double).is_err());
-        assert!(convert_cell(ValueRef::UBigInt(u64::MAX), ValueType::Integer).is_err());
-        assert!(convert_cell(ValueRef::HugeInt(i128::MIN), ValueType::Integer).is_err());
+        let date = |days| single(&Date32Array::from(vec![days]), ValueType::Date);
+        assert!(date(i32::MAX).unwrap_err().contains("infinite"));
+        assert!(date(-100_000_000).unwrap_err().contains("range"));
+        assert!(single(&Float64Array::from(vec![f64::NAN]), ValueType::Double).is_err());
+        assert!(single(&Float64Array::from(vec![f64::INFINITY]), ValueType::Double).is_err());
+        assert!(single(&UInt64Array::from(vec![u64::MAX]), ValueType::Integer).is_err());
+        let huge = Decimal128Array::from(vec![1i128 << 100]).with_precision_and_scale(38, 0).unwrap();
+        assert!(single(&huge, ValueType::Integer).is_err());
+        assert!(single(&TimestampNanosecondArray::from(vec![i64::MAX]), ValueType::Datetime).is_err());
     }
 
     #[test]
@@ -292,18 +388,24 @@ mod test {
 
     #[test]
     fn negative_zero_is_read_as_zero() {
-        for negative_zero in [ValueRef::Double(-0.0), ValueRef::Float(-0.0)] {
-            let Ok(Some(TypeDBValue::Double(zero))) = convert_cell(negative_zero, ValueType::Double) else { panic!() };
+        let double = single(&Float64Array::from(vec![-0.0]), ValueType::Double);
+        let float = single(&Float32Array::from(vec![-0.0f32]), ValueType::Double);
+        for zero in [double, float] {
+            let Ok(Some(TypeDBValue::Double(zero))) = zero else { panic!() };
             assert!(zero == 0.0 && zero.is_sign_positive());
         }
     }
 
     #[test]
-    fn list_elements_convert_like_cells() {
-        let date = convert_list_element(Value::Date32(0), ValueType::Date).unwrap();
-        assert_eq!(date, Some(TypeDBValue::Date { days_since_ce: EPOCH_DAYS_FROM_CE }));
-        let interval = Value::Text("1 month 2 days 00:00:00.000003".to_owned());
-        let duration = convert_list_element(interval, ValueType::Duration).unwrap();
-        assert_eq!(duration, Some(TypeDBValue::Duration { months: 1, days: 2, nanos: 3000 }));
+    fn lists_yield_their_elements_and_nulls() {
+        let list = ListArray::from_iter_primitive::<duckdb::arrow::datatypes::Int32Type, _, _>(vec![
+            Some(vec![Some(1), None, Some(3)]),
+            None,
+        ]);
+        let cells = Cells::of(&list).unwrap();
+        let (elements, range) = cells.list_range(0).unwrap().expect("a list");
+        let values: Vec<_> = range.map(|index| elements.value(index, ValueType::Integer).unwrap()).collect();
+        assert_eq!(values, [Some(TypeDBValue::Integer(1)), None, Some(TypeDBValue::Integer(3))]);
+        assert!(cells.list_range(1).unwrap().is_none());
     }
 }

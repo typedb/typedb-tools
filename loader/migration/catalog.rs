@@ -11,18 +11,18 @@ use duckdb::{
     types::{Value, ValueRef},
 };
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ColumnType {
     Boolean,
     // TINYINT to HUGEINT, signed and unsigned, but not UHUGEINT.
-    Integer,
+    Integer { bits: u8, signed: bool },
     Double,
-    Decimal { scale: u8 },
+    Decimal { precision: u8, scale: u8 },
     Varchar,
     // ENUM, UUID or JSON.
     StringLike,
     Date,
-    Timestamp,
+    Timestamp { nanoseconds: bool },
     TimestampTz,
     Interval,
     List(Box<ColumnType>),
@@ -30,20 +30,38 @@ pub(crate) enum ColumnType {
 }
 
 impl ColumnType {
+    pub(crate) const INSTANCE_ID: ColumnType = ColumnType::Integer { bits: 64, signed: false };
+
+    pub(crate) fn fits_i64(&self) -> bool {
+        match self {
+            ColumnType::Integer { bits, signed } => *bits < 64 || (*bits == 64 && *signed),
+            _ => false,
+        }
+    }
+
     fn parse(data_type: &str) -> ColumnType {
         let upper = data_type.to_uppercase();
         if let Some(element) = upper.strip_suffix("[]") {
             return ColumnType::List(Box::new(ColumnType::parse(element)));
         }
+        let integer = |bits, signed| ColumnType::Integer { bits, signed };
         match upper.as_str() {
             "BOOLEAN" => ColumnType::Boolean,
-            "TINYINT" | "SMALLINT" | "INTEGER" | "BIGINT" | "UTINYINT" | "USMALLINT" | "UINTEGER" | "UBIGINT"
-            | "HUGEINT" => ColumnType::Integer,
+            "TINYINT" => integer(8, true),
+            "SMALLINT" => integer(16, true),
+            "INTEGER" => integer(32, true),
+            "BIGINT" => integer(64, true),
+            "HUGEINT" => integer(128, true),
+            "UTINYINT" => integer(8, false),
+            "USMALLINT" => integer(16, false),
+            "UINTEGER" => integer(32, false),
+            "UBIGINT" => integer(64, false),
             "FLOAT" | "DOUBLE" => ColumnType::Double,
             "VARCHAR" => ColumnType::Varchar,
             "UUID" | "JSON" => ColumnType::StringLike,
             "DATE" => ColumnType::Date,
-            "TIMESTAMP" | "TIMESTAMP_S" | "TIMESTAMP_MS" | "TIMESTAMP_NS" => ColumnType::Timestamp,
+            "TIMESTAMP" | "TIMESTAMP_S" | "TIMESTAMP_MS" => ColumnType::Timestamp { nanoseconds: false },
+            "TIMESTAMP_NS" => ColumnType::Timestamp { nanoseconds: true },
             "TIMESTAMP WITH TIME ZONE" => ColumnType::TimestampTz,
             "INTERVAL" => ColumnType::Interval,
             "BLOB" => ColumnType::Unsupported {
@@ -54,7 +72,10 @@ impl ColumnType {
                 type_name: upper,
                 hint: "TypeDB has no time-of-day type; use VARCHAR or a duration-since-midnight INTERVAL",
             },
-            _ if upper.starts_with("DECIMAL") => ColumnType::Decimal { scale: decimal_scale(&upper) },
+            _ if upper.starts_with("DECIMAL") => {
+                let (precision, scale) = decimal_precision_and_scale(&upper);
+                ColumnType::Decimal { precision, scale }
+            }
             _ if upper.starts_with("ENUM") => ColumnType::StringLike,
             _ if upper.starts_with("STRUCT") => ColumnType::Unsupported {
                 type_name: upper,
@@ -73,9 +94,26 @@ impl ColumnType {
     }
 }
 
-// DuckDB's default DECIMAL scale is 3.
-fn decimal_scale(upper: &str) -> u8 {
-    upper.split(',').nth(1).and_then(|scale| scale.trim_end_matches(')').trim().parse().ok()).unwrap_or(3)
+// DuckDB's default is DECIMAL(18,3).
+fn decimal_precision_and_scale(upper: &str) -> (u8, u8) {
+    let mut parts = upper.trim_end_matches(')').splitn(2, '(').nth(1).unwrap_or("").split(',');
+    let mut next = || parts.next().and_then(|part| part.trim().parse().ok());
+    (next().unwrap_or(18), next().unwrap_or(3))
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn decimal_precision_and_scale_default_to_duckdb_values() {
+        assert_eq!(decimal_precision_and_scale("DECIMAL(38,2)"), (38, 2));
+        assert_eq!(decimal_precision_and_scale("DECIMAL(10, 3)"), (10, 3));
+        assert_eq!(decimal_precision_and_scale("DECIMAL"), (18, 3));
+        assert!(ColumnType::parse("UBIGINT") == ColumnType::INSTANCE_ID);
+        assert!(!ColumnType::parse("UBIGINT").fits_i64() && ColumnType::parse("BIGINT").fits_i64());
+        assert!(!ColumnType::parse("HUGEINT").fits_i64() && ColumnType::parse("UINTEGER").fits_i64());
+    }
 }
 
 #[derive(Debug)]
