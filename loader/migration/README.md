@@ -14,7 +14,7 @@ typedb loader --duckdb my-data.duckdb --schema-file my-schema.tql \
 typedb loader --duckdb my-data.duckdb --schema-file my-schema.tql --dry-run
 
 # write the data file instead of loading (offline; --overwrite replaces an existing file)
-typedb loader --duckdb my-data.duckdb --schema-file my-schema.tql --database mydb --files-only out/
+typedb loader --duckdb my-data.duckdb --schema-file my-schema.tql --database mydb --files-only --output-dir out/
 # → out/mydb.data.typedb, importable together with the original schema file:
 #   typedb console --command="database import mydb my-schema.tql out/mydb.data.typedb"
 ```
@@ -288,11 +288,13 @@ the data file with the schema file it was prepared against.
 Tables are written in name order, entity tables first. A relation that plays a role may
 come after the relation it plays in; the import links such players once every relation is
 read. A one-shot load stages the data file as `<database>.data.typedb` next to the DuckDB
-file and removes it once the import has succeeded; `--files-only` writes it into the given
-directory instead. Either way an existing file is refused unless `--overwrite` is passed.
-The file is written under a temporary name and renamed on completion, and an interrupted
-conversion (Ctrl+C or SIGTERM) removes it. The import starts once the file is complete; if
-the connection opened at the start did not survive the conversion, the loader reconnects (up
-to twelve attempts, ten seconds apart) and starts the import over. If the import still fails, or
-is interrupted, the data file is kept and the loader prints the `typedb console` command
-that imports it, so the conversion need not be repeated.
+file, or in `--output-dir`, and removes it once the import has succeeded; `--files-only`
+writes it without importing. Either way an existing file is refused unless `--overwrite` is
+passed. The file is written under a temporary name and renamed on completion, and an
+interrupted conversion (Ctrl+C or SIGTERM) removes it. The import starts once the file is
+complete; if the connection opened at the start did not survive the conversion, the loader
+reconnects (up to twelve attempts, ten seconds apart) and starts the import over, and a
+retry that finds the database already created reports that the earlier attempt completed.
+If the import still fails, or the run is interrupted after the file is complete, the file is
+kept and the loader prints the `typedb console` command that imports it, so the conversion
+need not be repeated.

@@ -68,6 +68,12 @@ pub(crate) struct Relates {
     pub(crate) specialises: Option<String>,
 }
 
+impl Relates {
+    pub(crate) fn scoped_label(&self) -> String {
+        format!("{}:{}", self.declared_by, self.role)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct ObjectType {
     pub(crate) label: String,

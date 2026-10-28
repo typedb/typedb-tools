@@ -118,6 +118,19 @@ fn check_value_domain(
             "hold a decimal whose integer part is beyond TypeDB's 64-bit range",
             "e < -9223372036854775808 OR e >= 9223372036854775808".to_owned(),
         ),
+        // Rounding would merge distinct values into one attribute, and move their ownerships onto it. A value is
+        // exact when the double, printed at the column's scale, reads back as the value: DuckDB's own cast from a
+        // double to a wide decimal is not exact, its formatting is.
+        column_type if to_double && !column_type.fits_double_exactly() => (
+            "hold a value that a double cannot represent exactly",
+            format!(
+                "printf('%.{}f', e::DOUBLE) <> e::VARCHAR",
+                match column_type {
+                    ColumnType::Decimal { scale, .. } => *scale,
+                    _ => 0,
+                }
+            ),
+        ),
         ColumnType::Double => ("hold a double that is not finite, which TypeDB requires", "NOT isfinite(e)".to_owned()),
         ColumnType::Date => (
             "hold a date that is infinite or outside TypeDB's range",

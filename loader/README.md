@@ -10,8 +10,8 @@ progress is checkpointed so an interrupted run can be resumed.
 `typedb loader --duckdb <file>` migrates a DuckDB database into TypeDB: the tables are
 mapped onto `--schema-file`, converted, and imported into `--database` in one run, with
 the schema's constraints enforced by the server. `--dry-run` converts without writing;
-`--files-only <dir>` writes the data file for a later `database import` instead of
-loading. See
+`--files-only` writes the data file (into `--output-dir`, by default next to the DuckDB
+file) for a later `database import` instead of loading. See
 [migration/README.md](migration/README.md) for conventions, directives, and modelling
 recommendations.
 

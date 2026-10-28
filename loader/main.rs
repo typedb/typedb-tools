@@ -23,7 +23,7 @@ mod checkpoint;
 mod cli;
 mod csv_reader;
 mod load;
-mod migration;
+mod migrate;
 mod output;
 mod params;
 mod progress;
@@ -39,7 +39,7 @@ pub(crate) const VERSION: &str = include_str!("../VERSION");
 async fn main() {
     let args = Args::parse();
     if args.duckdb.is_some() {
-        migration::run_migration(&args).await;
+        migrate::run_migration(&args).await;
     } else {
         run_load_command(args).await;
     }

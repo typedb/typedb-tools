@@ -581,13 +581,13 @@ fn decimal_integer_parts_beyond_typedb_are_found_before_the_conversion() -> Resu
     let fragment = "column 'amount': 2 row(s) hold a decimal whose integer part is beyond TypeDB's 64-bit range";
     assert_error(&errors, &[fragment, "_iid 1, 5"]);
 
-    // Wide integers and decimals feeding doubles are rounded, not refused.
+    // Wide integers and decimals feeding doubles convert when a double holds them exactly.
     let dir = scratch(
         "wide-to-double",
         "define\n  attribute score value double;\n  entity item, owns score @card(0..);\n",
         "CREATE TABLE item (_iid UBIGINT PRIMARY KEY, big UBIGINT, wide DECIMAL(38,19));
          COMMENT ON COLUMN item.big IS '@typedb owns score'; COMMENT ON COLUMN item.wide IS '@typedb owns score';
-         INSERT INTO item VALUES (1, 18446744073709551615, 9999999999999999999.5);",
+         INSERT INTO item VALUES (1, 18446744073709551616 - 2048, 4503599627370495.5);",
     )?;
     convert(&dir)?;
     Ok(())
@@ -606,15 +606,30 @@ fn decimal_columns_beyond_typedb_precision_are_rejected() -> Result<(), Box<dyn 
 }
 
 #[test]
-fn integers_and_decimals_feeding_doubles_round_to_the_nearest_double() -> Result<(), Box<dyn Error>> {
+fn integers_and_decimals_feeding_doubles_must_be_exact() -> Result<(), Box<dyn Error>> {
     let dir = scratch(
-        "nearest-double",
+        "inexact-double",
         EVENTS,
         "CREATE TABLE event (_iid UBIGINT PRIMARY KEY, score BIGINT);
          CREATE TABLE reading (_iid UBIGINT PRIMARY KEY, score DECIMAL(20,3));
          COMMENT ON TABLE reading IS '@typedb entity event';
-         INSERT INTO event VALUES (1, 9007199254740993);
-         INSERT INTO reading VALUES (2, 0.1);",
+         INSERT INTO event VALUES (1, 9007199254740993), (2, 9007199254740992);
+         INSERT INTO reading VALUES (3, 0.1), (4, 12345678901234567.125);",
+    )?;
+    let errors = validation_errors(&dir);
+    assert_error(&errors, &["table 'event': column 'score': 1 row(s) hold a value that a double cannot", "_iid 1"]);
+    assert_error(&errors, &["table 'reading': column 'score': 1 row(s) hold a value that a double cannot", "_iid 4"]);
+    assert_eq!(errors.len(), 2, "{errors:#?}");
+
+    // A decimal reads exactly at its own scale: 0.1 is the double nearest to it.
+    let dir = scratch(
+        "exact-double",
+        EVENTS,
+        "CREATE TABLE event (_iid UBIGINT PRIMARY KEY, score BIGINT);
+         CREATE TABLE reading (_iid UBIGINT PRIMARY KEY, score DECIMAL(20,3));
+         COMMENT ON TABLE reading IS '@typedb entity event';
+         INSERT INTO event VALUES (2, 9007199254740992);
+         INSERT INTO reading VALUES (3, 0.1);",
     )?;
     let mut doubles: Vec<f64> = convert(&dir)?
         .into_iter()

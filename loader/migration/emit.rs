@@ -22,7 +22,7 @@ use typedb_protocol::migration::{
 };
 
 use crate::{
-    mapping::{IID_COLUMN, MappingPlan, OwnsMapping, TableKind, TableMapping, quoted},
+    mapping::{IID_COLUMN, MappingPlan, OwnsMapping, TableKind, quoted},
     schema::ValueType,
     value::{Cells, TypeDBValue, Typed},
 };
@@ -59,8 +59,8 @@ pub(crate) fn emit(
 
     emit_attributes(conn, plan, &mut output, &mut checksums)?;
     let numbering = number_instances(conn, plan)?;
-    for table in &plan.tables {
-        emit_objects(conn, table, &numbering, &mut output, &mut checksums)?;
+    for index in 0..plan.tables.len() {
+        emit_objects(conn, plan, index, &numbering, &mut output, &mut checksums)?;
     }
 
     write_item(&mut output, item::Item::Checksums(checksums))?;
@@ -94,12 +94,13 @@ impl TableNumbering {
     }
 }
 
-fn number_instances<'a>(conn: &Connection, plan: &'a MappingPlan) -> Result<HashMap<&'a str, TableNumbering>, String> {
+// Indexed like `MappingPlan::tables`.
+fn number_instances(conn: &Connection, plan: &MappingPlan) -> Result<Vec<TableNumbering>, String> {
     let iid = quoted(IID_COLUMN);
-    let player_tables: HashSet<&str> =
-        plan.tables.iter().flat_map(|table| table.roles().iter().map(|role| role.player_table.as_str())).collect();
+    let player_tables: HashSet<usize> =
+        plan.tables.iter().flat_map(|table| table.roles().iter().map(|role| role.player)).collect();
     let mut next_ids: HashMap<&str, u64> = HashMap::new();
-    let mut numbering = HashMap::new();
+    let mut numbering = Vec::with_capacity(plan.tables.len());
     for (index, table) in plan.tables.iter().enumerate() {
         let read_error =
             |err: duckdb::Error| format!("failed to read the {IID_COLUMN} values of '{}': {err}", table.name);
@@ -107,7 +108,7 @@ fn number_instances<'a>(conn: &Connection, plan: &'a MappingPlan) -> Result<Hash
         let (count, min, max): (u64, Option<u64>, Option<u64>) =
             conn.query_row(&sql, [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?))).map_err(read_error)?;
         let iids = match (min, max) {
-            _ if !player_tables.contains(table.name.as_str()) => None,
+            _ if !player_tables.contains(&index) => None,
             // `_iid` is unique, so a span as wide as the count has no gaps.
             (Some(min), Some(max)) if u128::from(max - min) + 1 == u128::from(count) => {
                 Some(Iids::Consecutive { first: min })
@@ -124,7 +125,7 @@ fn number_instances<'a>(conn: &Connection, plan: &'a MappingPlan) -> Result<Hash
             }
         };
         let next_id = next_ids.entry(&table.type_label).or_default();
-        numbering.insert(table.name.as_str(), TableNumbering { first_id: *next_id, count, iids });
+        numbering.push(TableNumbering { first_id: *next_id, count, iids });
         *next_id += count;
     }
     Ok(numbering)
@@ -207,11 +208,13 @@ fn attribute_select(table: &str, owns: &OwnsMapping) -> String {
 
 fn emit_objects(
     conn: &Connection,
-    table: &TableMapping,
-    numbering: &HashMap<&str, TableNumbering>,
+    plan: &MappingPlan,
+    table_index: usize,
+    numbering: &[TableNumbering],
     output: &mut (impl Write + Send),
     checksums: &mut Checksums,
 ) -> Result<(), String> {
+    let table = &plan.tables[table_index];
     // Loader-owned aliases keep a column named `rowid` from shadowing the scan's rowid.
     let mut selects = vec![format!("t.{} AS c0", quoted(IID_COLUMN))];
     for owns in &table.owns {
@@ -222,7 +225,7 @@ fn emit_objects(
     for (index, role) in table.roles().iter().enumerate() {
         let column = selects.len();
         selects.push(format!("t.{} AS c{column}", quoted(&role.column)));
-        let rank_column = match &numbering[role.player_table.as_str()].iids {
+        let rank_column = match &numbering[role.player].iids {
             Some(Iids::Ranked(ranks)) => {
                 let alias = format!("r{index}");
                 joins += &format!(
@@ -240,13 +243,27 @@ fn emit_objects(
     let sql = format!("SELECT {} FROM {} t{joins} ORDER BY 1", selects.join(", "), quoted(&table.name));
     let scan_error = |err: String| format!("scan of '{}' failed: {err}", table.name);
 
-    let player_numbering: Vec<&TableNumbering> =
-        table.roles().iter().map(|role| &numbering[role.player_table.as_str()]).collect();
+    struct Player<'a> {
+        numbering: &'a TableNumbering,
+        table: &'a str,
+        label: &'a str,
+        scoped_role: String,
+    }
+    let players: Vec<Player<'_>> = table
+        .roles()
+        .iter()
+        .map(|role| Player {
+            numbering: &numbering[role.player],
+            table: &plan.tables[role.player].name,
+            label: &plan.tables[role.player].type_label,
+            scoped_role: role.relates.scoped_label(),
+        })
+        .collect();
     let ownerships_may_repeat =
         table.owns.iter().enumerate().any(|(index, owns)| {
             owns.multi || table.owns[..index].iter().any(|other| other.attribute == owns.attribute)
         });
-    let TableNumbering { first_id, count, .. } = numbering[table.name.as_str()];
+    let TableNumbering { first_id, count, .. } = numbering[table_index];
 
     let encode = |batches: &[RecordBatch], first_row: u64| {
         let mut unit = Unit::default();
@@ -299,7 +316,7 @@ fn emit_objects(
 
                 if let TableKind::Relation { roles: bindings } = &table.kind {
                     let mut roles: Vec<item::relation::Role> = Vec::new();
-                    for (index, (role, players)) in bindings.iter().zip(&player_numbering).enumerate() {
+                    for (index, (role, player)) in bindings.iter().zip(&players).enumerate() {
                         let (column, rank_column) = role_columns[index];
                         let Typed::UInt64(player_iids) = &columns[column].typed else {
                             return Err(with_context(format!("column '{}' was not read as UBIGINT", role.column)));
@@ -312,24 +329,26 @@ fn emit_objects(
                             Some(Typed::Int64(ranks)) if !ranks.is_null(row) => Some(ranks.value(row)),
                             _ => None,
                         };
-                        let player_id = players.id_of(player_iid, rank).ok_or_else(|| {
+                        let player_id = player.numbering.id_of(player_iid, rank).ok_or_else(|| {
                             with_context(format!(
                                 "column '{}' holds {IID_COLUMN} {player_iid}, which table '{}' does not have",
-                                role.column, role.player_table
+                                role.column, player.table
                             ))
                         })?;
-                        let player = item::relation::role::Player {
-                            id: object_id(&role.player_label, player_id),
+                        let item_player = item::relation::role::Player {
+                            id: object_id(player.label, player_id),
                             player_by_label_scoped_id: Some(item::relation::role::player::PlayerByLabelScopedId {
-                                label: role.player_label.clone(),
+                                label: player.label.to_owned(),
                                 label_scoped_id: player_id,
                             }),
                         };
-                        match roles.iter_mut().find(|grouped| grouped.label == role.scoped_role) {
-                            Some(grouped) if grouped.players.iter().any(|known| known.id == player.id) => continue,
-                            Some(grouped) => grouped.players.push(player),
-                            None => roles
-                                .push(item::relation::Role { label: role.scoped_role.clone(), players: vec![player] }),
+                        match roles.iter_mut().find(|grouped| grouped.label == player.scoped_role) {
+                            Some(grouped) if grouped.players.iter().any(|known| known.id == item_player.id) => continue,
+                            Some(grouped) => grouped.players.push(item_player),
+                            None => roles.push(item::relation::Role {
+                                label: player.scoped_role.clone(),
+                                players: vec![item_player],
+                            }),
                         }
                         unit.checksums.role_count += 1;
                     }
@@ -455,11 +474,7 @@ fn pipeline(
                     }
                     last_iid = unit.last_iid.or(last_iid);
                     output.write_all(&unit.bytes).map_err(|err| format!("failed to write the output file: {err}"))?;
-                    checksums.entity_count += unit.checksums.entity_count;
-                    checksums.attribute_count += unit.checksums.attribute_count;
-                    checksums.relation_count += unit.checksums.relation_count;
-                    checksums.role_count += unit.checksums.role_count;
-                    checksums.ownership_count += unit.checksums.ownership_count;
+                    add_checksums(checksums, &unit.checksums);
                     rows += unit.rows;
                     next += 1;
                 }
@@ -506,4 +521,14 @@ fn pipeline(
             None => written,
         }
     })
+}
+
+// Destructured whole, so that a field added to the protocol's checksums fails to compile here.
+fn add_checksums(total: &mut Checksums, unit: &Checksums) {
+    let Checksums { entity_count, attribute_count, relation_count, role_count, ownership_count } = unit;
+    total.entity_count += entity_count;
+    total.attribute_count += attribute_count;
+    total.relation_count += relation_count;
+    total.role_count += role_count;
+    total.ownership_count += ownership_count;
 }

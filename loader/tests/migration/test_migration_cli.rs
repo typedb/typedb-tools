@@ -62,7 +62,7 @@ fn run_loader(dir: &Path, extra: &[&str]) -> std::process::Output {
 fn files_only_writes_the_data_file() -> Result<(), Box<dyn Error>> {
     let dir = setup("clean")?;
     let out = dir.join("out").to_string_lossy().into_owned();
-    let output = run_loader(&dir, &["--files-only", &out]);
+    let output = run_loader(&dir, &["--files-only", "--output-dir", &out]);
     assert!(
         output.status.success(),
         "loader failed:\n{}\n{}",
@@ -88,9 +88,9 @@ fn files_only_writes_the_data_file() -> Result<(), Box<dyn Error>> {
     }
     assert_eq!(count, 1 + 2 + 2 + 1); // header, 2 names, 2 persons, checksums
 
-    let rerun = run_loader(&dir, &["--files-only", &out]);
+    let rerun = run_loader(&dir, &["--files-only", "--output-dir", &out]);
     assert!(!rerun.status.success());
-    let rerun = run_loader(&dir, &["--files-only", &out, "--overwrite"]);
+    let rerun = run_loader(&dir, &["--files-only", "--output-dir", &out, "--overwrite"]);
     assert!(rerun.status.success());
 
     let _ = fs::remove_dir_all(&dir);
@@ -105,7 +105,7 @@ fn validation_errors_exit_nonzero_with_no_output() -> Result<(), Box<dyn Error>>
     drop(conn);
 
     let out = dir.join("out").to_string_lossy().into_owned();
-    let output = run_loader(&dir, &["--files-only", &out]);
+    let output = run_loader(&dir, &["--files-only", "--output-dir", &out]);
     assert_eq!(output.status.code(), Some(2), "user-input error exit code expected");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("mystery"), "error does not name the column: {stderr}");
@@ -121,7 +121,7 @@ fn dry_run_writes_nothing() -> Result<(), Box<dyn Error>> {
     let output = run_loader(&dir, &["--dry-run"]);
     assert!(output.status.success());
     assert!(!dir.join("out").exists(), "--dry-run created the output directory");
-    let output = run_loader(&dir, &["--dry-run", "--files-only", "out"]);
+    let output = run_loader(&dir, &["--dry-run", "--files-only"]);
     assert!(String::from_utf8_lossy(&output.stderr).contains("cannot be used with"), "clap conflict expected");
 
     let _ = fs::remove_dir_all(&dir);
@@ -162,7 +162,7 @@ fn invalid_database_names_fail_before_converting() -> Result<(), Box<dyn Error>>
     let output = Command::new(loader_binary())
         .args(["--duckdb", &dir.join("fixture.duckdb").to_string_lossy(), "--schema-file"])
         .arg(dir.join("schema.tql"))
-        .args(["--database", "my data", "--files-only", &out])
+        .args(["--database", "my data", "--files-only", "--output-dir", &out])
         .output()?;
     assert_eq!(output.status.code(), Some(2), "user-input error exit code expected");
     assert!(String::from_utf8_lossy(&output.stderr).contains("'my data' is not a valid TypeDB database name"));
@@ -196,7 +196,7 @@ fn a_termination_signal_removes_the_partial_file() -> Result<(), Box<dyn Error>>
     Connection::open(dir.join("fixture.duckdb"))?
         .execute_batch("INSERT INTO person SELECT 10 + i, 'name' || i FROM range(2000000) t(i);")?;
     let out = dir.join("out");
-    let mut loader = loader_command(&dir, &["--files-only", out.to_str().unwrap()]).spawn()?;
+    let mut loader = loader_command(&dir, &["--files-only", "--output-dir", out.to_str().unwrap()]).spawn()?;
     let partial = out.join(".fixture.data.typedb.partial");
     let deadline = Instant::now() + Duration::from_secs(60);
     while !partial.exists() {

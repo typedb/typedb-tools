@@ -56,14 +56,15 @@ impl OwnsMapping {
         }
     }
 
-    // A UNION's own type unification can round decimals, so every column of an attribute is read in one type.
+    // A UNION's own type unification can round decimals, so every column of an attribute is read in one type:
+    // integers as BIGINT (the checks have proven that they fit), doubles as DOUBLE, decimals at TypeDB's scale.
     // Intervals are read as text: DuckDB compares them normalised (1 month = 30 days), TypeDB does not.
-    pub(crate) fn cast(&self) -> Option<&'static str> {
+    pub(crate) fn cast(&self) -> Option<String> {
         match (&self.column_type, self.value_type) {
-            (ColumnType::StringLike | ColumnType::Interval, _) => Some("VARCHAR"),
-            (ColumnType::Double, ValueType::Double) => None,
-            (_, ValueType::Double) => Some("DOUBLE"),
-            (_, ValueType::Decimal) => Some("DECIMAL(38,19)"),
+            (ColumnType::StringLike | ColumnType::Interval, _) => Some("VARCHAR".to_owned()),
+            (ColumnType::Integer { .. }, ValueType::Integer) => Some("BIGINT".to_owned()),
+            (_, ValueType::Double) => Some("DOUBLE".to_owned()),
+            (_, ValueType::Decimal) => Some(format!("DECIMAL(38,{DECIMAL_FRACTIONAL_DIGITS})")),
             _ => None,
         }
     }
@@ -72,10 +73,9 @@ impl OwnsMapping {
 #[derive(Debug)]
 pub(crate) struct RoleBinding {
     pub(crate) column: String,
-    pub(crate) role: String,
-    pub(crate) scoped_role: String,
-    pub(crate) player_table: String,
-    pub(crate) player_label: String,
+    pub(crate) relates: Relates,
+    // The players' table, as an index into `MappingPlan::tables`.
+    pub(crate) player: usize,
 }
 
 #[derive(Debug)]
@@ -231,7 +231,9 @@ pub(crate) fn resolve(catalog: &Catalog, schema: &Schema, diagnostics: &mut Diag
             "{ignored} is not loaded: only tables of the 'main' schema are read (materialise a view as a table)"
         ));
     }
-    let targets = resolve_tables(catalog, schema, diagnostics);
+    // Entity tables first, as the plan lists them, so that a target's index is its table's index in the plan.
+    let mut targets = resolve_tables(catalog, schema, diagnostics);
+    targets.sort_by_key(|target| target.is_relation);
     let mut plan = MappingPlan::default();
 
     for target in &targets {
@@ -295,7 +297,7 @@ pub(crate) fn resolve(catalog: &Catalog, schema: &Schema, diagnostics: &mut Diag
             ));
         }
         for relates in &target.object.relates {
-            if !roles.is_empty() && !roles.iter().any(|r| r.role == relates.role) {
+            if !roles.is_empty() && !roles.iter().any(|r: &RoleBinding| r.relates.role == relates.role) {
                 diagnostics.warning(format!(
                     "relation table '{}' never fills role '{}:{}'",
                     target.table.name, target.object.label, relates.role
@@ -312,7 +314,6 @@ pub(crate) fn resolve(catalog: &Catalog, schema: &Schema, diagnostics: &mut Diag
     }
 
     unmapped_schema_warnings(&plan, schema, diagnostics);
-    plan.tables.sort_by_key(|table| table.is_relation());
     plan
 }
 
@@ -445,14 +446,8 @@ fn has_instance_id_column(table: &Table, diagnostics: &mut Diagnostics) -> bool 
     true
 }
 
-fn role_binding(relates: &Relates, column: &Column, player: &ResolvedTable<'_>) -> RoleBinding {
-    RoleBinding {
-        column: column.name.clone(),
-        role: relates.role.clone(),
-        scoped_role: format!("{}:{}", relates.declared_by, relates.role),
-        player_table: player.table.name.clone(),
-        player_label: player.object.label.clone(),
-    }
+fn role_binding(relates: &Relates, column: &Column, player: usize) -> RoleBinding {
+    RoleBinding { column: column.name.clone(), relates: relates.clone(), player }
 }
 
 fn bind_role(
@@ -479,7 +474,8 @@ fn bind_role(
         ));
         return;
     };
-    let Some(player) = resolve_player(target, column, fk, targets, diagnostics) else { return };
+    let Some(player_index) = resolve_player(target, column, fk, targets, diagnostics) else { return };
+    let player = &targets[player_index];
     let ancestry = schema.relation_ancestry(relation);
     if !player.object.plays.iter().any(|plays| plays.role == role && ancestry.contains(&plays.relation)) {
         diagnostics.error(format!(
@@ -489,7 +485,7 @@ fn bind_role(
         ));
         return;
     }
-    roles.push(role_binding(relates, column, player));
+    roles.push(role_binding(relates, column, player_index));
 }
 
 fn infer_role(
@@ -502,7 +498,8 @@ fn infer_role(
     diagnostics: &mut Diagnostics,
 ) {
     let relation = &target.object.label;
-    let Some(player) = resolve_player(target, column, fk, targets, diagnostics) else { return };
+    let Some(player_index) = resolve_player(target, column, fk, targets, diagnostics) else { return };
+    let player = &targets[player_index];
     let ancestry = schema.relation_ancestry(relation);
     let played_roles: Vec<&Relates> = target
         .object
@@ -522,7 +519,7 @@ fn infer_role(
             .collect(),
     };
     match candidate_roles.as_slice() {
-        [relates] => roles.push(role_binding(relates, column, player)),
+        [relates] => roles.push(role_binding(relates, column, player_index)),
         [] if plays_none => diagnostics.error(format!(
             "table '{}': FK column '{}' targets '{}', whose type '{}' plays no role of relation '{relation}'",
             target.table.name, column.name, fk.referenced_table, player.object.label
@@ -545,13 +542,13 @@ fn infer_role(
     }
 }
 
-fn resolve_player<'t, 'a>(
+fn resolve_player(
     target: &ResolvedTable<'_>,
     column: &Column,
     fk: &ForeignKey,
-    targets: &'t [ResolvedTable<'a>],
+    targets: &[ResolvedTable<'_>],
     diagnostics: &mut Diagnostics,
-) -> Option<&'t ResolvedTable<'a>> {
+) -> Option<usize> {
     if fk.columns.len() > 1 {
         diagnostics.error(format!(
             "table '{}': column '{}' is part of the composite FOREIGN KEY {:?}, which cannot bind a role: \
@@ -568,7 +565,7 @@ fn resolve_player<'t, 'a>(
         return None;
     }
     // DuckDB resolves identifiers case-insensitively but records the reference as written.
-    let Some(player) = targets.iter().find(|t| t.table.name.eq_ignore_ascii_case(&fk.referenced_table)) else {
+    let Some(player) = targets.iter().position(|t| t.table.name.eq_ignore_ascii_case(&fk.referenced_table)) else {
         diagnostics.error(format!(
             "table '{}': FK column '{}' references table '{}', which is not mapped (is it skipped or invalid?)",
             target.table.name, column.name, fk.referenced_table
@@ -670,7 +667,7 @@ fn bind_owns(
     if !is_compatible(element_type, value_type) {
         diagnostics.error(format!(
             "table '{}': column '{}' ({}) cannot populate attribute '{attribute_label}' (value type \
-             '{}'): the types are incompatible, and the loader never parses or coerces values",
+             '{}'): the types are incompatible, and the loader never parses text into values",
             target.table.name,
             column.name,
             column.raw_type,
