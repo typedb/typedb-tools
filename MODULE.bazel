@@ -31,7 +31,11 @@ bazel_dep(name = "typedb_dependencies", version = "0.0.0")
 git_override(
     module_name = "typedb_dependencies",
     remote = "https://github.com/typedb/typedb-dependencies",
+<<<<<<< HEAD
     commit = "e1b0d89c54d50a1fb54b511270a294d506fbf329",
+=======
+    commit = "cf82c3a44d6f5994111f21bd460d955dfd6ed206",
+>>>>>>> 6768d7f (Memory caps, optimizations)
 )
 
 bazel_dep(name = "typeql", version = "0.0.0")
@@ -117,8 +121,8 @@ workspace_refs = use_repo_rule("@typedb_bazel_distribution//common/workspace_ref
 workspace_refs(
     name = "typedb_console_workspace_refs",
     workspace_commit_dict = {
-#        "typedb_protocol+": "0c9a6c46d658a1db593d57b33fc6ad4faf0a3e98",
-#        "typedb_driver+": "2f655492403ea01608322e0add943d486e2cfc7e",
+#        "typedb_protocol+": "d659baa2fcfc755a03745885197dd0a1633c8ae2",
+#        "typedb_driver+": "9e645f29769ae589868c4ce8ca7308f317e0f49c",
     },
     workspace_tag_dict = {
         "typeql+": "3.15.0-rc0",

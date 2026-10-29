@@ -16,6 +16,7 @@ rust_test(
         # External dependencies
         "@crates//:duckdb",
         "@crates//:prost",
+        "@crates//:zstd",
     ],
     data = ["//loader:loader-native"],
     env = {"TYPEDB_LOADER_BIN": "$(rootpath //loader:loader-native)"},

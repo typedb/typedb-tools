@@ -37,7 +37,7 @@ INSERT INTO person FROM 'people.csv';          -- read_parquet(...) / read_json(
 -- SQLite file (live Postgres / MySQL likewise: INSTALL postgres; ATTACH 'dbname=... host=...')
 INSTALL sqlite; LOAD sqlite;
 ATTACH 'app.db' AS src (TYPE sqlite);
-CREATE TABLE person (_iid UBIGINT PRIMARY KEY, id BIGINT NOT NULL UNIQUE, name VARCHAR);
+CREATE TABLE person (_iid UBIGINT PRIMARY KEY, id BIGINT NOT NULL, name VARCHAR);
 INSERT INTO person SELECT id, id, name FROM src.person;
 CREATE TABLE company (_iid UBIGINT PRIMARY KEY, name VARCHAR);
 INSERT INTO company SELECT id, name FROM src.company;
@@ -50,10 +50,13 @@ INSERT INTO employment SELECT row_number() OVER (), person_id, company_id FROM s
 ```
 
 File readers and database scanners do not carry constraints over: a copied table arrives
-without its primary and foreign keys, which the loader derives the mapping from. Declare
-them in DuckDB by creating each table with its keys and inserting into it, as above. When
-the source's primary key is a non-negative integer, use it as `_iid` too: the source's FK
-columns then already hold `_iid` values.
+without its primary and foreign keys. Either declare them by creating each table with its
+keys and inserting into it, as above, or copy the tables without keys and mark each role
+column `@typedb references <table>`, which has the loader check what the keys would
+guarantee; for large data the latter stages within little memory (see
+[Keys are optional](#keys-are-optional)). When the source's primary key is a non-negative
+integer, use it as `_iid` too: the source's foreign key columns then already hold `_iid`
+values.
 
 ## The TypeDB schema is the source of truth
 
@@ -73,10 +76,11 @@ types take no table.
 
 ## Modelling
 
-Every mapped table identifies its rows by a column `_iid UBIGINT` declared `NOT NULL
-UNIQUE` or `PRIMARY KEY` on its own (see [Ids](#ids)), and foreign keys reference it. The
-examples below leave the attribute declarations out: every column name is an attribute of
-the matching name, e.g. `attribute name value string;`.
+Every mapped table identifies its rows by a column `_iid UBIGINT`, unique and not null
+(see [Ids](#ids)), and role columns reference it. The examples below declare these as
+keys (`PRIMARY KEY`, `REFERENCES`), which DuckDB enforces; the keys are optional, see
+[Keys are optional](#keys-are-optional). They also leave the attribute declarations out:
+every column name is an attribute of the matching name, e.g. `attribute name value string;`.
 
 **An entity type is a table**; its columns are the attributes it owns. `NULL` is no
 ownership.
@@ -98,10 +102,10 @@ CREATE TABLE person (_iid UBIGINT PRIMARY KEY, nickname VARCHAR[]);
 entity person, owns nickname @card(0..);
 ```
 
-**A relation type is a table too**, with one FK column per role. The FK references the
-player table's `_iid` (composite foreign keys are not recognised: give the referenced
-table an `_iid`), and the role is inferred from the role the player's type plays. Columns
-that are not FKs are the relation's own attributes.
+**A relation type is a table too**, with one column per role referencing the player
+table's `_iid`, by a foreign key or a `references` directive (composite foreign keys are
+not recognised: give the referenced table an `_iid`). The role is inferred from the role
+the player's type plays. The other columns are the relation's own attributes.
 
 ```sql
 CREATE TABLE employment (
@@ -152,7 +156,7 @@ entity person, plays mentorship:mentor, plays mentorship:student;
 relation mentorship, relates mentor, relates student;
 ```
 
-**A relation playing a role** is an FK to the relation table's `_iid`.
+**A relation playing a role** is a column referencing the relation table's `_iid`.
 
 ```sql
 CREATE TABLE approval (
@@ -169,7 +173,7 @@ entity person, plays employment:employee, plays approval:approver;
 
 **Subtypes take tables of their own**, abstract types none. An instance belongs to one
 table, so an `employee` row is not also a `person` row, and its table carries the inherited
-columns. Inherited ownerships and roles are mapped like declared ones. An FK to
+columns. Inherited ownerships and roles are mapped like declared ones. A reference to
 `person(_iid)` names persons only; a role open to employees too takes a second column
 referencing `employee(_iid)`.
 
@@ -183,8 +187,8 @@ entity employee sub person, owns salary;
 ```
 
 **Several tables may map to one type**, for instance when staged from several sources.
-Their `_iid` values may overlap: an `_iid` identifies a row within its table, and an FK
-names the table.
+Their `_iid` values may overlap: an `_iid` identifies a row within its table, and a
+reference names the table.
 
 ```sql
 CREATE TABLE person (_iid UBIGINT PRIMARY KEY, name VARCHAR);
@@ -202,11 +206,13 @@ COMMENT ON TABLE works_for      IS '@typedb relation employment (employee = pers
 COMMENT ON TABLE scratch        IS '@typedb skip';
 COMMENT ON COLUMN people.full_name IS '@typedb owns name';
 COMMENT ON COLUMN people.photo     IS '@typedb skip';
+COMMENT ON COLUMN works_for.person_id IS '@typedb references people';  -- instead of a FOREIGN KEY
 ```
 
-**An FK column on an entity table has no TypeDB form** and is rejected: a relation is a
-table of its own. Stage it, with its keys declared up front (DuckDB cannot add foreign
-keys to an existing table), and skip the original column:
+**A reference on an entity table has no TypeDB form** and is rejected, whether a foreign
+key or a `references` directive: a relation is a table of its own. Stage it (with its keys
+declared up front, as DuckDB cannot add foreign keys to an existing table, or without keys
+and with `references` directives), and skip the original column:
 
 ```sql
 CREATE TABLE management (
@@ -226,7 +232,7 @@ the import. Keep ids you query by as ordinary columns, ideally `@key`:
 ```sql
 CREATE TABLE person (
     _iid UBIGINT PRIMARY KEY,      -- instance id: consumed by the loader
-    id BIGINT NOT NULL UNIQUE,     -- business id: owns id @key in the schema
+    id BIGINT NOT NULL,            -- business id: owns id @key in the schema, which the server enforces
     ...
 );
 ```
@@ -250,17 +256,62 @@ For data without natural 64-bit ids, `row_number() OVER ()` at staging time is a
 | `BLOB`, `TIME`, `STRUCT`, `MAP`, `UNION` | — | rejected with a restructuring hint |
 | nested lists, other types | — | rejected |
 
+## Keys are optional
+
+The loader needs two facts about the data: that `_iid` is unique and present in every row
+of its table, and which table each role column points into, with every value an `_iid`
+there. Declaring them as keys hands both to DuckDB:
+
+```sql
+CREATE TABLE person (_iid UBIGINT PRIMARY KEY, name VARCHAR);
+CREATE TABLE employment (_iid UBIGINT PRIMARY KEY, person_id UBIGINT REFERENCES person(_iid));
+```
+
+Leaving them out hands both to the loader, which checks every row before converting
+anything; a role column then names its table with a directive:
+
+```sql
+CREATE TABLE person (_iid UBIGINT, name VARCHAR);
+CREATE TABLE employment (_iid UBIGINT, person_id UBIGINT);
+COMMENT ON COLUMN employment.person_id IS '@typedb references person';
+```
+
+Both produce the same data file, and they may be mixed table by table and column by
+column. The mapping summary shows which tables' ids and references are declared and which
+are checked by the loader. The checks are a few seconds per hundred million rows and spill
+to disk like the conversion.
+
+Keys cost memory while the data is staged, not while it is loaded: DuckDB keeps the index
+of every `PRIMARY KEY`, `UNIQUE` and `FOREIGN KEY` constraint in memory whenever rows are
+inserted, and cannot spill it. With random keys that is about 70 bytes per relation row,
+so staging a billion rows with keys needs tens of GB of RAM, where the same inserts without
+keys need well under one. The loader warns when it reads more than 100 million rows from
+tables with declared keys; for data of that size, staging without keys is the safe choice.
+
+## Memory
+
+The loader limits DuckDB to half of the memory it detects by default (the machine's, or a
+container's limit), and DuckDB spills sorts and joins to disk beyond it, next to the output
+(for `--dry-run`, in the system's temporary directory). `--memory-limit` sets another limit
+in DuckDB's syntax (`8GB`, `512MiB`); the conversion needs about one to three GB more for its
+own buffers. Lower limits trade time for memory: a hundred million rows converted in 22 s
+unlimited and in 30 s under 512 MB, a billion rows in 14 minutes under 2 GB. On disk, the
+data file and DuckDB's spills together peak at about twice the data file's size (a billion
+rows: a 34 GB file, 72 GB at the peak).
+
 ## What is checked, and what is the server's
 
-Before anything is written, the loader checks the structure (the `_iid` contract, FKs
-referencing `_iid`, supported column types, well-formed directives) and the mapping (every
+Before anything is written, the loader checks the structure (the `_iid` contract, role
+columns referencing `_iid`, supported column types, well-formed directives) and the mapping (every
 mapped type, attribute and role exists in the schema, with the right kind and a compatible
 value type). It then checks, with one DuckDB query per column, what would make the data
-file invalid: values TypeDB cannot hold (see the table above) and relation rows filling no
-role, since a relation cannot exist without players. Each violation is reported with its
-count and the first `_iid`s, so a dry run finds them all in minutes, not after hours of
-conversion. Any error stops the run with nothing written; warnings are printed and the run
-proceeds.
+file invalid: values TypeDB cannot hold (see the table above), relation rows filling no
+role, since a relation cannot exist without players, and, where they are not declared as
+keys, duplicate or missing `_iid`s and role values that are no `_iid` of the referenced
+table. Each violation is reported with its
+count and the first few examples (`_iid`s, or the offending values), so a dry run finds
+them all in minutes, not after hours of conversion. Any error stops the run with nothing
+written; warnings are printed and the run proceeds.
 
 Everything the schema constrains is enforced by the server at import, as for any other
 data: `@regex`, `@values` and `@range` as each attribute is created, which the import does
@@ -284,6 +335,12 @@ messages, in the order `database import` expects: a header stating the file's gu
 (the item order, unique attributes, players and owned attributes named as above), every
 attribute, every entity, every relation, then checksums. The schema is not copied: import
 the data file with the schema file it was prepared against.
+
+The file is compressed with zstd: a sequence of zstd frames, each with a checksum of its
+content, which `zstd -d` and `database import` read as one stream. Importing it needs a
+console or driver that reads compressed files; files exported by the server are plain and
+import as before. A file cut short or damaged fails to decompress instead of importing
+part of the data.
 
 Tables are written in name order, entity tables first. A relation that plays a role may
 come after the relation it plays in; the import links such players once every relation is

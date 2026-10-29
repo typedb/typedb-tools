@@ -22,6 +22,7 @@ use typedb_protocol::migration::{
 };
 
 use crate::{
+    SCRATCH,
     mapping::{IID_COLUMN, MappingPlan, OwnsMapping, TableKind, quoted},
     schema::ValueType,
     value::{Cells, TypeDBValue, Typed},
@@ -33,6 +34,18 @@ use crate::{
 const UNIT_ROWS: usize = 32_768;
 const UNIT_BYTES: usize = 32 << 20;
 const OUTPUT_BUFFER: usize = 8 << 20;
+
+// The file is a sequence of zstd frames, one per unit, which zstd reads as one stream. Each frame is complete
+// and carries a checksum of its content, so no stream is ever left unfinished and a file cut short or damaged
+// fails to decompress rather than import less.
+const COMPRESSION_LEVEL: i32 = 3;
+
+fn compress(bytes: &[u8]) -> Result<Vec<u8>, String> {
+    let compress_error = |err: std::io::Error| format!("failed to compress the output: {err}");
+    let mut compressor = zstd::bulk::Compressor::new(COMPRESSION_LEVEL).map_err(compress_error)?;
+    compressor.set_parameter(zstd::zstd_safe::CParameter::ChecksumFlag(true)).map_err(compress_error)?;
+    compressor.compress(bytes).map_err(compress_error)
+}
 
 pub(crate) fn emit(
     conn: &Connection,
@@ -69,7 +82,7 @@ pub(crate) fn emit(
 }
 
 fn write_item(output: &mut impl Write, item: item::Item) -> Result<(), String> {
-    let bytes = Item { item: Some(item) }.encode_length_delimited_to_vec();
+    let bytes = compress(&Item { item: Some(item) }.encode_length_delimited_to_vec())?;
     output.write_all(&bytes).map_err(|err| format!("failed to write the output file: {err}"))
 }
 
@@ -115,11 +128,13 @@ fn number_instances(conn: &Connection, plan: &MappingPlan) -> Result<Vec<TableNu
             }
             _ => {
                 // The sorted table's rowid is the rank; a `row_number()` window would not spill past the memory limit.
-                let ranks = format!("temp.typedb_loader_rank_{index}");
+                let ranks = format!("{SCRATCH}.rank_{index}");
                 let sql = format!(
-                    "CREATE OR REPLACE TEMP TABLE {ranks} AS SELECT {iid} FROM {} ORDER BY {iid}",
+                    "CREATE OR REPLACE TABLE {ranks} AS SELECT {iid} FROM {} ORDER BY {iid}",
                     quoted(&table.name)
                 );
+                // The table's rowid follows the insertion order, which this one statement must keep.
+                let sql = format!("SET preserve_insertion_order = true; {sql}; SET preserve_insertion_order = false");
                 conn.execute_batch(&sql).map_err(read_error)?;
                 Some(Iids::Ranked(ranks))
             }
@@ -220,28 +235,40 @@ fn emit_objects(
     for owns in &table.owns {
         selects.push(format!("{} AS c{}", owns.projection("t"), selects.len()));
     }
-    let mut joins = String::new();
     let mut role_columns: Vec<(usize, Option<usize>)> = Vec::new();
-    for (index, role) in table.roles().iter().enumerate() {
+    let mut rank_joins: Vec<(usize, &str)> = Vec::new();
+    for role in table.roles() {
         let column = selects.len();
         selects.push(format!("t.{} AS c{column}", quoted(&role.column)));
-        let rank_column = match &numbering[role.player].iids {
-            Some(Iids::Ranked(ranks)) => {
-                let alias = format!("r{index}");
-                joins += &format!(
-                    " LEFT JOIN {ranks} {alias} ON t.{} = {alias}.{}",
-                    quoted(&role.column),
-                    quoted(IID_COLUMN)
-                );
-                selects.push(format!("{alias}.rowid AS c{}", selects.len()));
-                Some(selects.len() - 1)
-            }
-            _ => None,
-        };
-        role_columns.push((column, rank_column));
+        role_columns.push((column, None));
+        if let Some(Iids::Ranked(ranks)) = &numbering[role.player].iids {
+            rank_joins.push((role_columns.len() - 1, ranks));
+        }
     }
-    let sql = format!("SELECT {} FROM {} t{joins} ORDER BY 1", selects.join(", "), quoted(&table.name));
-    let scan_error = |err: String| format!("scan of '{}' failed: {err}", table.name);
+    // Each rank is joined in a statement of its own: DuckDB spills one hash join under its memory limit, but two
+    // in one statement can fail to spill.
+    let base = format!("SELECT {} FROM {} t", selects.join(", "), quoted(&table.name));
+    let scan_error = |err: duckdb::Error| format!("scan of '{}' failed: {err}", table.name);
+    let mut source = format!("({base})");
+    let mut joined_table: Option<String> = None;
+    let mut width = selects.len();
+    for (step, (role_index, ranks)) in rank_joins.into_iter().enumerate() {
+        let (column, _) = role_columns[role_index];
+        let joined = format!("{SCRATCH}.joined_{table_index}_{step}");
+        conn.execute_batch(&format!(
+            "CREATE OR REPLACE TABLE {joined} AS SELECT p.*, r.rowid AS c{width} FROM {source} p \
+             LEFT JOIN {ranks} r ON p.c{column} = r.{}",
+            quoted(IID_COLUMN)
+        ))
+        .map_err(scan_error)?;
+        role_columns[role_index].1 = Some(width);
+        width += 1;
+        source = joined.clone();
+        if let Some(previous) = joined_table.replace(joined) {
+            conn.execute_batch(&format!("DROP TABLE {previous}")).map_err(scan_error)?;
+        }
+    }
+    let sql = format!("SELECT * FROM {source} ORDER BY 1");
 
     struct Player<'a> {
         numbering: &'a TableNumbering,
@@ -379,7 +406,12 @@ fn emit_objects(
         }
         Ok(unit)
     };
-    let scanned = scan(conn, &sql, output, checksums, &encode).map_err(scan_error)?;
+    let scanned =
+        scan(conn, &sql, output, checksums, &encode).map_err(|err| format!("scan of '{}' failed: {err}", table.name));
+    if let Some(joined) = joined_table {
+        conn.execute_batch(&format!("DROP TABLE {joined}")).map_err(scan_error)?;
+    }
+    let scanned = scanned?;
     if scanned != count {
         return Err(format!("the scan of '{}' returned {scanned} of its {count} rows", table.name));
     }
@@ -402,8 +434,10 @@ impl Unit {
     }
 }
 
-// A result read whole stays in memory beyond DuckDB's memory limit; a temporary table spills to disk, and
-// streams back in insertion order, which `preserve_insertion_order` keeps equal to the sort order.
+// The result is streamed in the order of the query's ORDER BY; a result read whole would stay in memory beyond
+// DuckDB's memory limit. DuckDB keeps that order in a streamed result only while insertion order is preserved
+// (since 2.0 it streams a parallel sort's batches as they finish), so the setting is on for the scan alone: the
+// joins and checks, which it would keep from spilling, run in statements of their own.
 fn scan(
     conn: &Connection,
     sql: &str,
@@ -411,11 +445,10 @@ fn scan(
     checksums: &mut Checksums,
     encode: &(impl Fn(&[RecordBatch], u64) -> Result<Unit, String> + Sync),
 ) -> Result<u64, String> {
-    const SCAN: &str = "temp.typedb_loader_scan";
     let scan_error = |err: duckdb::Error| format!("scan failed: {err}");
-    conn.execute_batch(&format!("CREATE OR REPLACE TEMP TABLE {SCAN} AS {sql}")).map_err(scan_error)?;
-    let rows = (|| {
-        let mut statement = conn.prepare(&format!("SELECT * FROM {SCAN}")).map_err(scan_error)?;
+    conn.execute_batch("SET preserve_insertion_order = true").map_err(scan_error)?;
+    let scanned = (|| {
+        let mut statement = conn.prepare(sql).map_err(scan_error)?;
         // The iterator `stream_arrow` returns panics on a fetch error; stepping the statement reports it instead.
         let _ = statement.stream_arrow([]).map_err(scan_error)?;
         let batches = std::iter::from_fn(|| {
@@ -423,8 +456,8 @@ fn scan(
         });
         pipeline(batches, output, checksums, encode)
     })();
-    let dropped = conn.execute_batch(&format!("DROP TABLE {SCAN}")).map_err(scan_error);
-    rows.and_then(|rows| dropped.map(|()| rows))
+    conn.execute_batch("SET preserve_insertion_order = false").map_err(scan_error)?;
+    scanned
 }
 
 fn pipeline(
@@ -448,7 +481,11 @@ fn pipeline(
                 loop {
                     let received = work_receiver.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).recv();
                     let Ok((sequence, first_row, batches)) = received else { return };
-                    if unit_sender.send((sequence, encode(&batches, first_row))).is_err() {
+                    let unit = encode(&batches, first_row).and_then(|mut unit| {
+                        unit.bytes = compress(&unit.bytes)?;
+                        Ok(unit)
+                    });
+                    if unit_sender.send((sequence, unit)).is_err() {
                         return;
                     }
                 }

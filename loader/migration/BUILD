@@ -17,6 +17,7 @@ rust_library(
         # External dependencies
         "@crates//:duckdb",
         "@crates//:prost",
+        "@crates//:zstd",
     ],
     visibility = ["//visibility:public"],
     tags = ["crate-name=typedb-migration"],
@@ -37,6 +38,7 @@ rust_test(
         # External dependencies
         "@crates//:duckdb",
         "@crates//:prost",
+        "@crates//:zstd",
     ],
 )
 

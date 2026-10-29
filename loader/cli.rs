@@ -55,6 +55,17 @@ pub struct Args {
     )]
     pub dry_run: bool,
 
+    /// With --duckdb: the memory DuckDB may use before it spills to disk, such as `8GB` or `512MiB`.
+    /// Default: half of the memory DuckDB detects (the machine's, or a container's limit).
+    #[arg(
+        long = "memory-limit",
+        value_name = "size",
+        help_heading = "Migration",
+        requires = "duckdb",
+        group = "migration_options"
+    )]
+    pub memory_limit: Option<String>,
+
     /// With --duckdb: replace an existing data file instead of refusing.
     #[arg(long, default_value = "false", help_heading = "Migration", requires = "duckdb", group = "migration_options")]
     pub overwrite: bool,

@@ -100,7 +100,7 @@ fn scratch(test_name: &str, schema: &str, sql: &str) -> Result<Scratch, Box<dyn 
 
 fn prepare(dir: &Scratch) -> Result<Migration, PrepareError> {
     let schema = fs::read_to_string(dir.0.join("schema.tql")).expect("schema");
-    Migration::prepare(&Source::DuckDb(dir.0.join("fixture.duckdb")), &schema, &dir.0.join("spill"))
+    Migration::prepare(&Source::DuckDb(dir.0.join("fixture.duckdb")), &schema, &dir.0.join("spill"), None)
 }
 
 fn validation_errors(dir: &Scratch) -> Vec<String> {
@@ -123,7 +123,8 @@ fn convert(dir: &Scratch) -> Result<Vec<item::Item>, Box<dyn Error>> {
 }
 
 fn decode_items(data: &[u8]) -> Result<Vec<item::Item>, Box<dyn Error>> {
-    let mut buf = data;
+    let data = zstd::stream::decode_all(data)?;
+    let mut buf = data.as_slice();
     let mut items = Vec::new();
     while !buf.is_empty() {
         let len = prost::decode_length_delimiter(&mut buf)?;
@@ -284,7 +285,10 @@ fn fk_column_on_entity_table_is_rejected() -> Result<(), Box<dyn Error>> {
          CREATE TABLE employee (_iid UBIGINT PRIMARY KEY REFERENCES person(_iid));",
     )?;
     let errors = validation_errors(&dir);
-    assert_error(&errors, &["table 'pet': FK column 'owner_id'", "relations are tables"]);
+    assert_error(
+        &errors,
+        &["table 'pet': column 'owner_id' references table 'person', which on an entity table", "relations are tables"],
+    );
     assert_error(&errors, &["table 'employee': _iid is a FOREIGN KEY"]);
     Ok(())
 }
@@ -304,8 +308,15 @@ fn structure_and_mapping_errors_name_the_table_and_the_fix() -> Result<(), Box<d
         ),
         ("CREATE TABLE person (id BIGINT PRIMARY KEY)", "table 'person' has no _iid column"),
         ("CREATE TABLE person (_iid BIGINT PRIMARY KEY)", "table 'person': _iid must be UBIGINT"),
-        ("CREATE TABLE person (_iid UBIGINT)", "table 'person': _iid must be declared NOT NULL"),
-        ("CREATE TABLE person (_iid UBIGINT NOT NULL)", "table 'person': _iid must carry a declared UNIQUE"),
+        (
+            "CREATE TABLE person (_iid UBIGINT); INSERT INTO person VALUES (1), (NULL), (NULL)",
+            "table 'person': 2 row(s) have no _iid, which every row needs as its instance id, e.g. rowid 1, 2",
+        ),
+        (
+            "CREATE TABLE person (_iid UBIGINT NOT NULL); INSERT INTO person VALUES (1), (2), (2), (3), (3), (3)",
+            "table 'person': 2 _iid value(s) appear in more than one row; an instance id must be unique within \
+             its table, e.g. _iid 2, 3",
+        ),
         (
             "CREATE TABLE friend_ship (_iid UBIGINT PRIMARY KEY)",
             "table 'friend_ship' matches both an entity and a relation",
@@ -1019,7 +1030,7 @@ fn role_inference_does_not_depend_on_column_order() -> Result<(), Box<dyn Error>
         ("order-2", "person_id UBIGINT REFERENCES person(_iid), company_id UBIGINT REFERENCES company(_iid)"),
     ] {
         let dir = scratch(name, schema, &format!("{tables} CREATE TABLE r (_iid UBIGINT PRIMARY KEY, {columns});"))?;
-        assert_error(&validation_errors(&dir), &["FK column 'person_id' is ambiguous", "(a = <column>, b = <column>)"]);
+        assert_error(&validation_errors(&dir), &["column 'person_id' is ambiguous", "(a = <column>, b = <column>)"]);
     }
     Ok(())
 }
@@ -1122,5 +1133,210 @@ fn an_output_error_ends_a_large_conversion() -> Result<(), Box<dyn Error>> {
     let result = receiver.recv_timeout(Duration::from_secs(120)).expect("the conversion must end, not hang");
     let error = result.expect_err("a failing output must fail the conversion");
     assert!(error.contains("failed to write the output file: disk full"), "{error}");
+    Ok(())
+}
+
+#[test]
+fn the_data_file_is_a_checksummed_zstd_stream_of_the_export_format() -> Result<(), Box<dyn Error>> {
+    // More rows than one unit, so that the file holds several frames.
+    let dir = scratch(
+        "zstd-stream",
+        "define\n  attribute name value string;\n  entity person, owns name;\n",
+        "CREATE TABLE person (_iid UBIGINT PRIMARY KEY, name VARCHAR);
+         INSERT INTO person SELECT i, 'p' || i FROM range(100000) t(i);",
+    )?;
+    let data = run(&dir)?;
+    assert_eq!(data[..4], [0x28, 0xB5, 0x2F, 0xFD], "the file starts with a zstd frame");
+    let plain = zstd::stream::decode_all(data.as_slice())?;
+    assert!(data.len() * 5 < plain.len(), "{} compressed bytes for {} plain", data.len(), plain.len());
+    let items = decode_items(&data)?;
+    assert_eq!(items.len(), 1 + 100_000 + 100_000 + 1);
+
+    let mut frames = 0;
+    let mut rest = data.as_slice();
+    while !rest.is_empty() {
+        let size = zstd::zstd_safe::find_frame_compressed_size(rest).map_err(|code| format!("frame error {code}"))?;
+        rest = &rest[size..];
+        frames += 1;
+    }
+    assert!(frames > 3, "{frames} frames");
+
+    for cut in [data.len() - 1, data.len() / 2] {
+        assert!(zstd::stream::decode_all(&data[..cut]).is_err(), "a file cut at {cut} must not decompress");
+    }
+    let mut damaged = data.clone();
+    let last = damaged.len() - 2;
+    damaged[last] ^= 0x01;
+    assert!(zstd::stream::decode_all(damaged.as_slice()).is_err(), "a damaged checksum must not decompress");
+    Ok(())
+}
+
+const KEY_FREE_FIXTURE: &str = r#"
+    CREATE TABLE person (_iid UBIGINT, name VARCHAR NOT NULL, age INTEGER, tags VARCHAR[]);
+    COMMENT ON COLUMN person.tags IS '@typedb owns tag';
+    CREATE TABLE company (_iid UBIGINT, name VARCHAR NOT NULL);
+    CREATE TABLE employment (_iid UBIGINT, person_id UBIGINT, company_id UBIGINT, salary DECIMAL(12,2));
+    COMMENT ON COLUMN employment.person_id IS '@typedb references person';
+    COMMENT ON COLUMN employment.company_id IS '@typedb references company';
+    CREATE TABLE mentorship (_iid UBIGINT, mentor_id UBIGINT, student_id UBIGINT);
+    COMMENT ON TABLE mentorship IS '@typedb relation mentorship (mentor = mentor_id, student = student_id)';
+    COMMENT ON COLUMN mentorship.mentor_id IS '@typedb references person';
+    COMMENT ON COLUMN mentorship.student_id IS '@typedb REFERENCES  Person';
+    INSERT INTO person VALUES (1, 'Alice', 30, ['a','b']), (2, 'Bob', NULL, NULL);
+    INSERT INTO company VALUES (10, 'Acme');
+    INSERT INTO employment VALUES (100, 1, 10, 50000.25), (101, 2, 10, NULL);
+    INSERT INTO mentorship VALUES (200, 1, 2);
+"#;
+
+#[test]
+fn tables_without_declared_keys_convert_as_the_keyed_ones() -> Result<(), Box<dyn Error>> {
+    let keyed = convert(&scratch("keyed", SCHEMA, FIXTURE)?)?;
+    let dir = scratch("key-free", SCHEMA, KEY_FREE_FIXTURE)?;
+    assert_eq!(convert(&dir)?, keyed);
+    let summary = prepare(&dir).map_err(|err| format!("{err:?}"))?.mapping_summary();
+    assert!(
+        summary.iter().any(|line| line.contains("table 'employment'")
+            && line.ends_with("; ids checked by the loader, references checked by the loader)")),
+        "{summary:#?}"
+    );
+    let summary =
+        prepare(&scratch("keyed-summary", SCHEMA, FIXTURE)?).map_err(|err| format!("{err:?}"))?.mapping_summary();
+    assert!(
+        summary
+            .iter()
+            .any(|line| line.contains("table 'employment'") && line.ends_with("; ids declared, references declared)")),
+        "{summary:#?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn sparse_ids_without_declared_keys_are_numbered_by_rank() -> Result<(), Box<dyn Error>> {
+    let schema = "define\n  attribute name value string;\n  entity person, owns name, plays knows:a, plays knows:b;\n  \
+                  relation knows, relates a, relates b;\n";
+    let rows = "INSERT INTO person SELECT 7 * i + 3, 'p' || i FROM range(5000) t(i);
+                INSERT INTO knows SELECT 11 * i, 7 * ((i * 37) % 5000) + 3, 7 * ((i * 91) % 5000) + 3
+                FROM range(9000) t(i);";
+    let keyed = scratch(
+        "sparse-keyed",
+        schema,
+        &format!(
+            "CREATE TABLE person (_iid UBIGINT PRIMARY KEY, name VARCHAR);
+             CREATE TABLE knows (_iid UBIGINT PRIMARY KEY, a UBIGINT REFERENCES person(_iid),
+                                 b UBIGINT REFERENCES person(_iid));
+             COMMENT ON TABLE knows IS '@typedb relation knows (a = a, b = b)'; {rows}"
+        ),
+    )?;
+    let key_free = scratch(
+        "sparse-key-free",
+        schema,
+        &format!(
+            "CREATE TABLE person (_iid UBIGINT, name VARCHAR);
+             CREATE TABLE knows (_iid UBIGINT, a UBIGINT, b UBIGINT);
+             COMMENT ON TABLE knows IS '@typedb relation knows (a = a, b = b)';
+             COMMENT ON COLUMN knows.a IS '@typedb references person';
+             COMMENT ON COLUMN knows.b IS '@typedb references person'; {rows}"
+        ),
+    )?;
+    let items = convert(&key_free)?;
+    assert_eq!(items, convert(&keyed)?);
+    assert_eq!(items.iter().filter(|item| matches!(item, item::Item::Relation(_))).count(), 9000);
+    Ok(())
+}
+
+#[test]
+fn references_without_declared_keys_are_checked() -> Result<(), Box<dyn Error>> {
+    let schema =
+        "define\n  entity person, plays knows:friend;\n  entity robot;\n  relation knows, relates friend @card(0..);\n";
+    let check = |sql: &str, fragments: &[&str]| -> Result<(), Box<dyn Error>> {
+        let dir = scratch(
+            "references",
+            schema,
+            &format!(
+                "CREATE TABLE person (_iid UBIGINT); INSERT INTO person VALUES (1), (2);
+                 CREATE TABLE robot (_iid UBIGINT PRIMARY KEY); {sql}"
+            ),
+        )?;
+        assert_error(&validation_errors(&dir), fragments);
+        Ok(())
+    };
+    check(
+        "CREATE TABLE knows (_iid UBIGINT, a UBIGINT, b UBIGINT);
+         COMMENT ON COLUMN knows.a IS '@typedb references person';
+         COMMENT ON COLUMN knows.b IS '@typedb references person';
+         INSERT INTO knows VALUES (5, 1, 2), (6, 1, 9), (7, 8, NULL), (8, NULL, 2);",
+        &["table 'knows': column 'a' (references 'person'): 1 row(s) hold a value that is no _iid of the referenced \
+           table, e.g. value 8"],
+    )?;
+    check(
+        "CREATE TABLE knows (_iid UBIGINT, a UBIGINT, b UBIGINT);
+         COMMENT ON COLUMN knows.a IS '@typedb references person';
+         COMMENT ON COLUMN knows.b IS '@typedb references person';
+         INSERT INTO knows VALUES (5, 1, 2), (6, 1, 9);",
+        &["table 'knows': column 'b' (references 'person'): 1 row(s) hold a value that is no _iid of the referenced \
+           table, e.g. value 9"],
+    )?;
+    check(
+        "CREATE TABLE knows (_iid UBIGINT, a BIGINT); COMMENT ON COLUMN knows.a IS '@typedb references person';",
+        &["column 'a' references 'person' and must hold its _iid values, so it must be UBIGINT; found BIGINT"],
+    )?;
+    check(
+        "CREATE TABLE knows (_iid UBIGINT, a UBIGINT); COMMENT ON COLUMN knows.a IS '@typedb references people';",
+        &["column 'a' references table 'people', which is not mapped"],
+    )?;
+    check(
+        "CREATE TABLE knows (_iid UBIGINT, a UBIGINT REFERENCES robot(_iid));
+         COMMENT ON COLUMN knows.a IS '@typedb references person';",
+        &["column 'a' is marked '@typedb references person', but its FOREIGN KEY references 'robot'"],
+    )?;
+    check(
+        "CREATE TABLE knows (_iid UBIGINT, a UBIGINT);
+         COMMENT ON TABLE knows IS '@typedb relation knows (friend = a)';",
+        &["column 'a' is bound to role 'friend' but names no players' table", "'@typedb references <table>'"],
+    )?;
+    check(
+        "CREATE TABLE knows (_iid UBIGINT, a UBIGINT); COMMENT ON COLUMN knows.a IS '@typedb references robot';",
+        &["column 'a' references 'robot', whose type 'robot' plays no role of relation 'knows'"],
+    )?;
+    check(
+        "CREATE TABLE knows (_iid UBIGINT, a UBIGINT); COMMENT ON COLUMN robot._iid IS '@typedb references person';
+         COMMENT ON COLUMN knows.a IS '@typedb references person';",
+        &["table 'robot': _iid holds the instances' ids and takes no directive"],
+    )?;
+    let dir = scratch(
+        "references-without-ids",
+        schema,
+        "CREATE TABLE person (_iid UBIGINT); INSERT INTO person VALUES (1); CREATE TABLE robot (_iid UBIGINT);
+         CREATE TABLE knows (_iid UBIGINT, a UBIGINT); COMMENT ON COLUMN knows.a IS '@typedb references person';
+         INSERT INTO knows VALUES (NULL, NULL), (NULL, 7);",
+    )?;
+    let errors = validation_errors(&dir);
+    assert_error(&errors, &["table 'knows': 2 row(s) have no _iid"]);
+    assert_error(&errors, &["relation table 'knows': 1 row(s) fill no role", "e.g. _iid NULL"]);
+    assert_error(&errors, &["column 'a' (references 'person'): 1 row(s)", "e.g. value 7"]);
+    assert!(errors.iter().all(|error| !error.contains("could not be checked")), "{errors:#?}");
+    check(
+        "CREATE TABLE knows (_iid UBIGINT, a UBIGINT); COMMENT ON COLUMN knows.a IS '@typedb references';",
+        &["column 'a': unrecognised directive '@typedb references' \
+             (expected: skip | owns <label> | references <table>)"],
+    )?;
+    let dir = scratch(
+        "references-on-entity",
+        "define\n  entity person;\n  entity pet;\n",
+        "CREATE TABLE person (_iid UBIGINT); CREATE TABLE pet (_iid UBIGINT, owner UBIGINT);
+         COMMENT ON COLUMN pet.owner IS '@typedb references person';",
+    )?;
+    assert_error(&validation_errors(&dir), &["column 'owner' references table 'person', which on an entity table"]);
+
+    // A declared key and a directive that agree are fine.
+    let dir = scratch(
+        "references-agree",
+        schema,
+        "CREATE TABLE person (_iid UBIGINT PRIMARY KEY); INSERT INTO person VALUES (1);
+         CREATE TABLE robot (_iid UBIGINT);
+         CREATE TABLE knows (_iid UBIGINT, a UBIGINT REFERENCES person(_iid));
+         COMMENT ON COLUMN knows.a IS '@typedb references person'; INSERT INTO knows VALUES (5, 1);",
+    )?;
+    convert(&dir)?;
     Ok(())
 }

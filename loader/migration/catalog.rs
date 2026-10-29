@@ -160,6 +160,10 @@ impl Table {
     pub(crate) fn fk_of_column(&self, name: &str) -> Option<&ForeignKey> {
         self.foreign_keys.iter().find(|fk| fk.columns.iter().any(|column| column == name))
     }
+
+    pub(crate) fn declares_keys(&self) -> bool {
+        !self.primary_key.is_empty() || !self.unique_column_sets.is_empty() || !self.foreign_keys.is_empty()
+    }
 }
 
 #[derive(Debug)]
