@@ -24,6 +24,9 @@
 	[dependencies.typeql]
 		workspace = true
 
+	[dependencies.zstd]
+		workspace = true
+
 [[test]]
 	name = "behaviour-schemas"
 	path = "tests/behaviour_schemas.rs"

@@ -5,7 +5,8 @@
  */
 
 use std::{
-    fs, io,
+    fs,
+    io::{self, Write},
     path::{self, Path, PathBuf},
     process,
     sync::{Arc, Mutex, MutexGuard},
@@ -47,14 +48,15 @@ pub(crate) async fn run_migration(args: &Args) -> ! {
     let cleanup = on_interrupt(spill_dir.clone());
     let migration = {
         let schema_text = schema_text.clone();
-        blocking(move || prepare(&source, &schema_text, &spill_dir)).await
+        let memory_limit = args.memory_limit.clone();
+        blocking(move || prepare(&source, &schema_text, &spill_dir, memory_limit.as_deref())).await
     };
     if args.dry_run {
         let original_database = original_database.clone();
         let (result, elapsed) = blocking(move || {
             let started = Instant::now();
             let result = migration.run(io::sink(), VERSION.trim(), &original_database);
-            drop(migration); // closing DuckDB removes its spill directory; exiting would not
+            drop(migration); // closes DuckDB and removes its spill directory; exiting would not
             (result, started.elapsed())
         })
         .await;
@@ -168,13 +170,17 @@ fn is_transient(err: &typedb_driver::Error) -> bool {
     }
 }
 
-fn prepare(source: &Source, schema_text: &str, spill_dir: &Path) -> Migration {
+fn prepare(source: &Source, schema_text: &str, spill_dir: &Path, memory_limit: Option<&str>) -> Migration {
     let started = Instant::now();
-    match Migration::prepare(source, schema_text, spill_dir) {
+    match Migration::prepare(source, schema_text, spill_dir, memory_limit) {
         Ok(migration) => {
             print_mapping(&migration.mapping_summary());
             print_warnings(migration.warnings());
-            println!("Checked in {}.", format_duration(started.elapsed()));
+            println!(
+                "Checked in {} (DuckDB memory limit {}).",
+                format_duration(started.elapsed()),
+                migration.memory_limit()
+            );
             migration
         }
         Err(PrepareError::Setup(message)) => fatal_with(ExitCode::UserInputError, message),
@@ -284,9 +290,19 @@ fn on_interrupt(spill_dir: PathBuf) -> Arc<Mutex<Cleanup>> {
                 println!("{kept_hint}");
             }
         }
-        process::exit(exit_code);
+        exit_now(exit_code);
     });
     cleanup
+}
+
+// The conversion's DuckDB threads may still be running: `process::exit` would run C++ static destructors under
+// them ("pure virtual method called"), so the process ends without running them.
+fn exit_now(code: i32) -> ! {
+    unsafe extern "C" {
+        fn _exit(status: std::ffi::c_int) -> !;
+    }
+    let _ = io::stdout().flush();
+    unsafe { _exit(code) }
 }
 
 fn output_data_path(dir: &Path, database: &str, overwrite: bool) -> PathBuf {

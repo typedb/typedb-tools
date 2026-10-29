@@ -30,7 +30,7 @@
 		[workspace.dependencies.duckdb]
 			default-features = false
 			features = ["bundled", "default"]
-			version = "1.10506.0"
+			version = "1.20000.1"
 
 		[workspace.dependencies.futures]
 			default-features = false
@@ -80,7 +80,7 @@
 		[workspace.dependencies.serde_json]
 			default-features = false
 			features = ["default", "raw_value", "std"]
-			version = "1.0.151"
+			version = "1.0.154"
 
 		[workspace.dependencies.sha2]
 			default-features = false
@@ -95,13 +95,13 @@
 		[workspace.dependencies.tokio]
 			default-features = false
 			features = ["bytes", "default", "fs", "io-std", "io-util", "libc", "macros", "mio", "net", "rt", "rt-multi-thread", "signal", "signal-hook-registry", "socket2", "sync", "test-util", "time", "tokio-macros"]
-			version = "1.53.2"
+			version = "1.54.1"
 
 		[workspace.dependencies.typedb-driver]
 			default-features = false
 			features = []
 			git = "https://github.com/typedb/typedb-driver"
-			rev = "2f655492403ea01608322e0add943d486e2cfc7e"
+			rev = "9e645f29769ae589868c4ce8ca7308f317e0f49c"
 
 		[workspace.dependencies.typedb-migration]
 			default-features = false
@@ -112,7 +112,7 @@
 			default-features = false
 			features = []
 			git = "https://github.com/typedb/typedb-protocol"
-			rev = "0c9a6c46d658a1db593d57b33fc6ad4faf0a3e98"
+			rev = "d659baa2fcfc755a03745885197dd0a1633c8ae2"
 
 		[workspace.dependencies.typedb_binary_runner]
 			default-features = false
@@ -134,3 +134,8 @@
 			default-features = false
 			features = ["default", "gzip", "tls"]
 			version = "2.12.1"
+
+		[workspace.dependencies.zstd]
+			default-features = false
+			features = []
+			version = "0.14.3"

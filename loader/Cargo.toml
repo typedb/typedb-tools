@@ -64,14 +64,17 @@
 	[dev-dependencies.typedb_binary_runner]
 		workspace = true
 
+	[dev-dependencies.zstd]
+		workspace = true
+
 [[bin]]
 	name = "typedb-loader"
 	path = "main.rs"
 
 [[test]]
-	name = "test-migration-cli"
-	path = "tests/migration/test_migration_cli.rs"
-
-[[test]]
 	name = "test-loader"
 	path = "tests/assembly/test_loader.rs"
+
+[[test]]
+	name = "test-migration-cli"
+	path = "tests/migration/test_migration_cli.rs"

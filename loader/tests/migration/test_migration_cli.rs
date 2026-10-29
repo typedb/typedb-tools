@@ -75,8 +75,10 @@ fn files_only_writes_the_data_file() -> Result<(), Box<dyn Error>> {
         stdout.contains(&format!("database import fixture {schema_path} ")),
         "no import hint referencing the original schema file: {stdout}"
     );
-    assert!(!dir.join("out/fixture.schema.typeql").exists(), "the schema file is referenced, not copied");
-    let data = fs::read(dir.join("out/fixture.data.typedb"))?;
+    let written: Vec<_> =
+        fs::read_dir(dir.join("out"))?.map(|entry| entry.map(|entry| entry.file_name())).collect::<Result<_, _>>()?;
+    assert_eq!(written, ["fixture.data.typedb"], "only the data file is left: the schema is referenced, not copied");
+    let data = zstd::stream::decode_all(fs::File::open(dir.join("out/fixture.data.typedb"))?)?;
     let mut buf: &[u8] = &data;
     let mut count = 0;
     while !buf.is_empty() {
@@ -208,6 +210,44 @@ fn a_termination_signal_removes_the_partial_file() -> Result<(), Box<dyn Error>>
     assert_eq!(loader.wait()?.code(), Some(143));
     assert!(!partial.exists(), "the partial file was left behind");
     assert!(!out.join("fixture.data.typedb").exists());
+    let _ = fs::remove_dir_all(&dir);
+    Ok(())
+}
+
+#[test]
+fn the_memory_limit_is_reported_and_validated() -> Result<(), Box<dyn Error>> {
+    let dir = setup("memory")?;
+    let output = run_loader(&dir, &["--dry-run", "--memory-limit", "256MiB"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "{stdout}\n{}", String::from_utf8_lossy(&output.stderr));
+    assert!(stdout.contains("(DuckDB memory limit 256.0 MiB)"), "{stdout}");
+
+    let output = run_loader(&dir, &["--dry-run"]);
+    assert!(String::from_utf8_lossy(&output.stdout).contains("(DuckDB memory limit "), "a default limit is set");
+
+    let output = run_loader(&dir, &["--dry-run", "--memory-limit", "lots"]);
+    assert_eq!(output.status.code(), Some(2), "an invalid limit is a user-input error");
+    assert!(String::from_utf8_lossy(&output.stderr).contains("invalid memory limit 'lots'"));
+    let _ = fs::remove_dir_all(&dir);
+    Ok(())
+}
+
+#[test]
+fn checks_spill_into_an_output_directory_that_does_not_exist_yet() -> Result<(), Box<dyn Error>> {
+    let dir = setup("spill")?;
+    Connection::open(dir.join("fixture.duckdb"))?.execute_batch(
+        "DROP TABLE person;
+         CREATE TABLE person AS SELECT i::UBIGINT AS _iid, 'name' || i AS name FROM range(8000000) t(i);",
+    )?;
+    let out = dir.join("out/nested").to_string_lossy().into_owned();
+    let output = run_loader(&dir, &["--files-only", "--output-dir", &out, "--memory-limit", "128MiB"]);
+    assert!(
+        output.status.success(),
+        "loader failed:\n{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(dir.join("out/nested/fixture.data.typedb").exists());
     let _ = fs::remove_dir_all(&dir);
     Ok(())
 }

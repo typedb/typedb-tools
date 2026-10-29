@@ -31,7 +31,7 @@ fn parse_all_behaviour_schemas() {
             continue;
         }
         let schema = fs::read_to_string(&path).unwrap();
-        match Migration::prepare(&Source::DuckDb(empty_db.clone()), &schema, &std::env::temp_dir()) {
+        match Migration::prepare(&Source::DuckDb(empty_db.clone()), &schema, &std::env::temp_dir(), None) {
             Ok(_) | Err(PrepareError::Invalid { .. }) => ok += 1,
             Err(PrepareError::Setup(message)) => {
                 setup_failures.push((path.file_name().unwrap().to_string_lossy().into_owned(), message));
