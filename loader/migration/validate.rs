@@ -34,6 +34,7 @@ pub(crate) fn check_data(conn: &Connection, plan: &MappingPlan, diagnostics: &mu
         .map(|owns| owns.attribute.as_str())
         .collect();
     let mut keyed_rows = Vec::new();
+    check_ids_within_types(conn, plan, diagnostics);
     for table in &plan.tables {
         check_instance_ids(conn, table, diagnostics);
         if let TableKind::Relation { roles } = &table.kind {
@@ -77,9 +78,19 @@ fn large_keyed_tables_warning(keyed_rows: &[(&str, u64)], threshold: u64) -> Opt
     ))
 }
 
+// An `_iid` is the instance's id within its type, as TypeDB numbers a type's instances below 2^63.
 fn check_instance_ids(conn: &Connection, table: &TableMapping, diagnostics: &mut Diagnostics) {
     let iid = quoted(IID_COLUMN);
     let name = quoted(&table.name);
+    Check {
+        subject: format!("table '{}'", table.name),
+        unit: "row(s)",
+        predicate: "have an _iid of 2^63 or more, beyond TypeDB's instance ids; number the rows, and the columns \
+                    referencing them, below that",
+        example: "_iid",
+        violations: format!("SELECT {iid} AS example FROM {name} WHERE {iid} >= {}", 1u64 << 63),
+    }
+    .report(conn, diagnostics);
     if !table.declared_ids.not_null {
         Check {
             subject: format!("table '{}'", table.name),
@@ -98,6 +109,34 @@ fn check_instance_ids(conn: &Connection, table: &TableMapping, diagnostics: &mut
             example: "_iid",
             violations: format!(
                 "SELECT {iid} AS example FROM {name} WHERE {iid} IS NOT NULL GROUP BY {iid} HAVING count(*) > 1"
+            ),
+        }
+        .report(conn, diagnostics);
+    }
+}
+
+// Tables mapped to one type number its instances together, so they share no `_iid`.
+fn check_ids_within_types(conn: &Connection, plan: &MappingPlan, diagnostics: &mut Diagnostics) {
+    let iid = quoted(IID_COLUMN);
+    let mut by_type: Vec<(&str, Vec<&str>)> = Vec::new();
+    for table in &plan.tables {
+        match by_type.iter_mut().find(|(label, _)| *label == table.type_label) {
+            Some((_, tables)) => tables.push(&table.name),
+            None => by_type.push((&table.type_label, vec![&table.name])),
+        }
+    }
+    for (label, tables) in by_type.iter().filter(|(_, tables)| tables.len() > 1) {
+        let selects: Vec<String> =
+            tables.iter().map(|table| format!("SELECT DISTINCT {iid} FROM {}", quoted(table))).collect();
+        let names: Vec<String> = tables.iter().map(|table| format!("'{table}'")).collect();
+        Check {
+            subject: format!("tables {} mapped to '{label}'", names.join(", ")),
+            unit: "_iid value(s)",
+            predicate: "appear in more than one of them; an _iid is the instance's id within its type",
+            example: "_iid",
+            violations: format!(
+                "SELECT {iid} AS example FROM ({}) WHERE {iid} IS NOT NULL GROUP BY {iid} HAVING count(*) > 1",
+                selects.join(" UNION ALL ")
             ),
         }
         .report(conn, diagnostics);
@@ -251,8 +290,8 @@ fn check_value_domain(
         ColumnType::Interval => (
             "hold an interval with a negative part or a time part beyond TypeDB's duration range",
             format!(
-                "e::VARCHAR LIKE '%-%' OR (epoch_us(e) - (date_part('year', e) * 12 + date_part('month', e)) \
-                 * 2592000000000 - date_part('day', e) * 86400000000) > {}",
+                "e::VARCHAR LIKE '%-%' OR (date_part('hour', e)::HUGEINT * 60 + date_part('minute', e)) * 60000000 \
+                 + date_part('microseconds', e) > {}",
                 u64::MAX / 1000
             ),
         ),

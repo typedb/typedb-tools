@@ -94,7 +94,7 @@ pub(crate) struct Cells<'a> {
 }
 
 // What the loader's projections produce: integers cast to BIGINT, doubles to DOUBLE, decimals to TypeDB's
-// scale, intervals and string-like types to VARCHAR; ids, players and ranks are UBIGINT and BIGINT.
+// scale, intervals and string-like types to VARCHAR; ids and players are UBIGINT.
 pub(crate) enum Typed<'a> {
     Boolean(&'a BooleanArray),
     Int64(&'a Int64Array),
