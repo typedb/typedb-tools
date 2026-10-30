@@ -65,10 +65,6 @@ pub struct Migration {
     _spill_dir: SpillDir,
 }
 
-// The loader's own tables live in a scratch database here, beside DuckDB's spill files: DuckDB 2.0 runs out of
-// memory joining temporary tables that it would spill as tables of a database file.
-pub(crate) const SCRATCH: &str = "typedb_loader_scratch";
-
 struct SpillDir(PathBuf);
 
 impl Drop for SpillDir {
@@ -135,10 +131,10 @@ impl Migration {
 }
 
 fn open_duckdb(path: &Path, spill_dir: &Path) -> Result<Connection, PrepareError> {
-    let connection = Config::default()
+    Config::default()
         .access_mode(AccessMode::ReadOnly)
         .and_then(|config| config.with("temp_directory", spill_dir.to_string_lossy()))
-        // Order comes from the queries' ORDER BY; preserving insertion order would keep joins from spilling.
+        // No scan depends on the order of its rows; preserving it would keep DuckDB from spilling.
         .and_then(|config| config.with("preserve_insertion_order", "false"))
         .and_then(|config| Connection::open_with_flags(path, config))
         .map_err(|err| {
@@ -147,12 +143,7 @@ fn open_duckdb(path: &Path, spill_dir: &Path) -> Result<Connection, PrepareError
                  see the loader's DuckDB README)",
                 path.display()
             ))
-        })?;
-    let scratch = spill_dir.join("scratch.duckdb").to_string_lossy().replace('\'', "''");
-    connection.execute_batch(&format!("ATTACH '{scratch}' AS {SCRATCH} (READ_WRITE)")).map_err(|err| {
-        PrepareError::Setup(format!("failed to create a scratch database in '{}': {err}", spill_dir.display()))
-    })?;
-    Ok(connection)
+        })
 }
 
 // Unlimited, DuckDB fills 80% of the machine's memory before it spills; half leaves room for the conversion's own
@@ -174,8 +165,24 @@ fn limit_memory(connection: &Connection, memory_limit: Option<&str>) -> Result<S
     connection
         .execute_batch(&format!("SET memory_limit = '{}'", limit.replace('\'', "''")))
         .map_err(|err| PrepareError::Setup(format!("invalid memory limit '{limit}': {err}")))?;
-    current().map_err(|err| PrepareError::Setup(format!("failed to read DuckDB's memory limit: {err}")))
+    let limit = current().map_err(|err| PrepareError::Setup(format!("failed to read DuckDB's memory limit: {err}")))?;
+    // A hash aggregate or join fails instead of spilling once its share of the limit drops below a few tens of
+    // MB per thread, so a small limit runs fewer threads.
+    if let Some(bytes) = size_in_bytes(&limit) {
+        let threads: i64 = connection
+            .query_row("SELECT current_setting('threads')", [], |row| row.get(0))
+            .map_err(|err| PrepareError::Setup(format!("failed to read DuckDB's threads: {err}")))?;
+        let affordable = i64::try_from(bytes / MEMORY_PER_THREAD).unwrap_or(i64::MAX).max(1);
+        if affordable < threads {
+            connection
+                .execute_batch(&format!("SET threads = {affordable}"))
+                .map_err(|err| PrepareError::Setup(format!("failed to set DuckDB's threads: {err}")))?;
+        }
+    }
+    Ok(limit)
 }
+
+const MEMORY_PER_THREAD: u64 = 64 << 20;
 
 // DuckDB prints sizes as `19.3 GiB` or `512.0 MiB`.
 fn size_in_bytes(size: &str) -> Option<u64> {
@@ -215,5 +222,14 @@ mod test {
         assert!(halved.abs_diff(expected) < 64 << 20, "{halved} vs {expected}");
         assert_eq!(limit_memory(&connection, Some("256MiB")).unwrap(), "256.0 MiB");
         assert!(matches!(limit_memory(&connection, Some("lots")), Err(PrepareError::Setup(_))));
+    }
+
+    #[test]
+    fn a_small_memory_limit_runs_fewer_threads() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection.execute_batch("SET threads = 8").unwrap();
+        limit_memory(&connection, Some("128MiB")).unwrap();
+        let threads: i64 = connection.query_row("SELECT current_setting('threads')", [], |row| row.get(0)).unwrap();
+        assert_eq!(threads, 2);
     }
 }

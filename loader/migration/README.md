@@ -76,8 +76,8 @@ types take no table.
 
 ## Modelling
 
-Every mapped table identifies its rows by a column `_iid UBIGINT`, unique and not null
-(see [Ids](#ids)), and role columns reference it. The examples below declare these as
+Every mapped table identifies its rows by a column `_iid UBIGINT`, unique within its type,
+not null and below 2^63 (see [Ids](#ids)), and role columns reference it. The examples below declare these as
 keys (`PRIMARY KEY`, `REFERENCES`), which DuckDB enforces; the keys are optional, see
 [Keys are optional](#keys-are-optional). They also leave the attribute declarations out:
 every column name is an attribute of the matching name, e.g. `attribute name value string;`.
@@ -187,7 +187,7 @@ entity employee sub person, owns salary;
 ```
 
 **Several tables may map to one type**, for instance when staged from several sources.
-Their `_iid` values may overlap: an `_iid` identifies a row within its table, and a
+Their `_iid` values must differ, as an `_iid` is the instance's id within its type; a
 reference names the table.
 
 ```sql
@@ -291,13 +291,14 @@ tables with declared keys; for data of that size, staging without keys is the sa
 ## Memory
 
 The loader limits DuckDB to half of the memory it detects by default (the machine's, or a
-container's limit), and DuckDB spills sorts and joins to disk beyond it, next to the output
+container's limit), and DuckDB spills what does not fit to disk, next to the output
 (for `--dry-run`, in the system's temporary directory). `--memory-limit` sets another limit
-in DuckDB's syntax (`8GB`, `512MiB`); the conversion needs about one to three GB more for its
-own buffers. Lower limits trade time for memory: a hundred million rows converted in 22 s
-unlimited and in 30 s under 512 MB, a billion rows in 14 minutes under 2 GB. On disk, the
-data file and DuckDB's spills together peak at about twice the data file's size (a billion
-rows: a 34 GB file, 72 GB at the peak).
+in DuckDB's syntax (`8GB`, `512MiB`); the conversion needs about one to two GB more for its
+own buffers, and a small limit runs DuckDB on fewer threads, one per 64 MB. Lower limits
+trade time for memory: a hundred million rows of 30 attributes each converted in 4m53s
+with the default limit and in 5m37s under 2 GB, a billion rows of three tables in 5m45s
+and in 6m30s under 4 GB. DuckDB's spills stay small beside the data file, whose size is
+about what the conversion needs on disk.
 
 ## What is checked, and what is the server's
 
@@ -321,20 +322,29 @@ player. A relation table without a role column fails validation.
 
 ## Ids
 
-`_iid` identifies a row within its table only, so sparse ids and source keys are fine.
-The loader numbers the instances of each type 0, 1, 2, ... in file order, table after
-table and by `_iid` within a table. Entities, relations and role players are named by
-their type and that number, attributes by their type and value. The file also carries
-each item's id as a string (`person:0`, `name:Alice`) for an importer that resolves ids by
-lookup; both name the same item.
+`_iid` is the instance's id in TypeDB: the server creates each instance with its `_iid` as
+its number within its type, and names role players by type and number. Sparse ids and
+source keys are therefore fine, as long as they are unique within the type (tables mapped
+to one type must not share values) and below 2^63, which leaves TypeDB room to number the
+instances created later. Larger values, such as 64-bit hashes, are refused before the
+conversion: number such rows, and the columns referencing them, with smaller ids, e.g.
+`row_number() OVER ()`.
+
+Entities, relations and role players are named by their type and `_iid`, attributes by
+their type and value. No table is sorted: DuckDB reads every table in parallel. Only each
+attribute's values are written in order, which the server imports faster. The file also
+carries each item's id as a string (`person:1000`, `name:Alice`) for an importer that
+resolves ids by lookup; both name the same item.
 
 ## Output format
 
 The data file is the `typedb export` format: length-delimited protobuf `Migration.Item`
 messages, in the order `database import` expects: a header stating the file's guarantees
 (the item order, unique attributes, players and owned attributes named as above), every
-attribute, every entity, every relation, then checksums. The schema is not copied: import
-the data file with the schema file it was prepared against.
+attribute, every entity, every relation, then checksums. Within each kind, items come in
+no particular order, except attribute values, which are sorted because the server imports
+them faster. The schema is not copied: import the data file with the schema file it was
+prepared against.
 
 The file is compressed with zstd: a sequence of zstd frames, each with a checksum of its
 content, which `zstd -d` and `database import` read as one stream. Importing it needs a

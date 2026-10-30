@@ -135,6 +135,25 @@ fn decode_items(data: &[u8]) -> Result<Vec<item::Item>, Box<dyn Error>> {
     Ok(items)
 }
 
+// Items in a canonical order: only the order of the kinds is part of the format.
+fn canonical(items: &[item::Item]) -> Vec<(usize, Vec<u8>)> {
+    let mut encoded: Vec<(usize, Vec<u8>)> = items
+        .iter()
+        .map(|item| {
+            let kind = match item {
+                item::Item::Header(_) => 0,
+                item::Item::Attribute(_) => 1,
+                item::Item::Entity(_) => 2,
+                item::Item::Relation(_) => 3,
+                item::Item::Checksums(_) => 4,
+            };
+            (kind, Item { item: Some(item.clone()) }.encode_to_vec())
+        })
+        .collect();
+    encoded.sort();
+    encoded
+}
+
 fn assert_error(errors: &[String], fragments: &[&str]) {
     assert!(
         errors.iter().any(|error| fragments.iter().all(|fragment| error.contains(fragment))),
@@ -152,7 +171,7 @@ fn assert_file_guarantees(items: &[item::Item]) {
 
     let mut attributes: HashMap<&str, &item::Attribute> = HashMap::new();
     let mut objects: HashMap<&str, (&str, u64)> = HashMap::new();
-    let mut next_ids: HashMap<&str, u64> = HashMap::new();
+    let mut scoped_ids = HashSet::new();
     let mut last_kind = 0;
     for item in items {
         let kind = match item {
@@ -174,9 +193,7 @@ fn assert_file_guarantees(items: &[item::Item]) {
             _ => continue,
         };
         let object = (object.0, object.1.expect("every object carries its label-scoped id"));
-        let next_id = next_ids.entry(object.0).or_default();
-        assert_eq!(object.1, *next_id, "{id} is out of sequence");
-        *next_id += 1;
+        assert!(scoped_ids.insert(object), "{id} repeats the label-scoped id of another {}", object.0);
         assert!(objects.insert(id, object).is_none(), "object {id} twice");
     }
     // Values compare by their encoding, which tells -0.0 from 0.0.
@@ -259,10 +276,12 @@ fn converts_and_produces_a_well_formed_import_file() -> Result<(), Box<dyn Error
     role_labels.dedup();
     assert_eq!(role_labels, ["employment:employee", "employment:employer", "mentorship:mentor", "mentorship:student"]);
 
-    let ids: Vec<(&str, Option<u64>)> = entities.iter().map(|e| (e.id.as_str(), e.label_scoped_id)).collect();
-    assert_eq!(ids, [("company:0", Some(0)), ("person:0", Some(0)), ("person:1", Some(1))]);
-    let ids: Vec<(&str, Option<u64>)> = relations.iter().map(|r| (r.id.as_str(), r.label_scoped_id)).collect();
-    assert_eq!(ids, [("employment:0", Some(0)), ("employment:1", Some(1)), ("mentorship:0", Some(0))]);
+    let mut ids: Vec<(&str, Option<u64>)> = entities.iter().map(|e| (e.id.as_str(), e.label_scoped_id)).collect();
+    ids.sort();
+    assert_eq!(ids, [("company:10", Some(10)), ("person:1", Some(1)), ("person:2", Some(2))]);
+    let mut ids: Vec<(&str, Option<u64>)> = relations.iter().map(|r| (r.id.as_str(), r.label_scoped_id)).collect();
+    ids.sort();
+    assert_eq!(ids, [("employment:100", Some(100)), ("employment:101", Some(101)), ("mentorship:200", Some(200))]);
     let mut ids: Vec<&str> = attributes.iter().map(|a| a.id.as_str()).collect();
     ids.sort();
     assert_eq!(
@@ -270,7 +289,7 @@ fn converts_and_produces_a_well_formed_import_file() -> Result<(), Box<dyn Error
         ["age:30", "name:Acme", "name:Alice", "name:Bob", "salary:50000.2500000000000000000", "tag:a", "tag:b"]
     );
 
-    assert_eq!(first, run(&dir)?, "migration output is not deterministic");
+    assert_eq!(canonical(&items), canonical(&convert(&dir)?), "migration output differs between runs");
 
     Ok(())
 }
@@ -497,7 +516,7 @@ fn relations_may_play_in_relations_streamed_before_them() -> Result<(), Box<dyn 
             _ => None,
         })
         .collect();
-    assert_eq!(relations, ["ref:0 <- base:0", "base:0 <- node:0"]);
+    assert_eq!(relations, ["ref:7 <- base:5", "base:5 <- node:1"]);
     Ok(())
 }
 
@@ -534,6 +553,7 @@ fn nanosecond_timestamps_and_date_lists_convert_exactly() -> Result<(), Box<dyn 
             }
         }
     }
+    datetimes.sort();
     assert_eq!(datetimes, [(-1, 999_999_999), (1_577_836_800, 1), (1_577_836_800, 2)]);
     assert_eq!(dates, 2);
     Ok(())
@@ -707,7 +727,7 @@ fn exact_names_win_over_dashed_readings() -> Result<(), Box<dyn Error>> {
 }
 
 #[test]
-fn instances_are_numbered_per_type_whatever_their_iid() -> Result<(), Box<dyn Error>> {
+fn instances_are_numbered_by_their_iid() -> Result<(), Box<dyn Error>> {
     let dir = scratch(
         "numbering",
         "define\n  attribute name value string;\n  entity person, owns name, plays knows:friend;\n  \
@@ -724,9 +744,9 @@ fn instances_are_numbered_per_type_whatever_their_iid() -> Result<(), Box<dyn Er
                               c UBIGINT REFERENCES knows(_iid));
          COMMENT ON TABLE aknows IS '@typedb relation knows (friend = a)';
          INSERT INTO person VALUES (1000, 'Ann'), (5, 'Bob');
-         INSERT INTO contractor VALUES (18446744073709551615, 'Dee'), (5, 'Cid');
-         INSERT INTO knows VALUES (7, 'k7', 1000, 18446744073709551615, NULL);
-         INSERT INTO knows VALUES (3, 'k3', 5, 5, 7);
+         INSERT INTO contractor VALUES (20, 'Dee'), (7, 'Cid');
+         INSERT INTO knows VALUES (7, 'k7', 1000, 20, NULL);
+         INSERT INTO knows VALUES (3, 'k3', 5, 7, 7);
          INSERT INTO knows VALUES (9, 'k9', NULL, NULL, 3);
          INSERT INTO aknows VALUES (1, 'ak', 1000, 7);",
     )?;
@@ -742,9 +762,9 @@ fn instances_are_numbered_per_type_whatever_their_iid() -> Result<(), Box<dyn Er
         };
         names.insert(id.clone(), owned[0].id.trim_start_matches("name:").to_owned());
     }
-    // Tables in name order, entity tables first (alumni is empty), rows by _iid.
-    let expected = [("person:0", "Cid"), ("person:1", "Dee"), ("person:2", "Bob"), ("person:3", "Ann")];
-    let relations = [("knows:0", "ak"), ("knows:1", "k3"), ("knows:2", "k7"), ("knows:3", "k9")];
+    // An instance's number is its _iid, whichever of its type's tables it comes from.
+    let expected = [("person:7", "Cid"), ("person:20", "Dee"), ("person:5", "Bob"), ("person:1000", "Ann")];
+    let relations = [("knows:1", "ak"), ("knows:3", "k3"), ("knows:7", "k7"), ("knows:9", "k9")];
     for (id, name) in expected.into_iter().chain(relations) {
         assert_eq!(names[id], name, "{id}");
     }
@@ -756,12 +776,55 @@ fn instances_are_numbered_per_type_whatever_their_iid() -> Result<(), Box<dyn Er
             friends.push(format!("{}: {}", names[&relation.id], players.collect::<Vec<_>>().join(" ")));
         }
     }
+    friends.sort();
     assert_eq!(friends, ["ak: Ann k7", "k3: Bob Cid k7", "k7: Ann Dee", "k9: k3"]);
     Ok(())
 }
 
 #[test]
-fn scans_longer_than_a_page_keep_their_order() -> Result<(), Box<dyn Error>> {
+fn iids_must_fit_typedb_and_differ_within_a_type() -> Result<(), Box<dyn Error>> {
+    let schema = "define\n  entity person;\n";
+    let dir = scratch(
+        "wide-ids",
+        schema,
+        "CREATE TABLE person (_iid UBIGINT);
+         INSERT INTO person VALUES (0), (9223372036854775808), (18446744073709551615);",
+    )?;
+    assert_error(
+        &validation_errors(&dir),
+        &[
+            "table 'person': 2 row(s) have an _iid of 2^63 or more",
+            "e.g. _iid 9223372036854775808, 18446744073709551615",
+        ],
+    );
+    let dir = scratch(
+        "shared-ids",
+        schema,
+        "CREATE TABLE person (_iid UBIGINT); INSERT INTO person VALUES (1), (2), (3);
+         CREATE TABLE staff (_iid UBIGINT); INSERT INTO staff VALUES (3), (4), (1);
+         COMMENT ON TABLE staff IS '@typedb entity person';",
+    )?;
+    assert_error(
+        &validation_errors(&dir),
+        &["tables 'person', 'staff' mapped to 'person': 2 _iid value(s) appear in more than one of them", "1, 3"],
+    );
+    let at_the_limit = scratch(
+        "ids-at-the-limit",
+        schema,
+        "CREATE TABLE person (_iid UBIGINT); INSERT INTO person VALUES (5), (9223372036854775807);",
+    )?;
+    let items = convert(&at_the_limit)?;
+    let mut ids: Vec<u64> = items
+        .iter()
+        .filter_map(|item| if let item::Item::Entity(entity) = item { entity.label_scoped_id } else { None })
+        .collect();
+    ids.sort();
+    assert_eq!(ids, [5, (1 << 63) - 1]);
+    Ok(())
+}
+
+#[test]
+fn large_tables_are_numbered_by_their_iid() -> Result<(), Box<dyn Error>> {
     let dir = scratch(
         "pages",
         "define\n  attribute age value integer;\n  entity person, owns age, plays knows:friend;\n  \
@@ -773,7 +836,7 @@ fn scans_longer_than_a_page_keep_their_order() -> Result<(), Box<dyn Error>> {
     )?;
     let items = convert(&dir)?;
     assert_file_guarantees(&items);
-    // The person numbered n has the n-th smallest _iid, which is also its age.
+    // A person's id is its _iid, which is also its age.
     let age_of_person: HashMap<u64, &str> = items
         .iter()
         .filter_map(|item| match item {
@@ -782,12 +845,13 @@ fn scans_longer_than_a_page_keep_their_order() -> Result<(), Box<dyn Error>> {
         })
         .collect();
     assert_eq!(age_of_person.len(), 250_000);
-    assert_eq!(age_of_person[&0], "age:250003");
-    assert_eq!(age_of_person[&249_999], "age:1000000");
+    assert_eq!(age_of_person[&250_003], "age:250003");
+    assert_eq!(age_of_person[&1_000_000], "age:1000000");
     for item in &items {
         if let item::Item::Relation(relation) = item {
             let friend_iid = 1_000_000 - 3 * relation.label_scoped_id.unwrap();
             let player = &relation.roles[0].players[0];
+            assert_eq!(player.player_by_label_scoped_id.as_ref().unwrap().label_scoped_id, friend_iid);
             assert_eq!(
                 age_of_person[&player.player_by_label_scoped_id.as_ref().unwrap().label_scoped_id],
                 format!("age:{friend_iid}")
@@ -878,6 +942,61 @@ fn values_sql_merges_but_typedb_distinguishes_stay_consistent() -> Result<(), Bo
 }
 
 #[test]
+fn equal_values_from_columns_of_different_types_are_one_attribute() -> Result<(), Box<dyn Error>> {
+    // The server trusts `attributes_unique` and links owners to attributes by value, so a value that the
+    // deduplication and the owners' conversion saw differently would be lost without an error.
+    let dir = scratch(
+        "mixed-columns",
+        "define\n  attribute at value datetime;\n  attribute amount value decimal;\n  attribute n value integer;\n  \
+         entity thing, owns at @card(0..), owns amount @card(0..), owns n @card(0..);\n",
+        "CREATE TABLE thing (_iid UBIGINT, s TIMESTAMP_S, ms TIMESTAMP_MS, us TIMESTAMP, ns TIMESTAMP_NS,
+                             d2 DECIMAL(5,2), d10 DECIMAL(20,10), d19 DECIMAL(38,19),
+                             i1 TINYINT, i8 BIGINT, i16 HUGEINT);
+         COMMENT ON COLUMN thing.s IS '@typedb owns at'; COMMENT ON COLUMN thing.ms IS '@typedb owns at';
+         COMMENT ON COLUMN thing.us IS '@typedb owns at'; COMMENT ON COLUMN thing.ns IS '@typedb owns at';
+         COMMENT ON COLUMN thing.d2 IS '@typedb owns amount'; COMMENT ON COLUMN thing.d10 IS '@typedb owns amount';
+         COMMENT ON COLUMN thing.d19 IS '@typedb owns amount'; COMMENT ON COLUMN thing.i1 IS '@typedb owns n';
+         COMMENT ON COLUMN thing.i8 IS '@typedb owns n'; COMMENT ON COLUMN thing.i16 IS '@typedb owns n';
+         INSERT INTO thing VALUES (1, '2020-01-01 10:00:00', '2020-01-01 10:00:00', '2020-01-01 10:00:00',
+                                   '2020-01-01 10:00:00', 1.50, 1.5, 1.5000, 5, 5, 5),
+                                  (2, NULL, '2020-01-01 10:00:00.001', NULL, '2020-01-01 10:00:00.001', 2.25, NULL,
+                                   2.2500000000000000001, NULL, 6, 6);",
+    )?;
+    let items = convert(&dir)?;
+    assert_file_guarantees(&items);
+    let mut labels: Vec<&str> = items
+        .iter()
+        .filter_map(|item| match item {
+            item::Item::Attribute(attribute) => Some(attribute.label.as_str()),
+            _ => None,
+        })
+        .collect();
+    labels.sort();
+    assert_eq!(labels, ["amount", "amount", "amount", "at", "at", "n", "n"]);
+    Ok(())
+}
+
+#[test]
+fn intervals_of_millions_of_years_are_durations() -> Result<(), Box<dyn Error>> {
+    let dir = scratch(
+        "long-intervals",
+        "define\n  attribute span value duration;\n  entity thing, owns span;\n",
+        "CREATE TABLE thing (_iid UBIGINT, span INTERVAL);
+         INSERT INTO thing VALUES (1, INTERVAL '4000000 years 5 days 25:00:00.5');",
+    )?;
+    let durations: Vec<_> = convert(&dir)?
+        .into_iter()
+        .filter_map(|item| match item {
+            item::Item::Attribute(attribute) => attribute.value.and_then(|value| value.value),
+            _ => None,
+        })
+        .collect();
+    let [migration_value::Value::Duration(duration)] = durations.as_slice() else { panic!("{durations:?}") };
+    assert_eq!((duration.months, duration.days, duration.nanos), (48_000_000, 5, 90_000_500_000_000));
+    Ok(())
+}
+
+#[test]
 fn repeated_values_and_players_are_written_once() -> Result<(), Box<dyn Error>> {
     let dir = scratch(
         "repeats",
@@ -950,7 +1069,7 @@ fn directive_bindings_settle_inference_of_the_other_columns() -> Result<(), Box<
     let mut players: Vec<String> =
         relation.roles.iter().map(|role| format!("{}={}", role.label, role.players[0].id)).collect();
     players.sort();
-    assert_eq!(players, ["mentorship:mentor=person:1", "mentorship:student=person:0"]);
+    assert_eq!(players, ["mentorship:mentor=person:2", "mentorship:student=person:1"]);
     Ok(())
 }
 
@@ -1048,7 +1167,7 @@ fn directives_take_any_whitespace_and_keyword_case() -> Result<(), Box<dyn Error
     )?;
     let items = convert(&dir)?;
     assert_file_guarantees(&items);
-    assert!(items.iter().any(|item| matches!(item, item::Item::Entity(entity) if entity.id == "person:0")));
+    assert!(items.iter().any(|item| matches!(item, item::Item::Entity(entity) if entity.id == "person:1")));
     Ok(())
 }
 
@@ -1192,7 +1311,7 @@ const KEY_FREE_FIXTURE: &str = r#"
 fn tables_without_declared_keys_convert_as_the_keyed_ones() -> Result<(), Box<dyn Error>> {
     let keyed = convert(&scratch("keyed", SCHEMA, FIXTURE)?)?;
     let dir = scratch("key-free", SCHEMA, KEY_FREE_FIXTURE)?;
-    assert_eq!(convert(&dir)?, keyed);
+    assert_eq!(canonical(&convert(&dir)?), canonical(&keyed));
     let summary = prepare(&dir).map_err(|err| format!("{err:?}"))?.mapping_summary();
     assert!(
         summary.iter().any(|line| line.contains("table 'employment'")
@@ -1211,7 +1330,7 @@ fn tables_without_declared_keys_convert_as_the_keyed_ones() -> Result<(), Box<dy
 }
 
 #[test]
-fn sparse_ids_without_declared_keys_are_numbered_by_rank() -> Result<(), Box<dyn Error>> {
+fn sparse_ids_without_declared_keys_convert_as_the_keyed_ones() -> Result<(), Box<dyn Error>> {
     let schema = "define\n  attribute name value string;\n  entity person, owns name, plays knows:a, plays knows:b;\n  \
                   relation knows, relates a, relates b;\n";
     let rows = "INSERT INTO person SELECT 7 * i + 3, 'p' || i FROM range(5000) t(i);
@@ -1239,8 +1358,33 @@ fn sparse_ids_without_declared_keys_are_numbered_by_rank() -> Result<(), Box<dyn
         ),
     )?;
     let items = convert(&key_free)?;
-    assert_eq!(items, convert(&keyed)?);
-    assert_eq!(items.iter().filter(|item| matches!(item, item::Item::Relation(_))).count(), 9000);
+    assert_file_guarantees(&items);
+    assert_eq!(canonical(&items), canonical(&convert(&keyed)?));
+    // Ids are the _iid values, gaps included: person p<i> has _iid 7i + 3, relation <i> 11i.
+    let mut relations = 0;
+    for item in &items {
+        match item {
+            item::Item::Entity(entity) => {
+                let i: u64 = entity.attributes[0].id.trim_start_matches("name:p").parse()?;
+                assert_eq!(entity.label_scoped_id, Some(7 * i + 3));
+            }
+            item::Item::Relation(relation) => {
+                relations += 1;
+                let i = relation.label_scoped_id.expect("label-scoped id") / 11;
+                let ids: Vec<u64> = relation
+                    .roles
+                    .iter()
+                    .map(|role| role.players[0].player_by_label_scoped_id.as_ref().unwrap().label_scoped_id)
+                    .collect();
+                assert!(
+                    ids.contains(&(7 * ((i * 37) % 5000) + 3)) && ids.contains(&(7 * ((i * 91) % 5000) + 3)),
+                    "{ids:?}"
+                );
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(relations, 9000);
     Ok(())
 }
 

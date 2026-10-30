@@ -5,7 +5,8 @@
  */
 
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::HashSet,
+    fmt::Write as _,
     io::{BufWriter, Write},
     sync::{Arc, Mutex, mpsc},
     thread,
@@ -22,15 +23,14 @@ use typedb_protocol::migration::{
 };
 
 use crate::{
-    SCRATCH,
     mapping::{IID_COLUMN, MappingPlan, OwnsMapping, TableKind, quoted},
     schema::ValueType,
     value::{Cells, TypeDBValue, Typed},
 };
 
-// Each scan is a pipeline: this thread streams the sorted rows out of DuckDB in record batches and groups them
-// into units; every core turns units into encoded items; one thread writes the units back in order. A unit is
-// cut by rows or by bytes, whichever comes first, so that wide rows do not inflate what is in flight.
+// Each scan is a pipeline: this thread streams the rows out of DuckDB in record batches and groups them into
+// units; every core turns units into encoded items; one thread writes the units as they are done. A unit is cut
+// by rows or by bytes, whichever comes first, so that wide rows do not inflate what is in flight.
 const UNIT_ROWS: usize = 32_768;
 const UNIT_BYTES: usize = 32 << 20;
 const OUTPUT_BUFFER: usize = 8 << 20;
@@ -71,9 +71,8 @@ pub(crate) fn emit(
     )?;
 
     emit_attributes(conn, plan, &mut output, &mut checksums)?;
-    let numbering = number_instances(conn, plan)?;
     for index in 0..plan.tables.len() {
-        emit_objects(conn, plan, index, &numbering, &mut output, &mut checksums)?;
+        emit_objects(conn, plan, index, &mut output, &mut checksums)?;
     }
 
     write_item(&mut output, item::Item::Checksums(checksums))?;
@@ -86,72 +85,17 @@ fn write_item(output: &mut impl Write, item: item::Item) -> Result<(), String> {
     output.write_all(&bytes).map_err(|err| format!("failed to write the output file: {err}"))
 }
 
-struct TableNumbering {
-    first_id: u64,
-    count: u64,
-    iids: Option<Iids>,
-}
-
-enum Iids {
-    Consecutive { first: u64 },
-    Ranked(String),
-}
-
-impl TableNumbering {
-    fn id_of(&self, iid: u64, rank: Option<i64>) -> Option<u64> {
-        let rank = match self.iids.as_ref().expect("iids are collected for the tables that play roles") {
-            Iids::Consecutive { first } => iid.checked_sub(*first).filter(|rank| *rank < self.count),
-            Iids::Ranked(_) => rank.map(|rank| rank as u64),
-        };
-        rank.map(|rank| self.first_id + rank)
-    }
-}
-
-// Indexed like `MappingPlan::tables`.
-fn number_instances(conn: &Connection, plan: &MappingPlan) -> Result<Vec<TableNumbering>, String> {
-    let iid = quoted(IID_COLUMN);
-    let player_tables: HashSet<usize> =
-        plan.tables.iter().flat_map(|table| table.roles().iter().map(|role| role.player)).collect();
-    let mut next_ids: HashMap<&str, u64> = HashMap::new();
-    let mut numbering = Vec::with_capacity(plan.tables.len());
-    for (index, table) in plan.tables.iter().enumerate() {
-        let read_error =
-            |err: duckdb::Error| format!("failed to read the {IID_COLUMN} values of '{}': {err}", table.name);
-        let sql = format!("SELECT count(*)::UBIGINT, min({iid}), max({iid}) FROM {}", quoted(&table.name));
-        let (count, min, max): (u64, Option<u64>, Option<u64>) =
-            conn.query_row(&sql, [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?))).map_err(read_error)?;
-        let iids = match (min, max) {
-            _ if !player_tables.contains(&index) => None,
-            // `_iid` is unique, so a span as wide as the count has no gaps.
-            (Some(min), Some(max)) if u128::from(max - min) + 1 == u128::from(count) => {
-                Some(Iids::Consecutive { first: min })
-            }
-            _ => {
-                // The sorted table's rowid is the rank; a `row_number()` window would not spill past the memory limit.
-                let ranks = format!("{SCRATCH}.rank_{index}");
-                let sql = format!(
-                    "CREATE OR REPLACE TABLE {ranks} AS SELECT {iid} FROM {} ORDER BY {iid}",
-                    quoted(&table.name)
-                );
-                // The table's rowid follows the insertion order, which this one statement must keep.
-                let sql = format!("SET preserve_insertion_order = true; {sql}; SET preserve_insertion_order = false");
-                conn.execute_batch(&sql).map_err(read_error)?;
-                Some(Iids::Ranked(ranks))
-            }
-        };
-        let next_id = next_ids.entry(&table.type_label).or_default();
-        numbering.push(TableNumbering { first_id: *next_id, count, iids });
-        *next_id += count;
-    }
-    Ok(numbering)
-}
-
+// Sized up front: `format!` starts empty and grows the string, which costs more than writing the id.
 fn object_id(label: &str, label_scoped_id: u64) -> String {
-    format!("{label}:{label_scoped_id}")
+    let mut id = String::with_capacity(label.len() + 21);
+    let _ = write!(id, "{label}:{label_scoped_id}");
+    id
 }
 
 fn attribute_id(label: &str, value: &TypeDBValue) -> String {
-    format!("{label}:{value}")
+    let mut id = String::with_capacity(label.len() + 32);
+    let _ = write!(id, "{label}:{value}");
+    id
 }
 
 fn emit_attributes(
@@ -187,9 +131,16 @@ fn emit_attributes(
     }
 
     for source in sources {
-        let sql = format!("{} ORDER BY 1", source.selects.join(" UNION "));
+        // One aggregate over all the columns: a UNION of DISTINCTs plans one per column and one more, which fail to
+        // spill under limits that a single one streams through. Values in order make the server's import of them
+        // faster (6% on 10M rows of 30 attributes); a streamed result keeps its order only while insertion order
+        // is preserved, which this one statement can afford.
+        let sql = match source.selects.as_slice() {
+            [select] => format!("{select} ORDER BY 1"),
+            selects => format!("SELECT DISTINCT v FROM ({}) ORDER BY 1", selects.join(" UNION ALL ")),
+        };
         let with_context = |err: String| format!("attribute '{}' (from {:?}): {err}", source.label, source.columns);
-        let encode = |batches: &[RecordBatch], _: u64| {
+        let encode = |batches: &[RecordBatch]| {
             let mut unit = Unit::default();
             for batch in batches {
                 let cells = Cells::of(batch.column(0).as_ref()).map_err(with_context)?;
@@ -207,7 +158,10 @@ fn emit_attributes(
             }
             Ok(unit)
         };
-        scan(conn, &sql, output, checksums, &encode).map_err(with_context)?;
+        conn.execute_batch("SET preserve_insertion_order = true").map_err(|err| with_context(err.to_string()))?;
+        let scanned = scan(conn, &sql, output, checksums, &encode).map_err(with_context);
+        conn.execute_batch("SET preserve_insertion_order = false").map_err(|err| with_context(err.to_string()))?;
+        scanned?;
     }
     Ok(())
 }
@@ -225,76 +179,42 @@ fn emit_objects(
     conn: &Connection,
     plan: &MappingPlan,
     table_index: usize,
-    numbering: &[TableNumbering],
     output: &mut (impl Write + Send),
     checksums: &mut Checksums,
 ) -> Result<(), String> {
     let table = &plan.tables[table_index];
-    // Loader-owned aliases keep a column named `rowid` from shadowing the scan's rowid.
     let mut selects = vec![format!("t.{} AS c0", quoted(IID_COLUMN))];
     for owns in &table.owns {
         selects.push(format!("{} AS c{}", owns.projection("t"), selects.len()));
     }
-    let mut role_columns: Vec<(usize, Option<usize>)> = Vec::new();
-    let mut rank_joins: Vec<(usize, &str)> = Vec::new();
+    let mut role_columns = Vec::new();
     for role in table.roles() {
-        let column = selects.len();
-        selects.push(format!("t.{} AS c{column}", quoted(&role.column)));
-        role_columns.push((column, None));
-        if let Some(Iids::Ranked(ranks)) = &numbering[role.player].iids {
-            rank_joins.push((role_columns.len() - 1, ranks));
-        }
+        role_columns.push(selects.len());
+        selects.push(format!("t.{} AS c{}", quoted(&role.column), selects.len()));
     }
-    // Each rank is joined in a statement of its own: DuckDB spills one hash join under its memory limit, but two
-    // in one statement can fail to spill.
-    let base = format!("SELECT {} FROM {} t", selects.join(", "), quoted(&table.name));
-    let scan_error = |err: duckdb::Error| format!("scan of '{}' failed: {err}", table.name);
-    let mut source = format!("({base})");
-    let mut joined_table: Option<String> = None;
-    let mut width = selects.len();
-    for (step, (role_index, ranks)) in rank_joins.into_iter().enumerate() {
-        let (column, _) = role_columns[role_index];
-        let joined = format!("{SCRATCH}.joined_{table_index}_{step}");
-        conn.execute_batch(&format!(
-            "CREATE OR REPLACE TABLE {joined} AS SELECT p.*, r.rowid AS c{width} FROM {source} p \
-             LEFT JOIN {ranks} r ON p.c{column} = r.{}",
-            quoted(IID_COLUMN)
-        ))
-        .map_err(scan_error)?;
-        role_columns[role_index].1 = Some(width);
-        width += 1;
-        source = joined.clone();
-        if let Some(previous) = joined_table.replace(joined) {
-            conn.execute_batch(&format!("DROP TABLE {previous}")).map_err(scan_error)?;
-        }
-    }
-    let sql = format!("SELECT * FROM {source} ORDER BY 1");
+    let sql = format!("SELECT {} FROM {} t", selects.join(", "), quoted(&table.name));
 
+    // An instance's label-scoped id is its `_iid`: the checks have made it unique within its type and below 2^63.
     struct Player<'a> {
-        numbering: &'a TableNumbering,
-        table: &'a str,
         label: &'a str,
         scoped_role: String,
     }
     let players: Vec<Player<'_>> = table
         .roles()
         .iter()
-        .map(|role| Player {
-            numbering: &numbering[role.player],
-            table: &plan.tables[role.player].name,
-            label: &plan.tables[role.player].type_label,
-            scoped_role: role.relates.scoped_label(),
-        })
+        .map(|role| Player { label: &plan.tables[role.player].type_label, scoped_role: role.relates.scoped_label() })
         .collect();
     let ownerships_may_repeat =
         table.owns.iter().enumerate().any(|(index, owns)| {
             owns.multi || table.owns[..index].iter().any(|other| other.attribute == owns.attribute)
         });
-    let TableNumbering { first_id, count, .. } = numbering[table_index];
+    let count_sql = format!("SELECT count(*)::UBIGINT FROM {}", quoted(&table.name));
+    let count: u64 = conn
+        .query_row(&count_sql, [], |row| row.get(0))
+        .map_err(|err| format!("failed to count the rows of '{}': {err}", table.name))?;
 
-    let encode = |batches: &[RecordBatch], first_row: u64| {
+    let encode = |batches: &[RecordBatch]| {
         let mut unit = Unit::default();
-        let mut label_scoped_id = first_id + first_row;
         for batch in batches {
             let columns: Vec<Cells<'_>> =
                 batch.columns().iter().map(|column| Cells::of(column.as_ref())).collect::<Result<_, _>>()?;
@@ -303,16 +223,9 @@ fn emit_objects(
             };
             for row in 0..batch.num_rows() {
                 let instance_id = iids.value(row);
-                if unit.last_iid.is_some_and(|previous| instance_id <= previous) {
-                    return Err(format!(
-                        "the scan of '{}' did not keep {IID_COLUMN} order at {instance_id}",
-                        table.name
-                    ));
-                }
-                unit.first_iid.get_or_insert(instance_id);
-                unit.last_iid = Some(instance_id);
                 unit.rows += 1;
                 let with_context = |err: String| format!("table '{}', {IID_COLUMN} = {instance_id}: {err}", table.name);
+                let label_scoped_id = instance_id;
 
                 let mut owned = Vec::new();
                 let mut owned_ids = HashSet::new();
@@ -344,24 +257,24 @@ fn emit_objects(
                 if let TableKind::Relation { roles: bindings } = &table.kind {
                     let mut roles: Vec<item::relation::Role> = Vec::new();
                     for (index, (role, player)) in bindings.iter().zip(&players).enumerate() {
-                        let (column, rank_column) = role_columns[index];
-                        let Typed::UInt64(player_iids) = &columns[column].typed else {
+                        let Typed::UInt64(player_iids) = &columns[role_columns[index]].typed else {
                             return Err(with_context(format!("column '{}' was not read as UBIGINT", role.column)));
                         };
                         if player_iids.is_null(row) {
                             continue;
                         }
-                        let player_iid = player_iids.value(row);
-                        let rank = match rank_column.map(|column| &columns[column].typed) {
-                            Some(Typed::Int64(ranks)) if !ranks.is_null(row) => Some(ranks.value(row)),
-                            _ => None,
+                        let player_id = player_iids.value(row);
+                        let grouped = roles.iter().position(|grouped| grouped.label == player.scoped_role);
+                        let known = |grouped: &item::relation::Role| {
+                            grouped
+                                .players
+                                .iter()
+                                .filter_map(|known| known.player_by_label_scoped_id.as_ref())
+                                .any(|known| known.label_scoped_id == player_id && known.label == player.label)
                         };
-                        let player_id = player.numbering.id_of(player_iid, rank).ok_or_else(|| {
-                            with_context(format!(
-                                "column '{}' holds {IID_COLUMN} {player_iid}, which table '{}' does not have",
-                                role.column, player.table
-                            ))
-                        })?;
+                        if grouped.is_some_and(|index| known(&roles[index])) {
+                            continue;
+                        }
                         let item_player = item::relation::role::Player {
                             id: object_id(player.label, player_id),
                             player_by_label_scoped_id: Some(item::relation::role::player::PlayerByLabelScopedId {
@@ -369,9 +282,8 @@ fn emit_objects(
                                 label_scoped_id: player_id,
                             }),
                         };
-                        match roles.iter_mut().find(|grouped| grouped.label == player.scoped_role) {
-                            Some(grouped) if grouped.players.iter().any(|known| known.id == item_player.id) => continue,
-                            Some(grouped) => grouped.players.push(item_player),
+                        match grouped {
+                            Some(index) => roles[index].players.push(item_player),
                             None => roles.push(item::relation::Role {
                                 label: player.scoped_role.clone(),
                                 players: vec![item_player],
@@ -401,31 +313,24 @@ fn emit_objects(
                     }));
                     unit.checksums.entity_count += 1;
                 }
-                label_scoped_id += 1;
             }
         }
         Ok(unit)
     };
-    let scanned =
-        scan(conn, &sql, output, checksums, &encode).map_err(|err| format!("scan of '{}' failed: {err}", table.name));
-    if let Some(joined) = joined_table {
-        conn.execute_batch(&format!("DROP TABLE {joined}")).map_err(scan_error)?;
-    }
-    let scanned = scanned?;
+    let scanned = scan(conn, &sql, output, checksums, &encode)
+        .map_err(|err| format!("scan of '{}' failed: {err}", table.name))?;
     if scanned != count {
         return Err(format!("the scan of '{}' returned {scanned} of its {count} rows", table.name));
     }
     Ok(())
 }
 
-// The encoded items of one group of batches, with what the writer needs to keep the stream in order.
+// The encoded items of one group of batches.
 #[derive(Default)]
 struct Unit {
     bytes: Vec<u8>,
     checksums: Checksums,
     rows: u64,
-    first_iid: Option<u64>,
-    last_iid: Option<u64>,
 }
 
 impl Unit {
@@ -434,41 +339,32 @@ impl Unit {
     }
 }
 
-// The result is streamed in the order of the query's ORDER BY; a result read whole would stay in memory beyond
-// DuckDB's memory limit. DuckDB keeps that order in a streamed result only while insertion order is preserved
-// (since 2.0 it streams a parallel sort's batches as they finish), so the setting is on for the scan alone: the
-// joins and checks, which it would keep from spilling, run in statements of their own.
+// A result read whole would stay in memory beyond DuckDB's memory limit, so it is streamed.
 fn scan(
     conn: &Connection,
     sql: &str,
     output: &mut (impl Write + Send),
     checksums: &mut Checksums,
-    encode: &(impl Fn(&[RecordBatch], u64) -> Result<Unit, String> + Sync),
+    encode: &(impl Fn(&[RecordBatch]) -> Result<Unit, String> + Sync),
 ) -> Result<u64, String> {
     let scan_error = |err: duckdb::Error| format!("scan failed: {err}");
-    conn.execute_batch("SET preserve_insertion_order = true").map_err(scan_error)?;
-    let scanned = (|| {
-        let mut statement = conn.prepare(sql).map_err(scan_error)?;
-        // The iterator `stream_arrow` returns panics on a fetch error; stepping the statement reports it instead.
-        let _ = statement.stream_arrow([]).map_err(scan_error)?;
-        let batches = std::iter::from_fn(|| {
-            statement.step().map(|array| array.map(|array| RecordBatch::from(&array))).transpose()
-        });
-        pipeline(batches, output, checksums, encode)
-    })();
-    conn.execute_batch("SET preserve_insertion_order = false").map_err(scan_error)?;
-    scanned
+    let mut statement = conn.prepare(sql).map_err(scan_error)?;
+    // Stepping the statement, rather than iterating, reports a fetch error as an error on every duckdb-rs version.
+    let _ = statement.stream_arrow([]).map_err(scan_error)?;
+    let batches =
+        std::iter::from_fn(|| statement.step().map(|array| array.map(|array| RecordBatch::from(&array))).transpose());
+    pipeline(batches, output, checksums, encode)
 }
 
 fn pipeline(
     batches: impl Iterator<Item = Result<RecordBatch, duckdb::Error>>,
     output: &mut (impl Write + Send),
     checksums: &mut Checksums,
-    encode: &(impl Fn(&[RecordBatch], u64) -> Result<Unit, String> + Sync),
+    encode: &(impl Fn(&[RecordBatch]) -> Result<Unit, String> + Sync),
 ) -> Result<u64, String> {
     let workers = thread::available_parallelism().map(|n| n.get()).unwrap_or(2);
-    let (work_sender, work_receiver) = mpsc::sync_channel::<(u64, u64, Vec<RecordBatch>)>(workers);
-    let (unit_sender, unit_receiver) = mpsc::sync_channel::<(u64, Result<Unit, String>)>(workers);
+    let (work_sender, work_receiver) = mpsc::sync_channel::<Vec<RecordBatch>>(workers);
+    let (unit_sender, unit_receiver) = mpsc::sync_channel::<Result<Unit, String>>(workers);
 
     thread::scope(|scope| {
         // Only the workers hold the receiver: once the writer has failed and they have all left, sending fails
@@ -480,12 +376,12 @@ fn pipeline(
             scope.spawn(move || {
                 loop {
                     let received = work_receiver.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).recv();
-                    let Ok((sequence, first_row, batches)) = received else { return };
-                    let unit = encode(&batches, first_row).and_then(|mut unit| {
+                    let Ok(batches) = received else { return };
+                    let unit = encode(&batches).and_then(|mut unit| {
                         unit.bytes = compress(&unit.bytes)?;
                         Ok(unit)
                     });
-                    if unit_sender.send((sequence, unit)).is_err() {
+                    if unit_sender.send(unit).is_err() {
                         return;
                     }
                 }
@@ -495,40 +391,19 @@ fn pipeline(
         drop(unit_sender);
 
         let writer = scope.spawn(move || -> Result<u64, String> {
-            let mut pending = BTreeMap::new();
-            let mut next = 0;
             let mut rows = 0;
-            let mut last_iid = None;
-            for (sequence, unit) in unit_receiver {
-                pending.insert(sequence, unit);
-                // Units are taken in order, so the first error in the data is the one reported.
-                while let Some(unit) = pending.remove(&next) {
-                    let unit = unit?;
-                    if let (Some(last), Some(first)) = (last_iid, unit.first_iid)
-                        && first <= last
-                    {
-                        return Err(format!("the scan did not keep {IID_COLUMN} order at {first}"));
-                    }
-                    last_iid = unit.last_iid.or(last_iid);
-                    output.write_all(&unit.bytes).map_err(|err| format!("failed to write the output file: {err}"))?;
-                    add_checksums(checksums, &unit.checksums);
-                    rows += unit.rows;
-                    next += 1;
-                }
+            for unit in unit_receiver {
+                let unit = unit?;
+                output.write_all(&unit.bytes).map_err(|err| format!("failed to write the output file: {err}"))?;
+                add_checksums(checksums, &unit.checksums);
+                rows += unit.rows;
             }
             Ok(rows)
         });
 
-        let mut sequence = 0;
-        let mut rows = 0;
         let mut group = Vec::new();
         let (mut group_rows, mut group_bytes) = (0, 0);
-        let mut send = |group: Vec<RecordBatch>, group_rows: usize| -> bool {
-            let accepted = !writer.is_finished() && work_sender.send((sequence, rows, group)).is_ok();
-            sequence += 1;
-            rows += group_rows as u64;
-            accepted
-        };
+        let send = |group: Vec<RecordBatch>| !writer.is_finished() && work_sender.send(group).is_ok();
         let mut fetch_error = None;
         for batch in batches {
             let batch = match batch {
@@ -542,14 +417,14 @@ fn pipeline(
             group_bytes += batch.get_array_memory_size();
             group.push(batch);
             if group_rows >= UNIT_ROWS || group_bytes >= UNIT_BYTES {
-                if !send(std::mem::take(&mut group), group_rows) {
+                if !send(std::mem::take(&mut group)) {
                     break;
                 }
                 (group_rows, group_bytes) = (0, 0);
             }
         }
         if !group.is_empty() {
-            send(group, group_rows);
+            send(group);
         }
         drop(work_sender);
         let written = writer.join().unwrap_or_else(|_| Err("the output writer panicked".to_owned()));
