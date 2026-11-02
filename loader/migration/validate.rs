@@ -33,6 +33,21 @@ pub(crate) fn check_data(conn: &Connection, plan: &MappingPlan, diagnostics: &mu
         .filter(|owns| owns.column_type == ColumnType::Timestamp { nanoseconds: true })
         .map(|owns| owns.attribute.as_str())
         .collect();
+    let mut decimals_by_double: Vec<(&str, Vec<DecimalSource<'_>>)> = Vec::new();
+    for table in &plan.tables {
+        for owns in &table.owns {
+            // A double printed exactly at scale 0 is an integer, which no decimal of another scale makes.
+            if let (ValueType::Double, &ColumnType::Decimal { precision, scale: scale @ 1.. }) =
+                (owns.value_type, &owns.column_type)
+            {
+                let source = DecimalSource { table, owns, precision, scale };
+                match decimals_by_double.iter_mut().find(|(attribute, _)| *attribute == owns.attribute) {
+                    Some((_, sources)) => sources.push(source),
+                    None => decimals_by_double.push((&owns.attribute, vec![source])),
+                }
+            }
+        }
+    }
     let mut keyed_rows = Vec::new();
     check_ids_within_types(conn, plan, diagnostics);
     for table in &plan.tables {
@@ -50,6 +65,9 @@ pub(crate) fn check_data(conn: &Connection, plan: &MappingPlan, diagnostics: &mu
             let nanoseconds = nanosecond_attributes.contains(owns.attribute.as_str());
             check_value_domain(conn, table, owns, nanoseconds, diagnostics);
         }
+    }
+    for (attribute, sources) in &decimals_by_double {
+        check_decimals_across_scales(conn, attribute, sources, diagnostics);
     }
     if let Some(warning) = large_keyed_tables_warning(&keyed_rows, LARGE_KEYED_ROWS) {
         diagnostics.warning(warning);
@@ -101,38 +119,34 @@ fn check_instance_ids(conn: &Connection, table: &TableMapping, diagnostics: &mut
         }
         .report(conn, diagnostics);
     }
-    if !table.declared_ids.unique {
-        Check {
-            subject: format!("table '{}'", table.name),
-            unit: "_iid value(s)",
-            predicate: "appear in more than one row; an instance id must be unique within its table",
-            example: "_iid",
-            violations: format!(
-                "SELECT {iid} AS example FROM {name} WHERE {iid} IS NOT NULL GROUP BY {iid} HAVING count(*) > 1"
-            ),
-        }
-        .report(conn, diagnostics);
-    }
 }
 
-// Tables mapped to one type number its instances together, so they share no `_iid`.
+// An `_iid` is unique within its type, also across the tables mapped to the type: one GROUP BY per type, which a
+// single table with a declared unique `_iid` does not need.
 fn check_ids_within_types(conn: &Connection, plan: &MappingPlan, diagnostics: &mut Diagnostics) {
     let iid = quoted(IID_COLUMN);
-    let mut by_type: Vec<(&str, Vec<&str>)> = Vec::new();
+    let mut by_type: Vec<(&str, Vec<&TableMapping>)> = Vec::new();
     for table in &plan.tables {
         match by_type.iter_mut().find(|(label, _)| *label == table.type_label) {
-            Some((_, tables)) => tables.push(&table.name),
-            None => by_type.push((&table.type_label, vec![&table.name])),
+            Some((_, tables)) => tables.push(table),
+            None => by_type.push((&table.type_label, vec![table])),
         }
     }
-    for (label, tables) in by_type.iter().filter(|(_, tables)| tables.len() > 1) {
+    for (label, tables) in by_type {
+        let subject = match tables.as_slice() {
+            [table] if table.declared_ids.unique => continue,
+            [table] => format!("table '{}'", table.name),
+            _ => {
+                let names: Vec<String> = tables.iter().map(|table| format!("'{}'", table.name)).collect();
+                format!("tables {} mapped to '{label}'", names.join(", "))
+            }
+        };
         let selects: Vec<String> =
-            tables.iter().map(|table| format!("SELECT DISTINCT {iid} FROM {}", quoted(table))).collect();
-        let names: Vec<String> = tables.iter().map(|table| format!("'{table}'")).collect();
+            tables.iter().map(|table| format!("SELECT {iid} FROM {}", quoted(&table.name))).collect();
         Check {
-            subject: format!("tables {} mapped to '{label}'", names.join(", ")),
+            subject,
             unit: "_iid value(s)",
-            predicate: "appear in more than one of them; an _iid is the instance's id within its type",
+            predicate: "appear in more than one row; an _iid is the instance's id within its type",
             example: "_iid",
             violations: format!(
                 "SELECT {iid} AS example FROM ({}) WHERE {iid} IS NOT NULL GROUP BY {iid} HAVING count(*) > 1",
@@ -176,35 +190,76 @@ struct Check {
 }
 
 impl Check {
+    // One streaming aggregate: the count and a few smallest examples, NULL ones apart, whatever the violations.
     fn report(&self, conn: &Connection, diagnostics: &mut Diagnostics) {
         let sql = format!(
-            "SELECT n, coalesce(example::VARCHAR, 'NULL') FROM (SELECT count(*) OVER () AS n, example FROM ({}) \
-             ORDER BY example LIMIT {EXAMPLES})",
+            "SELECT count(*)::BIGINT, (count(*) - count(example))::BIGINT, \
+             coalesce(array_to_string(min(example, {EXAMPLES})::VARCHAR[], ', '), '') \
+             FROM ({})",
             self.violations
         );
-        let mut count: i64 = 0;
-        let mut examples = Vec::new();
-        let read = conn.prepare(&sql).and_then(|mut statement| {
-            let mut rows = statement.query([])?;
-            while let Some(row) = rows.next()? {
-                count = row.get(0)?;
-                examples.push(row.get::<_, String>(1)?);
-            }
-            Ok(())
-        });
+        let read = conn.query_row(&sql, [], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get(2)?)));
         match read {
             Err(err) => diagnostics.error(format!("{}: could not be checked: {err}", self.subject)),
-            Ok(()) if count > 0 => diagnostics.error(format!(
-                "{}: {count} {} {}, e.g. {} {}",
-                self.subject,
-                self.unit,
-                self.predicate,
-                self.example,
-                examples.join(", ")
-            )),
-            Ok(()) => {}
+            Ok((count, nulls, examples)) if count > 0 => {
+                let examples: String = examples;
+                let examples = match (examples.is_empty(), nulls > 0) {
+                    (true, _) => "NULL".to_owned(),
+                    (false, true) => format!("NULL, {examples}"),
+                    (false, false) => examples,
+                };
+                diagnostics.error(format!(
+                    "{}: {count} {} {}, e.g. {} {examples}",
+                    self.subject, self.unit, self.predicate, self.example
+                ))
+            }
+            Ok(_) => {}
         }
     }
+}
+
+// Values of different scales can each pass at their own scale and still make one double, as 0.1 and
+// 0.10000000000000001 do. Values of at most 15 digits never do.
+struct DecimalSource<'a> {
+    table: &'a TableMapping,
+    owns: &'a OwnsMapping,
+    precision: u8,
+    scale: u8,
+}
+
+fn check_decimals_across_scales(
+    conn: &Connection,
+    attribute: &str,
+    sources: &[DecimalSource<'_>],
+    diagnostics: &mut Diagnostics,
+) {
+    let scales: HashSet<u8> = sources.iter().map(|source| source.scale).collect();
+    if scales.len() < 2 || sources.iter().all(|source| source.precision <= 15) {
+        return;
+    }
+    // Compared as text without trailing fractional zeros, so that 0.1 and 0.10 are one value.
+    let selects: Vec<String> = sources
+        .iter()
+        .map(|source| {
+            format!(
+                "SELECT e::DOUBLE AS d, rtrim(rtrim(e::VARCHAR, '0'), '.') AS v FROM (SELECT {} AS e FROM {})",
+                source.owns.element(),
+                quoted(&source.table.name)
+            )
+        })
+        .collect();
+    Check {
+        subject: format!("attribute '{attribute}'"),
+        unit: "double(s)",
+        predicate: "are made from distinct decimals of different scales, which would merge into one attribute",
+        example: "decimals",
+        violations: format!(
+            "SELECT string_agg(DISTINCT v, ' and ' ORDER BY v) AS example FROM ({}) WHERE d IS NOT NULL GROUP BY d \
+             HAVING count(DISTINCT v) > 1",
+            selects.join(" UNION ALL ")
+        ),
+    }
+    .report(conn, diagnostics);
 }
 
 fn check_playerless_rows(
@@ -250,17 +305,16 @@ fn check_value_domain(
             "e < -9223372036854775808 OR e >= 9223372036854775808".to_owned(),
         ),
         // Rounding would merge distinct values into one attribute, and move their ownerships onto it. A value is
-        // exact when the double, printed at the column's scale, reads back as the value: DuckDB's own cast from a
-        // double to a wide decimal is not exact, its formatting is.
-        column_type if to_double && !column_type.fits_double_exactly() => (
+        // exact when the double, printed at the column's scale, reads back as the value: at one scale, distinct
+        // values that pass make distinct doubles. DuckDB's own cast from a double to a wide decimal is not exact,
+        // its formatting is.
+        ColumnType::Integer { bits, .. } if to_double && *bits > 32 => (
             "hold a value that a double cannot represent exactly",
-            format!(
-                "printf('%.{}f', e::DOUBLE) <> e::VARCHAR",
-                match column_type {
-                    ColumnType::Decimal { scale, .. } => *scale,
-                    _ => 0,
-                }
-            ),
+            "printf('%.0f', e::DOUBLE) <> e::VARCHAR".to_owned(),
+        ),
+        ColumnType::Decimal { precision, scale } if to_double && *precision > 15 => (
+            "hold a value that a double cannot represent exactly",
+            format!("printf('%.{scale}f', e::DOUBLE) <> e::VARCHAR"),
         ),
         ColumnType::Double => ("hold a double that is not finite, which TypeDB requires", "NOT isfinite(e)".to_owned()),
         ColumnType::Date => (
@@ -295,7 +349,13 @@ fn check_value_domain(
                 u64::MAX / 1000
             ),
         ),
-        _ => return,
+        ColumnType::Boolean
+        | ColumnType::Integer { .. }
+        | ColumnType::Decimal { .. }
+        | ColumnType::Varchar
+        | ColumnType::StringLike
+        | ColumnType::List(_)
+        | ColumnType::Unsupported { .. } => return,
     };
     Check {
         subject: format!("table '{}': column '{}'", table.name, owns.column),

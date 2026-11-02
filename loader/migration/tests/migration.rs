@@ -114,7 +114,7 @@ fn validation_errors(dir: &Scratch) -> Vec<String> {
 fn run(dir: &Scratch) -> Result<Vec<u8>, Box<dyn Error>> {
     let migration = prepare(dir).map_err(|err| format!("validation failed: {err:?}"))?;
     let mut output = Vec::new();
-    migration.run(&mut output, "3.0.0-test", "duckdb:fixture.duckdb")?;
+    migration.run(&mut output, "3.0.0-test", "duckdb:fixture.duckdb", &|_| {})?;
     Ok(output)
 }
 
@@ -193,6 +193,7 @@ fn assert_file_guarantees(items: &[item::Item]) {
             _ => continue,
         };
         let object = (object.0, object.1.expect("every object carries its label-scoped id"));
+        assert!(object.1 < 1 << 63, "{id} has a label-scoped id beyond TypeDB's");
         assert!(scoped_ids.insert(object), "{id} repeats the label-scoped id of another {}", object.0);
         assert!(objects.insert(id, object).is_none(), "object {id} twice");
     }
@@ -333,8 +334,8 @@ fn structure_and_mapping_errors_name_the_table_and_the_fix() -> Result<(), Box<d
         ),
         (
             "CREATE TABLE person (_iid UBIGINT NOT NULL); INSERT INTO person VALUES (1), (2), (2), (3), (3), (3)",
-            "table 'person': 2 _iid value(s) appear in more than one row; an instance id must be unique within \
-             its table, e.g. _iid 2, 3",
+            "table 'person': 2 _iid value(s) appear in more than one row; an _iid is the instance's id within its \
+             type, e.g. _iid 2, 3",
         ),
         (
             "CREATE TABLE friend_ship (_iid UBIGINT PRIMARY KEY)",
@@ -637,6 +638,71 @@ fn decimal_columns_beyond_typedb_precision_are_rejected() -> Result<(), Box<dyn 
 }
 
 #[test]
+fn decimals_of_different_scales_that_make_one_double_are_refused() -> Result<(), Box<dyn Error>> {
+    // 0.1 and 0.1000000000000000056 are distinct decimals, but one double: at its own scale each passes.
+    let schema = "define\n  attribute d value double;\n  entity thing, owns d @card(0..);\n";
+    let dir = scratch(
+        "double-scales",
+        schema,
+        "CREATE TABLE thing (_iid UBIGINT, coarse DECIMAL(4,1), fine DECIMAL(38,19));
+         COMMENT ON COLUMN thing.coarse IS '@typedb owns d'; COMMENT ON COLUMN thing.fine IS '@typedb owns d';
+         INSERT INTO thing VALUES (1, 0.1, NULL), (2, NULL, 0.1000000000000000056);",
+    )?;
+    assert_error(
+        &validation_errors(&dir),
+        &["attribute 'd': 1 double(s) are made from distinct decimals of different scales, which would merge into \
+           one attribute, e.g. decimals 0.1 and 0.1000000000000000056"],
+    );
+    // 0.1 is not exact at the finer column's scale, but no value there makes its double.
+    let dir = scratch(
+        "double-scales-exact",
+        schema,
+        "CREATE TABLE thing (_iid UBIGINT, coarse DECIMAL(18,1), fine DECIMAL(38,19));
+         COMMENT ON COLUMN thing.coarse IS '@typedb owns d'; COMMENT ON COLUMN thing.fine IS '@typedb owns d';
+         INSERT INTO thing VALUES (1, 1.5, 1.25), (2, 0.1, 2.0625), (3, 0.5, NULL);",
+    )?;
+    let items = convert(&dir)?;
+    assert_file_guarantees(&items);
+    let mut doubles: Vec<f64> = items
+        .into_iter()
+        .filter_map(|item| match item {
+            item::Item::Attribute(attribute) => match attribute.value?.value? {
+                migration_value::Value::Double(double) => Some(double),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect();
+    doubles.sort_by(f64::total_cmp);
+    assert_eq!(doubles, [0.1, 0.5, 1.25, 1.5, 2.0625]);
+    Ok(())
+}
+
+#[test]
+fn attribute_values_are_written_in_order() -> Result<(), Box<dyn Error>> {
+    // More values than one unit holds, so that units finishing out of order would show.
+    let dir = scratch(
+        "sorted-values",
+        "define\n  attribute n value integer;\n  entity thing, owns n;\n",
+        "CREATE TABLE thing (_iid UBIGINT, n BIGINT);
+         INSERT INTO thing SELECT i, hash(i) % 1000000000 FROM range(300000) t(i);",
+    )?;
+    let values: Vec<i64> = convert(&dir)?
+        .into_iter()
+        .filter_map(|item| match item {
+            item::Item::Attribute(attribute) => match attribute.value?.value? {
+                migration_value::Value::Integer(integer) => Some(integer),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect();
+    assert!(values.len() > 200_000);
+    assert!(values.windows(2).all(|pair| pair[0] < pair[1]), "attribute values are out of order");
+    Ok(())
+}
+
+#[test]
 fn integers_and_decimals_feeding_doubles_must_be_exact() -> Result<(), Box<dyn Error>> {
     let dir = scratch(
         "inexact-double",
@@ -806,7 +872,7 @@ fn iids_must_fit_typedb_and_differ_within_a_type() -> Result<(), Box<dyn Error>>
     )?;
     assert_error(
         &validation_errors(&dir),
-        &["tables 'person', 'staff' mapped to 'person': 2 _iid value(s) appear in more than one of them", "1, 3"],
+        &["tables 'person', 'staff' mapped to 'person': 2 _iid value(s) appear in more than one row", "1, 3"],
     );
     let at_the_limit = scratch(
         "ids-at-the-limit",
@@ -1049,22 +1115,33 @@ fn relation_directive_bindings_are_checked() -> Result<(), Box<dyn Error>> {
 }
 
 #[test]
-fn directive_bindings_settle_inference_of_the_other_columns() -> Result<(), Box<dyn Error>> {
-    let dir = scratch(
-        "partial-directive",
-        "define
-  entity person, plays mentorship:mentor, plays mentorship:student;
-  \
-         relation mentorship, relates mentor, relates student;
-",
-        "CREATE TABLE person (_iid UBIGINT PRIMARY KEY);
+fn a_directive_does_not_settle_the_roles_of_columns_it_leaves_out() -> Result<(), Box<dyn Error>> {
+    // Several columns may bind one role, so binding `mentor` says nothing about `student_id`: it is ambiguous.
+    let schema = "define\n  entity person, plays mentorship:mentor, plays mentorship:student;\n  \
+                  relation mentorship, relates mentor @card(0..), relates student @card(0..);\n";
+    let tables = "CREATE TABLE person (_iid UBIGINT PRIMARY KEY);
          CREATE TABLE mentorship (_iid UBIGINT PRIMARY KEY, student_id UBIGINT REFERENCES person(_iid),
                                   mentor_id UBIGINT REFERENCES person(_iid));
-         COMMENT ON TABLE mentorship IS '@typedb relation mentorship (mentor = mentor_id)';
          INSERT INTO person VALUES (1), (2);
-         INSERT INTO mentorship VALUES (3, 1, 2);",
+         INSERT INTO mentorship VALUES (3, 1, 2);";
+    let partial = scratch(
+        "partial-directive",
+        schema,
+        &format!("{tables} COMMENT ON TABLE mentorship IS '@typedb relation mentorship (mentor = mentor_id)';"),
     )?;
-    let items = convert(&dir)?;
+    assert_error(
+        &validation_errors(&partial),
+        &["column 'student_id' is ambiguous", "mentor = <column>, student = <column>"],
+    );
+    let complete = scratch(
+        "complete-directive",
+        schema,
+        &format!(
+            "{tables} COMMENT ON TABLE mentorship IS \
+             '@typedb relation mentorship (mentor = mentor_id, student = student_id)';"
+        ),
+    )?;
+    let items = convert(&complete)?;
     let item::Item::Relation(relation) = &items[items.len() - 2] else { panic!("the relation precedes the checksums") };
     let mut players: Vec<String> =
         relation.roles.iter().map(|role| format!("{}={}", role.label, role.players[0].id)).collect();
@@ -1246,7 +1323,7 @@ fn an_output_error_ends_a_large_conversion() -> Result<(), Box<dyn Error>> {
     thread::spawn(move || {
         let result = prepare(&dir)
             .map_err(|err| format!("{err:?}"))
-            .and_then(|migration| migration.run(Failing, "3.0.0-test", "duckdb:fixture.duckdb").map(|_| ()));
+            .and_then(|migration| migration.run(Failing, "3.0.0-test", "duckdb:fixture.duckdb", &|_| {}).map(|_| ()));
         let _ = sender.send(result);
     });
     let result = receiver.recv_timeout(Duration::from_secs(120)).expect("the conversion must end, not hang");

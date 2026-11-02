@@ -5,11 +5,13 @@
  */
 
 use std::{
-    collections::HashSet,
+    collections::{BTreeMap, HashSet},
     fmt::Write as _,
     io::{BufWriter, Write},
+    panic::{self, AssertUnwindSafe},
     sync::{Arc, Mutex, mpsc},
     thread,
+    time::{Duration, Instant},
 };
 
 use duckdb::{
@@ -29,10 +31,11 @@ use crate::{
 };
 
 // Each scan is a pipeline: this thread streams the rows out of DuckDB in record batches and groups them into
-// units; every core turns units into encoded items; one thread writes the units as they are done. A unit is cut
-// by rows or by bytes, whichever comes first, so that wide rows do not inflate what is in flight.
+// units; every core turns units into encoded items; one thread writes the units back in the order they were read.
+// A unit is cut by rows or by bytes, whichever comes first, so that wide rows do not inflate what is in flight.
 const UNIT_ROWS: usize = 32_768;
 const UNIT_BYTES: usize = 32 << 20;
+const UNITS_IN_FLIGHT_PER_WORKER: usize = 4;
 const OUTPUT_BUFFER: usize = 8 << 20;
 
 // The file is a sequence of zstd frames, one per unit, which zstd reads as one stream. Each frame is complete
@@ -53,6 +56,7 @@ pub(crate) fn emit(
     typedb_version: &str,
     original_database: &str,
     output: impl Write + Send,
+    progress: &(dyn Fn(String) + Sync),
 ) -> Result<Checksums, String> {
     let mut output = BufWriter::with_capacity(OUTPUT_BUFFER, output);
     let mut checksums = Checksums::default();
@@ -70,9 +74,9 @@ pub(crate) fn emit(
         }),
     )?;
 
-    emit_attributes(conn, plan, &mut output, &mut checksums)?;
+    emit_attributes(conn, plan, &mut output, &mut checksums, progress)?;
     for index in 0..plan.tables.len() {
-        emit_objects(conn, plan, index, &mut output, &mut checksums)?;
+        emit_objects(conn, plan, index, &mut output, &mut checksums, progress)?;
     }
 
     write_item(&mut output, item::Item::Checksums(checksums))?;
@@ -103,6 +107,7 @@ fn emit_attributes(
     plan: &MappingPlan,
     output: &mut (impl Write + Send),
     checksums: &mut Checksums,
+    progress: &(dyn Fn(String) + Sync),
 ) -> Result<(), String> {
     struct AttributeSource<'a> {
         label: &'a str,
@@ -131,15 +136,14 @@ fn emit_attributes(
     }
 
     for source in sources {
-        // One aggregate over all the columns: a UNION of DISTINCTs plans one per column and one more, which fail to
-        // spill under limits that a single one streams through. Values in order make the server's import of them
-        // faster (6% on 10M rows of 30 attributes); a streamed result keeps its order only while insertion order
-        // is preserved, which this one statement can afford.
-        let sql = match source.selects.as_slice() {
-            [select] => format!("{select} ORDER BY 1"),
-            selects => format!("SELECT DISTINCT v FROM ({}) ORDER BY 1", selects.join(" UNION ALL ")),
-        };
-        let with_context = |err: String| format!("attribute '{}' (from {:?}): {err}", source.label, source.columns);
+        // One aggregate over all the columns: an aggregate per column besides fails to spill under limits that a
+        // single one streams through. Values in order make the server's import of them faster (6% on 10M rows of 30
+        // attributes); a streamed result keeps its order only while insertion order is preserved, which this one
+        // statement can afford.
+        let sql =
+            format!("SELECT DISTINCT v FROM ({}) WHERE v IS NOT NULL ORDER BY 1", source.selects.join(" UNION ALL "));
+        let with_context =
+            |err: String| format!("attribute '{}' (from {}): {err}", source.label, source.columns.join(", "));
         let encode = |batches: &[RecordBatch]| {
             let mut unit = Unit::default();
             for batch in batches {
@@ -159,7 +163,8 @@ fn emit_attributes(
             Ok(unit)
         };
         conn.execute_batch("SET preserve_insertion_order = true").map_err(|err| with_context(err.to_string()))?;
-        let scanned = scan(conn, &sql, output, checksums, &encode).map_err(with_context);
+        let report = Report { scan: format!("attribute '{}'", source.label), total: None, progress };
+        let scanned = scan(conn, &sql, output, checksums, &encode, &report).map_err(with_context);
         conn.execute_batch("SET preserve_insertion_order = false").map_err(|err| with_context(err.to_string()))?;
         scanned?;
     }
@@ -167,12 +172,7 @@ fn emit_attributes(
 }
 
 fn attribute_select(table: &str, owns: &OwnsMapping) -> String {
-    format!(
-        "SELECT DISTINCT {} AS v FROM {} WHERE {} IS NOT NULL",
-        owns.read(&owns.element()),
-        quoted(table),
-        quoted(&owns.column)
-    )
+    format!("SELECT {} AS v FROM {}", owns.read(&owns.element()), quoted(table))
 }
 
 fn emit_objects(
@@ -181,6 +181,7 @@ fn emit_objects(
     table_index: usize,
     output: &mut (impl Write + Send),
     checksums: &mut Checksums,
+    progress: &(dyn Fn(String) + Sync),
 ) -> Result<(), String> {
     let table = &plan.tables[table_index];
     let mut selects = vec![format!("t.{} AS c0", quoted(IID_COLUMN))];
@@ -219,13 +220,12 @@ fn emit_objects(
             let columns: Vec<Cells<'_>> =
                 batch.columns().iter().map(|column| Cells::of(column.as_ref())).collect::<Result<_, _>>()?;
             let Typed::UInt64(iids) = &columns[0].typed else {
-                return Err(format!("the scan of '{}' did not return {IID_COLUMN} as UBIGINT", table.name));
+                return Err(format!("{IID_COLUMN} was not read as UBIGINT"));
             };
             for row in 0..batch.num_rows() {
                 let instance_id = iids.value(row);
                 unit.rows += 1;
-                let with_context = |err: String| format!("table '{}', {IID_COLUMN} = {instance_id}: {err}", table.name);
-                let label_scoped_id = instance_id;
+                let with_context = |err: String| format!("{IID_COLUMN} {instance_id}: {err}");
 
                 let mut owned = Vec::new();
                 let mut owned_ids = HashSet::new();
@@ -297,18 +297,18 @@ fn emit_objects(
                         ));
                     }
                     unit.write_item(item::Item::Relation(item::Relation {
-                        id: object_id(&table.type_label, label_scoped_id),
+                        id: object_id(&table.type_label, instance_id),
                         label: table.type_label.clone(),
-                        label_scoped_id: Some(label_scoped_id),
+                        label_scoped_id: Some(instance_id),
                         attributes: owned,
                         roles,
                     }));
                     unit.checksums.relation_count += 1;
                 } else {
                     unit.write_item(item::Item::Entity(item::Entity {
-                        id: object_id(&table.type_label, label_scoped_id),
+                        id: object_id(&table.type_label, instance_id),
                         label: table.type_label.clone(),
-                        label_scoped_id: Some(label_scoped_id),
+                        label_scoped_id: Some(instance_id),
                         attributes: owned,
                     }));
                     unit.checksums.entity_count += 1;
@@ -317,7 +317,8 @@ fn emit_objects(
         }
         Ok(unit)
     };
-    let scanned = scan(conn, &sql, output, checksums, &encode)
+    let report = Report { scan: format!("table '{}'", table.name), total: Some(count), progress };
+    let scanned = scan(conn, &sql, output, checksums, &encode, &report)
         .map_err(|err| format!("scan of '{}' failed: {err}", table.name))?;
     if scanned != count {
         return Err(format!("the scan of '{}' returned {scanned} of its {count} rows", table.name));
@@ -346,14 +347,35 @@ fn scan(
     output: &mut (impl Write + Send),
     checksums: &mut Checksums,
     encode: &(impl Fn(&[RecordBatch]) -> Result<Unit, String> + Sync),
+    report: &Report<'_>,
 ) -> Result<u64, String> {
-    let scan_error = |err: duckdb::Error| format!("scan failed: {err}");
+    let scan_error = |err: duckdb::Error| err.to_string();
+    // Each worker holds a unit in and a unit out; DuckDB's threads, which the memory limit bounds, bound them too.
+    let duckdb_threads: i64 =
+        conn.query_row("SELECT current_setting('threads')", [], |row| row.get(0)).map_err(scan_error)?;
+    let cores = thread::available_parallelism().map(|n| n.get()).unwrap_or(2);
+    let workers = cores.min(usize::try_from(duckdb_threads).unwrap_or(1).max(1));
     let mut statement = conn.prepare(sql).map_err(scan_error)?;
     // Stepping the statement, rather than iterating, reports a fetch error as an error on every duckdb-rs version.
     let _ = statement.stream_arrow([]).map_err(scan_error)?;
     let batches =
         std::iter::from_fn(|| statement.step().map(|array| array.map(|array| RecordBatch::from(&array))).transpose());
-    pipeline(batches, output, checksums, encode)
+    pipeline(batches, output, checksums, encode, workers, report)
+}
+
+const PROGRESS_INTERVAL: Duration = Duration::from_secs(30);
+
+struct Report<'a> {
+    scan: String,
+    total: Option<u64>,
+    progress: &'a (dyn Fn(String) + Sync),
+}
+
+impl Report<'_> {
+    fn tell(&self, rows: u64, bytes: u64) {
+        let total = self.total.map(|total| format!(" of {total}")).unwrap_or_default();
+        (self.progress)(format!("{}: {rows}{total} rows, {:.1} GB encoded", self.scan, bytes as f64 / 1e9));
+    }
 }
 
 fn pipeline(
@@ -361,10 +383,15 @@ fn pipeline(
     output: &mut (impl Write + Send),
     checksums: &mut Checksums,
     encode: &(impl Fn(&[RecordBatch]) -> Result<Unit, String> + Sync),
+    workers: usize,
+    report: &Report<'_>,
 ) -> Result<u64, String> {
-    let workers = thread::available_parallelism().map(|n| n.get()).unwrap_or(2);
-    let (work_sender, work_receiver) = mpsc::sync_channel::<Vec<RecordBatch>>(workers);
-    let (unit_sender, unit_receiver) = mpsc::sync_channel::<Result<Unit, String>>(workers);
+    let (work_sender, work_receiver) = mpsc::sync_channel::<(u64, Vec<RecordBatch>)>(workers);
+    let (unit_sender, unit_receiver) = mpsc::sync_channel::<(u64, Result<Unit, String>)>(workers);
+    let (token_sender, tokens) = mpsc::sync_channel::<()>(UNITS_IN_FLIGHT_PER_WORKER * workers);
+    for _ in 0..UNITS_IN_FLIGHT_PER_WORKER * workers {
+        token_sender.send(()).expect("the token channel has room for every token");
+    }
 
     thread::scope(|scope| {
         // Only the workers hold the receiver: once the writer has failed and they have all left, sending fails
@@ -376,12 +403,16 @@ fn pipeline(
             scope.spawn(move || {
                 loop {
                     let received = work_receiver.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).recv();
-                    let Ok(batches) = received else { return };
-                    let unit = encode(&batches).and_then(|mut unit| {
-                        unit.bytes = compress(&unit.bytes)?;
-                        Ok(unit)
-                    });
-                    if unit_sender.send(unit).is_err() {
+                    let Ok((sequence, batches)) = received else { return };
+                    // A unit lost to a panic would hold its token forever; it fails the scan instead.
+                    let unit = panic::catch_unwind(AssertUnwindSafe(|| {
+                        encode(&batches).and_then(|mut unit| {
+                            unit.bytes = compress(&unit.bytes)?;
+                            Ok(unit)
+                        })
+                    }))
+                    .unwrap_or_else(|_| Err("the encoder panicked".to_owned()));
+                    if unit_sender.send((sequence, unit)).is_err() {
                         return;
                     }
                 }
@@ -391,25 +422,40 @@ fn pipeline(
         drop(unit_sender);
 
         let writer = scope.spawn(move || -> Result<u64, String> {
-            let mut rows = 0;
-            for unit in unit_receiver {
-                let unit = unit?;
-                output.write_all(&unit.bytes).map_err(|err| format!("failed to write the output file: {err}"))?;
-                add_checksums(checksums, &unit.checksums);
-                rows += unit.rows;
+            let (mut rows, mut bytes, mut next, mut done) = (0, 0, 0, BTreeMap::new());
+            let mut reported = Instant::now();
+            for (sequence, unit) in unit_receiver {
+                done.insert(sequence, unit?);
+                // Units are written in the order they were read, which keeps a sorted scan sorted.
+                while let Some(unit) = done.remove(&next) {
+                    output.write_all(&unit.bytes).map_err(|err| format!("failed to write the output file: {err}"))?;
+                    add_checksums(checksums, &unit.checksums);
+                    rows += unit.rows;
+                    bytes += unit.bytes.len() as u64;
+                    next += 1;
+                    let _ = token_sender.send(());
+                }
+                if reported.elapsed() >= PROGRESS_INTERVAL {
+                    report.tell(rows, bytes);
+                    reported = Instant::now();
+                }
             }
             Ok(rows)
         });
 
         let mut group = Vec::new();
         let (mut group_rows, mut group_bytes) = (0, 0);
-        let send = |group: Vec<RecordBatch>| !writer.is_finished() && work_sender.send(group).is_ok();
+        let mut sequence = 0;
+        let mut send = |group: Vec<RecordBatch>| {
+            sequence += 1;
+            tokens.recv().is_ok() && !writer.is_finished() && work_sender.send((sequence - 1, group)).is_ok()
+        };
         let mut fetch_error = None;
         for batch in batches {
             let batch = match batch {
                 Ok(batch) => batch,
                 Err(err) => {
-                    fetch_error = Some(format!("scan failed: {err}"));
+                    fetch_error = Some(err.to_string());
                     break;
                 }
             };

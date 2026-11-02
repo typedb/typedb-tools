@@ -32,20 +32,20 @@ pub(crate) enum ColumnType {
 impl ColumnType {
     pub(crate) const INSTANCE_ID: ColumnType = ColumnType::Integer { bits: 64, signed: false };
 
-    // Whether every value converts to a double and back unchanged: integers up to 32 bits and decimals up to 15
-    // digits do, as a double holds 53 bits.
-    pub(crate) fn fits_double_exactly(&self) -> bool {
-        match self {
-            ColumnType::Integer { bits, .. } => *bits <= 32,
-            ColumnType::Decimal { precision, .. } => *precision <= 15,
-            _ => true,
-        }
-    }
-
     pub(crate) fn fits_i64(&self) -> bool {
         match self {
             ColumnType::Integer { bits, signed } => *bits < 64 || (*bits == 64 && *signed),
-            _ => false,
+            ColumnType::Boolean
+            | ColumnType::Double
+            | ColumnType::Decimal { .. }
+            | ColumnType::Varchar
+            | ColumnType::StringLike
+            | ColumnType::Date
+            | ColumnType::Timestamp { .. }
+            | ColumnType::TimestampTz
+            | ColumnType::Interval
+            | ColumnType::List(_)
+            | ColumnType::Unsupported { .. } => false,
         }
     }
 

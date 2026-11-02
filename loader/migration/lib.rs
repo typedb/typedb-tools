@@ -120,13 +120,15 @@ impl Migration {
     }
 
     // The loader stands in for the server in the header: they release in lockstep.
+    // `progress` hears, every half minute of a scan, how far it has got.
     pub fn run(
         &self,
         output: impl Write + Send,
         typedb_version: &str,
         original_database: &str,
+        progress: &(dyn Fn(String) + Sync),
     ) -> Result<Checksums, String> {
-        emit::emit(&self.connection, &self.plan, typedb_version, original_database, output)
+        emit::emit(&self.connection, &self.plan, typedb_version, original_database, output, progress)
     }
 }
 
@@ -146,8 +148,8 @@ fn open_duckdb(path: &Path, spill_dir: &Path) -> Result<Connection, PrepareError
         })
 }
 
-// Unlimited, DuckDB fills 80% of the machine's memory before it spills; half leaves room for the conversion's own
-// buffers and for whatever runs alongside, such as a server.
+// Unlimited, DuckDB fills 80% of the machine's memory before it spills; five eighths of that, half the machine,
+// leaves room for the conversion's own buffers and for whatever runs alongside, such as a server.
 fn limit_memory(connection: &Connection, memory_limit: Option<&str>) -> Result<String, PrepareError> {
     let current = || -> duckdb::Result<String> {
         connection.query_row("SELECT current_setting('memory_limit')", [], |row| row.get(0))
@@ -167,8 +169,13 @@ fn limit_memory(connection: &Connection, memory_limit: Option<&str>) -> Result<S
         .map_err(|err| PrepareError::Setup(format!("invalid memory limit '{limit}': {err}")))?;
     let limit = current().map_err(|err| PrepareError::Setup(format!("failed to read DuckDB's memory limit: {err}")))?;
     // A hash aggregate or join fails instead of spilling once its share of the limit drops below a few tens of
-    // MB per thread, so a small limit runs fewer threads.
+    // MB per thread, so a small limit runs fewer threads, down to the floor that one thread needs.
     if let Some(bytes) = size_in_bytes(&limit) {
+        if bytes < MEMORY_FLOOR {
+            return Err(PrepareError::Setup(format!(
+                "the memory limit {limit} is too small: the conversion needs at least 256 MiB"
+            )));
+        }
         let threads: i64 = connection
             .query_row("SELECT current_setting('threads')", [], |row| row.get(0))
             .map_err(|err| PrepareError::Setup(format!("failed to read DuckDB's threads: {err}")))?;
@@ -183,6 +190,7 @@ fn limit_memory(connection: &Connection, memory_limit: Option<&str>) -> Result<S
 }
 
 const MEMORY_PER_THREAD: u64 = 64 << 20;
+const MEMORY_FLOOR: u64 = 256 << 20;
 
 // DuckDB prints sizes as `19.3 GiB` or `512.0 MiB`.
 fn size_in_bytes(size: &str) -> Option<u64> {
@@ -228,8 +236,10 @@ mod test {
     fn a_small_memory_limit_runs_fewer_threads() {
         let connection = Connection::open_in_memory().unwrap();
         connection.execute_batch("SET threads = 8").unwrap();
-        limit_memory(&connection, Some("128MiB")).unwrap();
+        limit_memory(&connection, Some("256MiB")).unwrap();
         let threads: i64 = connection.query_row("SELECT current_setting('threads')", [], |row| row.get(0)).unwrap();
-        assert_eq!(threads, 2);
+        assert_eq!(threads, 4);
+        assert!(matches!(limit_memory(&connection, Some("128MiB")), Err(PrepareError::Setup(message))
+            if message.contains("at least 256 MiB")));
     }
 }
