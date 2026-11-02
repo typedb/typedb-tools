@@ -39,13 +39,26 @@ pub(crate) async fn run_migration(args: &Args) -> ! {
 
     let work_dir = match args.output_dir.as_deref() {
         _ if args.dry_run => std::env::temp_dir(),
-        Some(dir) => PathBuf::from(dir),
+        Some(dir) => PathBuf::from(if dir.is_empty() { "." } else { dir }),
         None => staging_dir(&db_path),
     };
-    let spill_dir = work_dir.join(format!(".{database}.{}.tmp", process::id()));
+    let data_path = (!args.dry_run).then(|| output_data_path(&work_dir, &database, args.overwrite));
+    let (_run_lock, spill_dir) = match &data_path {
+        Some(data_path) => {
+            let run_lock = claim(&work_dir, &database);
+            let spill_dir = work_dir.join(format!(".{database}.tmp"));
+            remove_if_exists(&spill_dir);
+            remove_if_exists(&partial_path(data_path));
+            (Some(run_lock), spill_dir)
+        }
+        None => (None, work_dir.join(format!(".{database}.{}.tmp", process::id()))),
+    };
+    let server = if args.dry_run || args.files_only { None } else { Some(connect(args, &database).await) };
     let source = Source::DuckDb(db_path.clone());
     println!("Migrating from {source}");
     let cleanup = on_interrupt(spill_dir.clone());
+    let pulse = Pulse::new();
+    let heartbeat = pulse.clone().beat();
     let migration = {
         let schema_text = schema_text.clone();
         let memory_limit = args.memory_limit.clone();
@@ -53,13 +66,15 @@ pub(crate) async fn run_migration(args: &Args) -> ! {
     };
     if args.dry_run {
         let original_database = original_database.clone();
+        let pulse = pulse.clone();
         let (result, elapsed) = blocking(move || {
             let started = Instant::now();
-            let result = migration.run(io::sink(), VERSION.trim(), &original_database);
+            let result = migration.run(io::sink(), VERSION.trim(), &original_database, &|message| pulse.say(&message));
             drop(migration); // closes DuckDB and removes its spill directory; exiting would not
             (result, started.elapsed())
         })
         .await;
+        heartbeat.abort();
         match result {
             Ok(checksums) => print_summary(&checksums, elapsed),
             Err(message) => fatal_with(ExitCode::MigrationError, message),
@@ -68,8 +83,7 @@ pub(crate) async fn run_migration(args: &Args) -> ! {
         process::exit(0);
     }
 
-    let data_path = output_data_path(&work_dir, &database, args.overwrite);
-    let server = if args.files_only { None } else { Some(connect(args, &database).await) };
+    let data_path = data_path.expect("set unless --dry-run");
     let import_command = console_import_command(args, &database, schema_path, &data_path);
     let kept_hint = format!(
         "The prepared data file is kept: {}\nImport it without converting again with:\n  {import_command}",
@@ -78,10 +92,12 @@ pub(crate) async fn run_migration(args: &Args) -> ! {
     lock(&cleanup).leftovers.push(partial_path(&data_path));
     let written = {
         let data_path = data_path.clone();
-        blocking(move || write_data_file(migration, &data_path, &original_database)).await
+        blocking(move || write_data_file(migration, &data_path, &original_database, &pulse)).await
     };
-    if let Err(message) = written {
-        fatal_with(ExitCode::MigrationError, message);
+    heartbeat.abort();
+    match written {
+        Ok((checksums, elapsed)) => print_summary(&checksums, elapsed),
+        Err(message) => fatal_with(ExitCode::MigrationError, message),
     }
     lock(&cleanup).phase = Phase::Converted { kept_hint: kept_hint.clone() };
 
@@ -95,10 +111,18 @@ pub(crate) async fn run_migration(args: &Args) -> ! {
     let started = Instant::now();
     lock(&cleanup).phase = Phase::Importing { kept_hint: kept_hint.clone() };
     match import(&connection, driver, &database, &schema_text, &data_path).await {
-        Ok(()) => {
+        Ok(Imported::Now) => {
             remove_if_exists(&data_path);
             println!("Imported in {}.", format_duration(started.elapsed()));
             process::exit(0);
+        }
+        Ok(Imported::BeforeTheConnectionWasLost) => {
+            println_warning!(
+                "'{database}' exists, possibly imported by an attempt of this run that lost its connection; the data \
+                 file is kept until you have checked the database"
+            );
+            println!("{kept_hint}");
+            process::exit(ExitCode::ConnectionError as i32);
         }
         Err((code, message)) => {
             println_error!("{message}");
@@ -108,8 +132,46 @@ pub(crate) async fn run_migration(args: &Args) -> ! {
     }
 }
 
-// The conversion is CPU- and IO-bound for up to hours; it runs off the runtime's workers, which serve the
-// interrupt handler.
+#[derive(Clone)]
+struct Pulse {
+    started: Instant,
+    last_said: Arc<Mutex<Instant>>,
+}
+
+impl Pulse {
+    const QUIET: Duration = Duration::from_secs(60);
+
+    fn new() -> Pulse {
+        let now = Instant::now();
+        Pulse { started: now, last_said: Arc::new(Mutex::new(now)) }
+    }
+
+    fn say(&self, message: &str) {
+        *self.last_said() = Instant::now();
+        say(format_args!("  {message} ({} elapsed)", format_duration(self.started.elapsed())));
+    }
+
+    fn beat(self) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            loop {
+                let last_said = *self.last_said();
+                tokio::time::sleep_until((last_said + Pulse::QUIET).into()).await;
+                if *self.last_said() == last_said {
+                    self.say("working");
+                }
+            }
+        })
+    }
+
+    fn last_said(&self) -> MutexGuard<'_, Instant> {
+        self.last_said.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+fn say(line: std::fmt::Arguments<'_>) {
+    let _ = writeln!(io::stdout(), "{line}");
+}
+
 async fn blocking<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) -> T {
     tokio::task::spawn_blocking(work).await.unwrap_or_else(|err| std::panic::resume_unwind(err.into_panic()))
 }
@@ -117,33 +179,34 @@ async fn blocking<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) 
 const RECONNECT_ATTEMPTS: u32 = 12;
 const RECONNECT_DELAY: Duration = Duration::from_secs(10);
 
-// The driver reports server errors by code only: DatabaseCreateError::AlreadyExists and ::IsBeingImported.
 const ALREADY_EXISTS: &str = "DBC6";
 const IS_BEING_IMPORTED: &str = "DBC8";
 
-// The conversion before the import can take hours; a connection that did not survive them is reopened.
+enum Imported {
+    Now,
+    BeforeTheConnectionWasLost,
+}
+
 async fn import(
     connection: &ConnectionSettings,
     driver: TypeDBDriver,
     database: &str,
     schema: &str,
     data_path: &Path,
-) -> Result<(), (ExitCode, String)> {
+) -> Result<Imported, (ExitCode, String)> {
     let mut driver = Ok(driver);
     let mut retries = 0;
+    let mut broke_off = false;
     loop {
-        let result = match driver {
-            Ok(driver) => driver.databases().import_from_file(database, schema, data_path).await,
-            Err(err) => Err(err),
+        let (result, attempted) = match driver {
+            Ok(driver) => (driver.databases().import_from_file(database, schema, data_path).await, true),
+            Err(err) => (Err(err), false),
         };
         match result {
-            Ok(()) => return Ok(()),
-            // The connection was lost after the server had completed an earlier attempt.
-            Err(err) if retries > 0 && err.code() == ALREADY_EXISTS => {
-                println_warning!("'{database}' exists: the import completed before the connection was lost");
-                return Ok(());
-            }
-            Err(err) if retries < RECONNECT_ATTEMPTS && is_transient(&err) => {
+            Ok(()) => return Ok(Imported::Now),
+            Err(err) if broke_off && err.code() == ALREADY_EXISTS => return Ok(Imported::BeforeTheConnectionWasLost),
+            Err(err) if retries < RECONNECT_ATTEMPTS && is_transient(&err, broke_off) => {
+                broke_off |= attempted && matches!(err, typedb_driver::Error::Connection(_));
                 retries += 1;
                 let delay = RECONNECT_DELAY.as_secs();
                 println_warning!("{err}; retrying in {delay}s (attempt {retries} of {RECONNECT_ATTEMPTS})");
@@ -155,17 +218,25 @@ async fn import(
                     typedb_driver::Error::Connection(_) => ExitCode::ConnectionError,
                     _ => ExitCode::GeneralError,
                 };
-                return Err((code, format!("import into '{database}' failed: {err}")));
+                let cause = match err.code().as_str() {
+                    IS_BEING_IMPORTED if broke_off => {
+                        format!("an import of '{database}', possibly this run's broken-off one, is still in progress")
+                    }
+                    IS_BEING_IMPORTED => format!("another import of '{database}' is in progress"),
+                    ALREADY_EXISTS => format!("'{database}' was created by another import meanwhile"),
+                    _ => err.to_string(),
+                };
+                return Err((code, format!("import into '{database}' failed: {cause}")));
             }
         }
     }
 }
 
-fn is_transient(err: &typedb_driver::Error) -> bool {
+fn is_transient(err: &typedb_driver::Error, broke_off: bool) -> bool {
     match err {
         typedb_driver::Error::Connection(_) => true,
-        // The server refuses the name while it discards a broken-off import.
-        typedb_driver::Error::Server(_) => err.code() == IS_BEING_IMPORTED,
+        // The server refuses the name while it completes or discards this run's broken-off import.
+        typedb_driver::Error::Server(_) => broke_off && err.code() == IS_BEING_IMPORTED,
         _ => false,
     }
 }
@@ -199,17 +270,27 @@ fn prepare(source: &Source, schema_text: &str, spill_dir: &Path, memory_limit: O
 }
 
 // Consumes the migration so that DuckDB is closed, and its spill directory removed, before the caller exits.
-fn write_data_file(migration: Migration, path: &Path, original_database: &str) -> Result<(), String> {
+fn write_data_file(
+    migration: Migration,
+    path: &Path,
+    original_database: &str,
+    pulse: &Pulse,
+) -> Result<(Checksums, Duration), String> {
     let partial = PartialFile(partial_path(path));
     let started = Instant::now();
     let mut file =
         fs::File::create(&partial.0).map_err(|err| format!("failed to create '{}': {err}", partial.0.display()))?;
-    let checksums = migration.run(&mut file, VERSION.trim(), original_database)?;
+    let checksums = migration.run(&mut file, VERSION.trim(), original_database, &|message| pulse.say(&message))?;
     file.sync_all().map_err(|err| format!("failed to write '{}': {err}", partial.0.display()))?;
     fs::rename(&partial.0, path)
         .map_err(|err| format!("failed to move the data file into '{}': {err}", path.display()))?;
-    print_summary(&checksums, started.elapsed());
-    Ok(())
+    #[cfg(unix)]
+    if let Some(dir) = path.parent() {
+        fs::File::open(dir)
+            .and_then(|dir| dir.sync_all())
+            .map_err(|err| format!("failed to write '{}': {err}", dir.display()))?;
+    }
+    Ok((checksums, started.elapsed()))
 }
 
 struct PartialFile(PathBuf);
@@ -279,16 +360,16 @@ fn on_interrupt(spill_dir: PathBuf) -> Arc<Mutex<Cleanup>> {
         for path in &cleanup.leftovers {
             remove_if_exists(path);
         }
-        match &cleanup.phase {
-            Phase::Converting => println_error!("interrupted; nothing was loaded"),
-            Phase::Converted { kept_hint } => {
-                println_error!("interrupted before the import; nothing was loaded");
-                println!("{kept_hint}");
-            }
+        let (message, kept_hint) = match &cleanup.phase {
+            Phase::Converting => ("interrupted; nothing was loaded", None),
+            Phase::Converted { kept_hint } => ("interrupted before the import; nothing was loaded", Some(kept_hint)),
             Phase::Importing { kept_hint } => {
-                println_error!("interrupted during the import; the server discards the partial database");
-                println!("{kept_hint}");
+                ("interrupted during the import; the server discards the partial database", Some(kept_hint))
             }
+        };
+        let _ = writeln!(io::stderr(), "{} {message}", typedb_cli_common::format_error!("error:"));
+        if let Some(kept_hint) = kept_hint {
+            say(format_args!("{kept_hint}"));
         }
         exit_now(exit_code);
     });
@@ -303,6 +384,29 @@ fn exit_now(code: i32) -> ! {
     }
     let _ = io::stdout().flush();
     unsafe { _exit(code) }
+}
+
+fn claim(dir: &Path, database: &str) -> fs::File {
+    let path = dir.join(format!(".{database}.lock"));
+    let fail = |err: io::Error| -> ! {
+        fatal_with(
+            ExitCode::UserInputError,
+            format!(
+                "failed to create '{}': {err} (files are written next to the DuckDB file, or in --output-dir)",
+                path.display()
+            ),
+        )
+    };
+    let file =
+        fs::OpenOptions::new().create(true).truncate(false).write(true).open(&path).unwrap_or_else(|err| fail(err));
+    match file.try_lock() {
+        Ok(()) => file,
+        Err(fs::TryLockError::WouldBlock) => fatal_with(
+            ExitCode::UserInputError,
+            format!("another loader is preparing or importing '{database}' in '{}'", dir.display()),
+        ),
+        Err(fs::TryLockError::Error(err)) => fail(err),
+    }
 }
 
 fn output_data_path(dir: &Path, database: &str, overwrite: bool) -> PathBuf {
@@ -331,7 +435,10 @@ fn remove_if_exists(path: &Path) {
     match removed {
         Ok(()) => {}
         Err(err) if err.kind() == io::ErrorKind::NotFound => {}
-        Err(err) => println_warning!("failed to remove '{}': {err}", path.display()),
+        Err(err) => {
+            let warning = typedb_cli_common::format_warning!("warning:");
+            let _ = writeln!(io::stderr(), "{warning} failed to remove '{}': {err}", path.display());
+        }
     }
 }
 

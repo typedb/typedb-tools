@@ -41,7 +41,7 @@ impl OwnsMapping {
 
     pub(crate) fn projection(&self, table_alias: &str) -> String {
         let column = format!("{table_alias}.{}", quoted(&self.column));
-        if self.multi { self.list(&column) } else { self.read(&column) }
+        if self.multi { self.list(&column) } else { self.typed(&column) }
     }
 
     pub(crate) fn element(&self) -> String {
@@ -60,12 +60,19 @@ impl OwnsMapping {
     // integers as BIGINT (the checks have proven that they fit), doubles as DOUBLE, decimals at TypeDB's scale.
     // Intervals are read as text: DuckDB compares them normalised (1 month = 30 days), TypeDB does not.
     pub(crate) fn cast(&self) -> Option<String> {
-        match (&self.column_type, self.value_type) {
-            (ColumnType::StringLike | ColumnType::Interval, _) => Some("VARCHAR".to_owned()),
-            (ColumnType::Integer { .. }, ValueType::Integer) => Some("BIGINT".to_owned()),
-            (_, ValueType::Double) => Some("DOUBLE".to_owned()),
-            (_, ValueType::Decimal) => Some(format!("DECIMAL(38,{DECIMAL_FRACTIONAL_DIGITS})")),
-            _ => None,
+        if matches!(self.column_type, ColumnType::StringLike | ColumnType::Interval) {
+            return Some("VARCHAR".to_owned());
+        }
+        match self.value_type {
+            ValueType::Integer => matches!(self.column_type, ColumnType::Integer { .. }).then(|| "BIGINT".to_owned()),
+            ValueType::Double => Some("DOUBLE".to_owned()),
+            ValueType::Decimal => Some(format!("DECIMAL(38,{DECIMAL_FRACTIONAL_DIGITS})")),
+            ValueType::Boolean
+            | ValueType::String
+            | ValueType::Date
+            | ValueType::Datetime
+            | ValueType::DatetimeTz
+            | ValueType::Duration => None,
         }
     }
 }
@@ -574,24 +581,12 @@ fn infer_role(
             player.object.plays.iter().any(|plays| plays.role == relates.role && ancestry.contains(&plays.relation))
         })
         .collect();
-    let plays_none = played_roles.is_empty();
-    // Only the directive's bindings settle a role: inference must not depend on column order.
-    let candidate_roles: Vec<&Relates> = match played_roles.as_slice() {
-        [_] => played_roles,
-        _ => played_roles
-            .into_iter()
-            .filter(|relates| !target.bound_columns.iter().any(|(bound, _)| *bound == relates.role))
-            .collect(),
-    };
-    match candidate_roles.as_slice() {
+    // A column the directive does not bind is inferred only when its players play one role: several columns may
+    // bind one role, so a role the directive binds elsewhere settles nothing.
+    match played_roles.as_slice() {
         [relates] => roles.push(role_binding(relates, column, player_index, reference)),
-        [] if plays_none => diagnostics.error(format!(
-            "table '{}': column '{}' references '{}', whose type '{}' plays no role of relation '{relation}'",
-            target.table.name, column.name, player.table.name, player.object.label
-        )),
         [] => diagnostics.error(format!(
-            "table '{}': column '{}' references '{}', whose type '{}' plays only roles of relation '{relation}' \
-             that the directive binds to other columns",
+            "table '{}': column '{}' references '{}', whose type '{}' plays no role of relation '{relation}'",
             target.table.name, column.name, player.table.name, player.object.label
         )),
         _ => diagnostics.error(format!(
@@ -600,9 +595,9 @@ fn infer_role(
             target.table.name,
             column.name,
             player.object.label,
-            candidate_roles.len(),
+            played_roles.len(),
             quoted(&target.table.name),
-            candidate_roles.iter().map(|relates| format!("{} = <column>", relates.role)).collect::<Vec<_>>().join(", ")
+            played_roles.iter().map(|relates| format!("{} = <column>", relates.role)).collect::<Vec<_>>().join(", ")
         )),
     }
 }

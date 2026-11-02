@@ -6,7 +6,7 @@
 
 use std::{
     error::Error,
-    fs,
+    fs, io,
     path::{Path, PathBuf},
     process::Command,
     time::{Duration, Instant},
@@ -75,9 +75,11 @@ fn files_only_writes_the_data_file() -> Result<(), Box<dyn Error>> {
         stdout.contains(&format!("database import fixture {schema_path} ")),
         "no import hint referencing the original schema file: {stdout}"
     );
-    let written: Vec<_> =
-        fs::read_dir(dir.join("out"))?.map(|entry| entry.map(|entry| entry.file_name())).collect::<Result<_, _>>()?;
-    assert_eq!(written, ["fixture.data.typedb"], "only the data file is left: the schema is referenced, not copied");
+    assert_eq!(
+        file_names(&dir.join("out"))?,
+        [".fixture.lock", "fixture.data.typedb"],
+        "only the data file and the lock are left: the schema is referenced, not copied"
+    );
     let data = zstd::stream::decode_all(fs::File::open(dir.join("out/fixture.data.typedb"))?)?;
     let mut buf: &[u8] = &data;
     let mut count = 0;
@@ -240,14 +242,78 @@ fn checks_spill_into_an_output_directory_that_does_not_exist_yet() -> Result<(),
          CREATE TABLE person AS SELECT i::UBIGINT AS _iid, 'name' || i AS name FROM range(8000000) t(i);",
     )?;
     let out = dir.join("out/nested").to_string_lossy().into_owned();
-    let output = run_loader(&dir, &["--files-only", "--output-dir", &out, "--memory-limit", "128MiB"]);
+    let output = run_loader(&dir, &["--files-only", "--output-dir", &out, "--memory-limit", "256MiB"]);
     assert!(
         output.status.success(),
         "loader failed:\n{}\n{}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(dir.join("out/nested/fixture.data.typedb").exists());
+    assert_eq!(
+        file_names(&dir.join("out/nested"))?,
+        [".fixture.lock", "fixture.data.typedb"],
+        "the spill directory is removed"
+    );
     let _ = fs::remove_dir_all(&dir);
     Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn a_second_loader_for_the_same_database_and_directory_fails_fast() -> Result<(), Box<dyn Error>> {
+    let dir = setup("concurrent")?;
+    Connection::open(dir.join("fixture.duckdb"))?
+        .execute_batch("INSERT INTO person SELECT 10 + i, 'name' || i FROM range(2000000) t(i);")?;
+    let out = dir.join("out");
+    let mut first = loader_command(&dir, &["--files-only", "--output-dir", out.to_str().unwrap()]).spawn()?;
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !out.join(".fixture.lock").exists() {
+        assert!(first.try_wait()?.is_none(), "the first loader finished before the second started");
+        assert!(Instant::now() < deadline, "the first loader did not start in time");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let second = run_loader(&dir, &["--files-only", "--output-dir", out.to_str().unwrap()]);
+    assert_eq!(second.status.code(), Some(2), "{}", String::from_utf8_lossy(&second.stderr));
+    assert!(String::from_utf8_lossy(&second.stderr).contains("another loader is preparing or importing 'fixture'"));
+    assert!(first.wait()?.success(), "the first loader must not be disturbed");
+    assert!(out.join("fixture.data.typedb").exists());
+    let _ = fs::remove_dir_all(&dir);
+    Ok(())
+}
+
+#[test]
+fn what_a_dead_run_left_is_swept() -> Result<(), Box<dyn Error>> {
+    let dir = setup("stale")?;
+    let out = dir.join("out");
+    fs::create_dir_all(out.join(".fixture.tmp"))?;
+    fs::write(out.join(".fixture.tmp/duckdb_temp_storage-0.tmp"), b"spilled by a run that was killed")?;
+    fs::write(out.join(".fixture.data.typedb.partial"), b"half a file")?;
+    fs::write(out.join(".fixture.lock"), b"")?;
+    let output = run_loader(&dir, &["--files-only", "--output-dir", out.to_str().unwrap()]);
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert_eq!(file_names(&out)?, [".fixture.lock", "fixture.data.typedb"]);
+    let _ = fs::remove_dir_all(&dir);
+    Ok(())
+}
+
+#[test]
+fn an_existing_data_file_is_refused_before_the_checks() -> Result<(), Box<dyn Error>> {
+    let dir = setup("refused-early")?;
+    let out = dir.join("out");
+    fs::create_dir_all(&out)?;
+    fs::write(out.join("fixture.data.typedb"), b"an earlier file")?;
+    let output = run_loader(&dir, &["--files-only", "--output-dir", out.to_str().unwrap()]);
+    assert_eq!(output.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("pass --overwrite"));
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("Checked"), "refused only after the checks");
+    let _ = fs::remove_dir_all(&dir);
+    Ok(())
+}
+
+fn file_names(dir: &Path) -> io::Result<Vec<String>> {
+    let mut names: Vec<String> = fs::read_dir(dir)?
+        .map(|entry| entry.map(|entry| entry.file_name().to_string_lossy().into_owned()))
+        .collect::<Result<_, _>>()?;
+    names.sort();
+    Ok(names)
 }

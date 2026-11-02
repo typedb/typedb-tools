@@ -47,19 +47,25 @@ pub(crate) fn install_shutdown_handler() -> Arc<AtomicBool> {
 pub(crate) struct Termination {
     interrupt: tokio::signal::unix::Signal,
     terminate: tokio::signal::unix::Signal,
+    hangup: tokio::signal::unix::Signal,
 }
 
 #[cfg(unix)]
 impl Termination {
     pub(crate) fn listen() -> io::Result<Self> {
         use tokio::signal::unix::{SignalKind, signal};
-        Ok(Self { interrupt: signal(SignalKind::interrupt())?, terminate: signal(SignalKind::terminate())? })
+        Ok(Self {
+            interrupt: signal(SignalKind::interrupt())?,
+            terminate: signal(SignalKind::terminate())?,
+            hangup: signal(SignalKind::hangup())?,
+        })
     }
 
     pub(crate) async fn recv(&mut self) -> Option<i32> {
         tokio::select! {
             received = self.interrupt.recv() => received.map(|()| 130),
             received = self.terminate.recv() => received.map(|()| 143),
+            received = self.hangup.recv() => received.map(|()| 129),
         }
     }
 }

@@ -77,10 +77,11 @@ types take no table.
 ## Modelling
 
 Every mapped table identifies its rows by a column `_iid UBIGINT`, unique within its type,
-not null and below 2^63 (see [Ids](#ids)), and role columns reference it. The examples below declare these as
-keys (`PRIMARY KEY`, `REFERENCES`), which DuckDB enforces; the keys are optional, see
-[Keys are optional](#keys-are-optional). They also leave the attribute declarations out:
-every column name is an attribute of the matching name, e.g. `attribute name value string;`.
+not null and below 2^63 (see [Ids](#ids)), and role columns reference it. The examples
+below declare these as keys (`PRIMARY KEY`, `REFERENCES`), which DuckDB enforces; the keys
+are optional, see [Keys are optional](#keys-are-optional). They also leave the attribute
+declarations out: every column name is an attribute of the matching name, e.g. `attribute
+name value string;`.
 
 **An entity type is a table**; its columns are the attributes it owns. `NULL` is no
 ownership.
@@ -141,7 +142,9 @@ relation ownership, relates owner, relates owned;
 ```
 
 **Two roles played by one type** cannot be told apart by inference: bind the columns
-with a table directive.
+with a table directive. A directive settles only the columns it names: as several columns
+may bind one role, every other column whose players play more than one of the relation's
+roles is ambiguous and must be bound too.
 
 ```sql
 CREATE TABLE mentorship (
@@ -245,16 +248,16 @@ For data without natural 64-bit ids, `row_number() OVER ()` at staging time is a
 | DuckDB | TypeDB value | Notes |
 |---|---|---|
 | `BOOLEAN` | `boolean` | |
-| integer types | `integer` | `UBIGINT`/`HUGEINT` values must fit 64 bits; also accepted into `decimal` (exactly) and `double` (nearest double, as SQL converts) |
+| integer types | `integer` | `UBIGINT`/`HUGEINT` values must fit 64 bits; also accepted into `decimal` (exactly) and `double` (only values a double holds exactly) |
 | `FLOAT`/`DOUBLE` | `double` | finite values only; `FLOAT` widens exactly; `-0.0` is loaded as `0.0`, since DuckDB does not keep the two apart |
-| `DECIMAL(w,s)` | `decimal` | exact; `s ≤ 19`, integer part within 64 bits; also accepted into `double` (nearest double) |
+| `DECIMAL(w,s)` | `decimal` | exact; `s ≤ 19`, integer part within 64 bits; also accepted into `double` when the double, printed at the column's scale, reads back as the value, and no two distinct decimals of the attribute's columns make one double (`0.1` and `0.1000000000000000056` from a `DECIMAL(38,19)` column would) |
 | `VARCHAR`, `ENUM`, `UUID`, `JSON` | `string` | compared byte-wise, as in TypeDB, whatever the column's collation: `'Bob'` and `'BOB'` are distinct values |
 | `DATE` | `date` | finite, within TypeDB's range (years -262143 to 262142) |
 | `TIMESTAMP[_S/_MS/_NS]` | `datetime` | exact to the nanosecond; finite, within TypeDB's range. The columns of one attribute are read together in one type, so beside a `TIMESTAMP_NS` column, other timestamps must fit its range (years 1677 to 2262) |
 | `TIMESTAMPTZ` | `datetime-tz` | always UTC: DuckDB stores the instant, not the zone; keep the zone in a separate column if it is data |
 | `INTERVAL` | `duration` | months, days and nanoseconds map one to one, so `1 month` and `30 days` are distinct durations (DuckDB compares them equal); no negative components |
 | `BLOB`, `TIME`, `STRUCT`, `MAP`, `UNION` | — | rejected with a restructuring hint |
-| nested lists, other types | — | rejected |
+| `UHUGEINT`, fixed-size `ARRAY`, nested lists, other types | — | rejected; cast an `ARRAY` to a `LIST` |
 
 ## Keys are optional
 
@@ -292,13 +295,19 @@ tables with declared keys; for data of that size, staging without keys is the sa
 
 The loader limits DuckDB to half of the memory it detects by default (the machine's, or a
 container's limit), and DuckDB spills what does not fit to disk, next to the output
-(for `--dry-run`, in the system's temporary directory). `--memory-limit` sets another limit
-in DuckDB's syntax (`8GB`, `512MiB`); the conversion needs about one to two GB more for its
-own buffers, and a small limit runs DuckDB on fewer threads, one per 64 MB. Lower limits
-trade time for memory: a hundred million rows of 30 attributes each converted in 4m53s
-with the default limit and in 5m37s under 2 GB, a billion rows of three tables in 5m45s
-and in 6m30s under 4 GB. DuckDB's spills stay small beside the data file, whose size is
-about what the conversion needs on disk.
+(for `--dry-run`, in the system's temporary directory: set `TMPDIR` to a disk-backed
+directory if that is a RAM disk). `--memory-limit` sets another limit in DuckDB's syntax
+(`8GB`, `512MiB`), at least 256 MiB. DuckDB and the conversion run one thread per 64 MB of
+the limit, up to one per core, and the conversion needs about one to two GB more for its
+own buffers.
+
+On disk the conversion needs the data file's size, and, under a small memory limit, room
+for DuckDB's spills: up to about half the file again. With `--overwrite` the old
+file stays until the new one replaces it.
+
+A long run reports its progress: while it converts, every half minute, the table or
+attribute being read, its rows so far (and the table's total) and the bytes encoded; while
+it checks or DuckDB sorts, a line every minute with the time taken.
 
 ## What is checked, and what is the server's
 
@@ -356,12 +365,19 @@ Tables are written in name order, entity tables first. A relation that plays a r
 come after the relation it plays in; the import links such players once every relation is
 read. A one-shot load stages the data file as `<database>.data.typedb` next to the DuckDB
 file, or in `--output-dir`, and removes it once the import has succeeded; `--files-only`
-writes it without importing. Either way an existing file is refused unless `--overwrite` is
-passed. The file is written under a temporary name and renamed on completion, and an
-interrupted conversion (Ctrl+C or SIGTERM) removes it. The import starts once the file is
-complete; if the connection opened at the start did not survive the conversion, the loader
-reconnects (up to twelve attempts, ten seconds apart) and starts the import over, and a
-retry that finds the database already created reports that the earlier attempt completed.
-If the import still fails, or the run is interrupted after the file is complete, the file is
-kept and the loader prints the `typedb console` command that imports it, so the conversion
-need not be repeated.
+writes it without importing. Either way an existing file is refused unless `--overwrite`
+is passed, before the checks begin, as are a server that cannot be reached and a database
+that already exists. One loader at a time prepares a database in a directory: a lock,
+`.<database>.lock`, makes a second one fail at once; the lock file stays, and what a run
+that died left (its spill directory `.<database>.tmp` and partial file) is removed by the
+next. The file is written under a temporary name and renamed on completion, and an
+interrupted conversion (Ctrl+C, SIGTERM or SIGHUP) removes it. The import starts once the
+file is complete; if the connection opened at the start did not survive the conversion,
+the loader reconnects (up to twelve attempts, ten seconds apart) and starts the import
+over. Once an attempt has lost its connection, a database that is being imported or
+already exists may be that attempt's: the loader waits for the first; for the second it
+keeps the file until the database has been checked and exits with code 3, as it cannot
+confirm the import. Before any attempt has broken off, both mean another import of the
+name, and the loader fails. If the import still fails, or the run is interrupted after the
+file is complete, the file is kept and the loader prints the `typedb console` command that
+imports it, so the conversion need not be repeated.
