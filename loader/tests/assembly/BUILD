@@ -13,7 +13,10 @@ rust_test(
         "test_loader.rs",
     ],
     deps = [
-        "//tool/runner:typedb_binary_runner"
+        "//tool/runner:typedb_binary_runner",
+
+        # External dependencies
+        "@crates//:duckdb",
     ],
     env = select({
         "@typedb_bazel_distribution//platform:is_linux_x86_64" : {

@@ -223,6 +223,60 @@ fn loader_loads_relation_match_insert() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+#[test]
+fn loader_imports_a_duckdb_database() -> Result<(), Box<dyn Error>> {
+    ensure_typedb_server();
+
+    let database = "loader-test-duckdb-db";
+    let dir = env::temp_dir().join(format!("typedb-loader-duckdb-test-{}", std::process::id()));
+    fs::create_dir_all(&dir)?;
+    let duckdb_path = dir.join("people.duckdb");
+    duckdb::Connection::open(&duckdb_path)?.execute_batch(
+        "CREATE TABLE person (_iid UBIGINT PRIMARY KEY, name VARCHAR NOT NULL, nickname VARCHAR[]);
+         CREATE TABLE friendship (_iid UBIGINT, a UBIGINT, b UBIGINT);
+         COMMENT ON TABLE friendship IS '@typedb relation friendship (friend = a, friend = b)';
+         COMMENT ON COLUMN friendship.a IS '@typedb references person';
+         COMMENT ON COLUMN friendship.b IS '@typedb references person';
+         INSERT INTO person SELECT i, 'person ' || i, CASE WHEN i % 3 = 0 THEN ['p' || i, 'q'] END FROM range(1000) t(i);
+         INSERT INTO friendship SELECT i, i, (i + 1) % 1000 FROM range(1000) t(i);",
+    )?;
+    let schema_path = dir.join("schema.tql");
+    fs::write(
+        &schema_path,
+        "define attribute name, value string; attribute nickname, value string;
+         entity person, owns name @card(1), owns nickname @card(0..), plays friendship:friend;
+         relation friendship, relates friend @card(2);",
+    )?;
+    let (duckdb_path, schema_path) = (duckdb_path.to_string_lossy(), schema_path.to_string_lossy());
+
+    let loader_runner = TypeDBBinaryRunner::new(TYPEDB_LOADER_ARCHIVE_VAR, TYPEDB_LOADER_SUBCOMMAND)
+        .expect("Failed to create loader binary runner");
+    let args = [
+        "--duckdb",
+        &duckdb_path,
+        "--schema-file",
+        &schema_path,
+        "--database",
+        database,
+        "--address",
+        SERVER_ADDRESS,
+        "--username",
+        ADMIN_USERNAME,
+        "--password",
+        ADMIN_PASSWORD,
+        "--tls-disabled",
+    ];
+    // The import verifies the file's checksums against what it imported.
+    let status = loader_runner.run(&args)?.wait()?.code().unwrap_or(-1);
+    assert_eq!(status, 0, "the DuckDB load failed");
+    assert!(!dir.join(format!("{database}.data.typedb")).exists(), "the data file outlived its import");
+    // The import created the database, so a second load is refused.
+    let status = loader_runner.run(&args)?.wait()?.code().unwrap_or(-1);
+    assert_eq!(status, 2, "a load into an existing database must fail");
+    let _ = fs::remove_dir_all(&dir);
+    Ok(())
+}
+
 // A single TypeDB server is shared across every test in this binary: each test uses a distinct
 // database name, and starting one server per test would race on the hardcoded port 1729.
 // The runner (which owns the unpacked distribution's temp dir) and the child are leaked so they
