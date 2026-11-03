@@ -392,7 +392,10 @@ pub(crate) fn resolve(catalog: &Catalog, schema: &Schema, diagnostics: &mut Diag
         });
     }
 
-    unmapped_schema_warnings(&plan, schema, diagnostics);
+    // Types the errors leave unmapped would only repeat them.
+    if diagnostics.errors.is_empty() {
+        unmapped_schema_warnings(&plan, schema, diagnostics);
+    }
     plan
 }
 
@@ -722,10 +725,10 @@ fn bind_owns(
         ColumnType::List(element) => (element.as_ref(), true),
         other => (other, false),
     };
-    if let ColumnType::Unsupported { type_name, hint } = element_type {
+    if let ColumnType::Unsupported { hint } = element_type {
         diagnostics.error(format!(
-            "table '{}': column '{}' has unsupported type {type_name}: {hint}",
-            target.table.name, column.name
+            "table '{}': column '{}' has unsupported type {}: {hint}",
+            target.table.name, column.name, column.raw_type
         ));
         return;
     }
@@ -747,13 +750,18 @@ fn bind_owns(
         return;
     }
     if !is_compatible(element_type, value_type) {
+        let reason = match element_type {
+            ColumnType::Varchar | ColumnType::StringLike => "the loader never parses text into values",
+            _ => "the types are incompatible",
+        };
         diagnostics.error(format!(
-            "table '{}': column '{}' ({}) cannot populate attribute '{attribute_label}' (value type \
-             '{}'): the types are incompatible, and the loader never parses text into values",
+            "table '{}': column '{}' ({}) cannot populate attribute '{attribute_label}' (value type '{}'): {reason}; \
+             stage the column as {}",
             target.table.name,
             column.name,
             column.raw_type,
-            value_type.name()
+            value_type.name(),
+            staged_type(value_type)
         ));
         return;
     }
@@ -777,9 +785,23 @@ fn is_compatible(column_type: &ColumnType, value_type: ValueType) -> bool {
         ColumnType::Varchar | ColumnType::StringLike => value_type == V::String,
         ColumnType::Date => value_type == V::Date,
         ColumnType::Timestamp { .. } => value_type == V::Datetime,
-        ColumnType::TimestampTz => value_type == V::DatetimeTz,
+        ColumnType::TimestampTz { .. } => value_type == V::DatetimeTz,
         ColumnType::Interval => value_type == V::Duration,
         ColumnType::List(_) | ColumnType::Unsupported { .. } => false,
+    }
+}
+
+fn staged_type(value_type: ValueType) -> &'static str {
+    match value_type {
+        ValueType::Boolean => "BOOLEAN",
+        ValueType::Integer => "BIGINT",
+        ValueType::Double => "DOUBLE",
+        ValueType::Decimal => "DECIMAL",
+        ValueType::String => "VARCHAR",
+        ValueType::Date => "DATE",
+        ValueType::Datetime => "TIMESTAMP",
+        ValueType::DatetimeTz => "TIMESTAMPTZ",
+        ValueType::Duration => "INTERVAL",
     }
 }
 

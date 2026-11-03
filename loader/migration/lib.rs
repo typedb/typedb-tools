@@ -135,6 +135,9 @@ impl Migration {
 fn open_duckdb(path: &Path, spill_dir: &Path) -> Result<Connection, PrepareError> {
     Config::default()
         .access_mode(AccessMode::ReadOnly)
+        // An extension loaded mid-run would change what the generated columns read after the checks.
+        .and_then(|config| config.with("autoinstall_known_extensions", "false"))
+        .and_then(|config| config.with("autoload_known_extensions", "false"))
         .and_then(|config| config.with("temp_directory", spill_dir.to_string_lossy()))
         // No scan depends on the order of its rows; preserving it would keep DuckDB from spilling.
         .and_then(|config| config.with("preserve_insertion_order", "false"))
@@ -173,7 +176,8 @@ fn limit_memory(connection: &Connection, memory_limit: Option<&str>) -> Result<S
     if let Some(bytes) = size_in_bytes(&limit) {
         if bytes < MEMORY_FLOOR {
             return Err(PrepareError::Setup(format!(
-                "the memory limit {limit} is too small: the conversion needs at least 256 MiB"
+                "the memory limit {limit} is too small: the conversion needs at least {} MiB",
+                MEMORY_FLOOR >> 20
             )));
         }
         let threads: i64 = connection
@@ -230,6 +234,20 @@ mod test {
         assert!(halved.abs_diff(expected) < 64 << 20, "{halved} vs {expected}");
         assert_eq!(limit_memory(&connection, Some("256MiB")).unwrap(), "256.0 MiB");
         assert!(matches!(limit_memory(&connection, Some("lots")), Err(PrepareError::Setup(_))));
+    }
+
+    #[test]
+    fn the_source_is_read_without_extensions() {
+        let path = std::env::temp_dir().join(format!("typedb-migration-extensions-{}.duckdb", std::process::id()));
+        drop(Connection::open(&path).unwrap());
+        let connection = open_duckdb(&path, &std::env::temp_dir()).unwrap();
+        for setting in ["autoinstall_known_extensions", "autoload_known_extensions"] {
+            let enabled: bool =
+                connection.query_row(&format!("SELECT current_setting('{setting}')"), [], |row| row.get(0)).unwrap();
+            assert!(!enabled, "{setting}");
+        }
+        drop(connection);
+        let _ = fs::remove_file(&path);
     }
 
     #[test]

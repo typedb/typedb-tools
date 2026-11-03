@@ -126,7 +126,21 @@ impl Schema {
             schema.apply(declaration)?;
         }
         schema.resolve_inheritance()?;
+        schema.check_labels()?;
         Ok(schema)
+    }
+
+    // The server's TypeQL refuses reserved keywords as labels, though its parser reads them.
+    fn check_labels(&self) -> Result<(), String> {
+        let mut labels = self.attributes.iter().map(|attribute| &attribute.label).chain(
+            self.entities.iter().chain(&self.relations).flat_map(|object| {
+                std::iter::once(&object.label).chain(object.relates.iter().map(|relates| &relates.role))
+            }),
+        );
+        match labels.find(|label| typeql::is_reserved_keyword(label)) {
+            Some(label) => Err(format!("'{label}' is a reserved TypeQL keyword, which TypeDB refuses as a label")),
+            None => Ok(()),
+        }
     }
 
     fn register(&mut self, declaration: &typeql::schema::definable::Type) -> Result<(), String> {

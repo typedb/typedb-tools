@@ -25,12 +25,17 @@ const LARGE_KEYED_ROWS: u64 = 100_000_000;
 // which DuckDB answers far faster than the conversion runs. The schema's constraints are the server's to
 // enforce at import.
 pub(crate) fn check_data(conn: &Connection, plan: &MappingPlan, diagnostics: &mut Diagnostics) {
-    // An attribute read from a TIMESTAMP_NS column anywhere is read in nanoseconds from every column.
+    // An attribute read from a nanosecond column anywhere is read in nanoseconds from every column.
     let nanosecond_attributes: HashSet<&str> = plan
         .tables
         .iter()
         .flat_map(|table| table.owns.iter())
-        .filter(|owns| owns.column_type == ColumnType::Timestamp { nanoseconds: true })
+        .filter(|owns| {
+            matches!(
+                owns.column_type,
+                ColumnType::Timestamp { nanoseconds: true } | ColumnType::TimestampTz { nanoseconds: true }
+            )
+        })
         .map(|owns| owns.attribute.as_str())
         .collect();
     let mut decimals_by_double: Vec<(&str, Vec<DecimalSource<'_>>)> = Vec::new();
@@ -48,14 +53,31 @@ pub(crate) fn check_data(conn: &Connection, plan: &MappingPlan, diagnostics: &mu
             }
         }
     }
+    let referenced: HashSet<usize> = plan
+        .tables
+        .iter()
+        .flat_map(|table| table.roles())
+        .filter(|role| role.verify_reference)
+        .map(|role| role.player)
+        .collect();
+    let progressions: Vec<Option<Progression>> = plan
+        .tables
+        .iter()
+        .enumerate()
+        .map(|(index, table)| {
+            let checked_alone = !table.declared_ids.unique
+                && plan.tables.iter().filter(|other| other.type_label == table.type_label).count() == 1;
+            (checked_alone || referenced.contains(&index)).then(|| progression(conn, table)).flatten()
+        })
+        .collect();
     let mut keyed_rows = Vec::new();
-    check_ids_within_types(conn, plan, diagnostics);
+    check_ids_within_types(conn, plan, &progressions, diagnostics);
     for table in &plan.tables {
         check_instance_ids(conn, table, diagnostics);
         if let TableKind::Relation { roles } = &table.kind {
             check_playerless_rows(conn, table, roles, diagnostics);
             for role in roles.iter().filter(|role| role.verify_reference) {
-                check_reference(conn, table, role, &plan.tables[role.player], diagnostics);
+                check_reference(conn, table, role, &plan.tables[role.player], progressions[role.player], diagnostics);
             }
         }
         if let Some(rows) = table.declares_keys.then(|| row_count(conn, table)).flatten() {
@@ -121,21 +143,80 @@ fn check_instance_ids(conn: &Connection, table: &TableMapping, diagnostics: &mut
     }
 }
 
+// Ids that run `first, first + step, ...` in row order, as numbering the rows with `row_number()` makes them, are
+// distinct and present, and a value is one of them exactly when it is on the progression: such ids, and the
+// references to them, are checked by a scan each instead of a GROUP BY or an ANTI JOIN.
+#[derive(Clone, Copy)]
+struct Progression {
+    first: u64,
+    last: u64,
+    step: u64,
+}
+
+fn progression(conn: &Connection, table: &TableMapping) -> Option<Progression> {
+    let (iid, name) = (quoted(IID_COLUMN), quoted(&table.name));
+    let shadowed: bool = conn
+        .query_row(
+            "SELECT count(*) > 0 FROM duckdb_columns() \
+             WHERE schema_name = 'main' AND table_name = ? AND lower(column_name) = 'rowid'",
+            [&table.name],
+            |row| row.get(0),
+        )
+        .ok()?;
+    if shadowed {
+        return None;
+    }
+    let (rows, ids, first, last, first_row): (u64, u64, Option<u64>, Option<u64>, Option<i64>) = conn
+        .query_row(
+            &format!("SELECT count(*)::UBIGINT, count({iid})::UBIGINT, min({iid}), max({iid}), min(rowid) FROM {name}"),
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+        )
+        .ok()?;
+    let (first, last, first_row) = (first?, last?, first_row?);
+    let step = match rows {
+        _ if ids != rows => return None,
+        1 => 1,
+        _ => {
+            let span = last - first;
+            (span > 0 && span % (rows - 1) == 0).then(|| span / (rows - 1))?
+        }
+    };
+    // An error, such as an overflow from ids that are no progression, leaves the ids to the general checks.
+    let off_progression: u64 = conn
+        .query_row(
+            &format!(
+                "SELECT count(*)::UBIGINT FROM (SELECT 1 FROM {name} \
+                 WHERE {iid} - {first} <> {step} * (rowid - {first_row})::UBIGINT LIMIT 1)"
+            ),
+            [],
+            |row| row.get(0),
+        )
+        .ok()?;
+    (off_progression == 0).then_some(Progression { first, last, step })
+}
+
 // An `_iid` is unique within its type, also across the tables mapped to the type: one GROUP BY per type, which a
-// single table with a declared unique `_iid` does not need.
-fn check_ids_within_types(conn: &Connection, plan: &MappingPlan, diagnostics: &mut Diagnostics) {
+// single table with a declared unique `_iid`, or with ids on a progression, does not need.
+fn check_ids_within_types(
+    conn: &Connection,
+    plan: &MappingPlan,
+    progressions: &[Option<Progression>],
+    diagnostics: &mut Diagnostics,
+) {
     let iid = quoted(IID_COLUMN);
-    let mut by_type: Vec<(&str, Vec<&TableMapping>)> = Vec::new();
-    for table in &plan.tables {
+    let mut by_type: Vec<(&str, Vec<usize>)> = Vec::new();
+    for (index, table) in plan.tables.iter().enumerate() {
         match by_type.iter_mut().find(|(label, _)| *label == table.type_label) {
-            Some((_, tables)) => tables.push(table),
-            None => by_type.push((&table.type_label, vec![table])),
+            Some((_, tables)) => tables.push(index),
+            None => by_type.push((&table.type_label, vec![index])),
         }
     }
-    for (label, tables) in by_type {
-        let subject = match tables.as_slice() {
-            [table] if table.declared_ids.unique => continue,
-            [table] => format!("table '{}'", table.name),
+    for (label, indices) in by_type {
+        let tables: Vec<&TableMapping> = indices.iter().map(|&index| &plan.tables[index]).collect();
+        let subject = match (tables.as_slice(), indices.as_slice()) {
+            ([table], [index]) if table.declared_ids.unique || progressions[*index].is_some() => continue,
+            ([table], _) => format!("table '{}'", table.name),
             _ => {
                 let names: Vec<String> = tables.iter().map(|table| format!("'{}'", table.name)).collect();
                 format!("tables {} mapped to '{label}'", names.join(", "))
@@ -162,20 +243,28 @@ fn check_reference(
     table: &TableMapping,
     role: &RoleBinding,
     player: &TableMapping,
+    progression: Option<Progression>,
     diagnostics: &mut Diagnostics,
 ) {
-    let (iid, column) = (quoted(IID_COLUMN), quoted(&role.column));
+    let (iid, column, name) = (quoted(IID_COLUMN), quoted(&role.column), quoted(&table.name));
+    let violations = match progression {
+        Some(Progression { first, last, step }) => format!(
+            "SELECT t.{column} AS example FROM {name} t WHERE t.{column} IS NOT NULL \
+             AND NOT (t.{column} BETWEEN {first} AND {last} AND t.{column} % {step} = {})",
+            first % step
+        ),
+        None => format!(
+            "SELECT t.{column} AS example FROM {name} t ANTI JOIN {} p ON t.{column} = p.{iid} \
+             WHERE t.{column} IS NOT NULL",
+            quoted(&player.name)
+        ),
+    };
     Check {
         subject: format!("table '{}': column '{}' (references '{}')", table.name, role.column, player.name),
         unit: "row(s)",
         predicate: "hold a value that is no _iid of the referenced table",
         example: "value",
-        violations: format!(
-            "SELECT t.{column} AS example FROM {} t ANTI JOIN {} p ON t.{column} = p.{iid} \
-             WHERE t.{column} IS NOT NULL",
-            quoted(&table.name),
-            quoted(&player.name)
-        ),
+        violations,
     }
     .report(conn, diagnostics);
 }
@@ -200,7 +289,15 @@ impl Check {
         );
         let read = conn.query_row(&sql, [], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get(2)?)));
         match read {
-            Err(err) => diagnostics.error(format!("{}: could not be checked: {err}", self.subject)),
+            Err(err) => {
+                let err = err.to_string();
+                let hint = if err.contains("Extension") {
+                    " (the loader loads no DuckDB extensions: materialise the columns that need one when staging)"
+                } else {
+                    ""
+                };
+                diagnostics.error(format!("{}: could not be checked: {err}{hint}", self.subject))
+            }
             Ok((count, nulls, examples)) if count > 0 => {
                 let examples: String = examples;
                 let examples = match (examples.is_empty(), nulls > 0) {
@@ -294,6 +391,11 @@ fn check_value_domain(
     diagnostics: &mut Diagnostics,
 ) {
     let to_double = owns.value_type == ValueType::Double;
+    let read_in_nanoseconds = nanoseconds
+        && matches!(
+            owns.column_type,
+            ColumnType::Timestamp { nanoseconds: false } | ColumnType::TimestampTz { nanoseconds: false }
+        );
     let (predicate, condition) = match &owns.column_type {
         ColumnType::Integer { .. } if !owns.column_type.fits_i64() && !to_double => (
             "hold an integer that does not fit TypeDB's 64-bit integer",
@@ -324,15 +426,19 @@ fn check_value_domain(
                  {MAX_EPOCH_DAYS} END"
             ),
         ),
-        ColumnType::Timestamp { nanoseconds: false } if nanoseconds => (
-            "hold a timestamp outside the nanosecond range that the attribute's TIMESTAMP_NS columns impose",
+        _ if read_in_nanoseconds => (
+            "hold a timestamp outside the nanosecond range that the attribute's nanosecond columns impose",
             format!(
                 "CASE WHEN isinf(e) THEN true ELSE epoch_us(e) NOT BETWEEN {} AND {} END",
                 i64::MIN / 1000,
                 i64::MAX / 1000
             ),
         ),
-        ColumnType::Timestamp { .. } | ColumnType::TimestampTz => (
+        // Nanoseconds since 1970 in 64 bits are within TypeDB's range, and `isinf` takes no TIMESTAMPTZ_NS.
+        ColumnType::TimestampTz { nanoseconds: true } => {
+            ("hold a timestamp that is infinite", "isinf(e::TIMESTAMPTZ)".to_owned())
+        }
+        ColumnType::Timestamp { .. } | ColumnType::TimestampTz { nanoseconds: false } => (
             "hold a timestamp that is infinite or outside TypeDB's datetime range",
             format!(
                 "CASE WHEN isinf(e) THEN true ELSE epoch_us(e) NOT BETWEEN {} AND {} END",

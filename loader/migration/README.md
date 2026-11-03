@@ -1,383 +1,199 @@
 # Loading DuckDB databases into TypeDB
 
-`typedb loader --duckdb` migrates a DuckDB database into TypeDB: it maps the tables onto a
-hand-written TypeDB schema, converts the data to the server's import format and imports
-it, in one run. The schema's constraints are enforced by the server at import. The DuckDB
-file is opened read-only.
+`typedb loader --duckdb` maps the tables of a DuckDB file onto a TypeDB schema that you write, checks the data,
+converts it to the server's import format and imports it. The DuckDB file is opened read-only. The server enforces
+the schema's constraints at import.
 
 ```bash
-# load into a server
-typedb loader --duckdb my-data.duckdb --schema-file my-schema.tql \
-  --database mydb --address localhost:1729 --username admin
+# convert and import; the database must not exist yet, and --database defaults to the file's stem
+typedb loader --duckdb data.duckdb --schema-file schema.tql --database mydb --address localhost:1729 --username admin
 
-# check the mapping and convert without writing or loading anything
-typedb loader --duckdb my-data.duckdb --schema-file my-schema.tql --dry-run
+# check and convert, writing nothing
+typedb loader --duckdb data.duckdb --schema-file schema.tql --dry-run
 
-# write the data file instead of loading (offline; --overwrite replaces an existing file)
-typedb loader --duckdb my-data.duckdb --schema-file my-schema.tql --database mydb --files-only --output-dir out/
-# → out/mydb.data.typedb, importable together with the original schema file:
-#   typedb console --command="database import mydb my-schema.tql out/mydb.data.typedb"
+# write out/mydb.data.typedb without importing it (--overwrite replaces an existing file), and import it later
+typedb loader --duckdb data.duckdb --schema-file schema.tql --database mydb --files-only --output-dir out/
+typedb console --command="database import mydb schema.tql out/mydb.data.typedb"
 ```
 
-The file is opened as a DuckDB database whatever its extension. The
-target database is created by the import and must not exist yet; `--database` defaults to
-the file's stem.
+## Staging other sources
 
-## Starting from CSV, Parquet, SQLite, Postgres, MySQL, ...
-
-The loader reads one format, DuckDB, and DuckDB reads most others, so any source is a
-few SQL statements away. The staged `.duckdb` file is then a queryable record of exactly
-what gets imported:
+The loader reads DuckDB files only; DuckDB reads most other formats:
 
 ```sql
--- CSV / Parquet / JSON: declare the table (ids and keys), then load into it
-CREATE TABLE person (_iid UBIGINT PRIMARY KEY, name VARCHAR NOT NULL, age INTEGER);
-INSERT INTO person FROM 'people.csv';          -- read_parquet(...) / read_json(...) likewise
+CREATE TABLE person (_iid UBIGINT, name VARCHAR, age INTEGER);
+INSERT INTO person SELECT row_number() OVER (), name, age FROM 'people.csv';  -- or read_parquet(), read_json()
 
--- SQLite file (live Postgres / MySQL likewise: INSTALL postgres; ATTACH 'dbname=... host=...')
-INSTALL sqlite; LOAD sqlite;
-ATTACH 'app.db' AS src (TYPE sqlite);
-CREATE TABLE person (_iid UBIGINT PRIMARY KEY, id BIGINT NOT NULL, name VARCHAR);
-INSERT INTO person SELECT id, id, name FROM src.person;
+ATTACH 'app.db' AS src (TYPE sqlite);                                          -- or postgres, mysql
+CREATE TABLE company AS SELECT id::UBIGINT AS _iid, name FROM src.company;
+```
+
+Copied tables carry no keys. Either create the tables with their keys and insert into them, or mark each role column
+`@typedb references <table>` and let the loader check what the keys would guarantee ([Keys](#keys-are-optional)).
+A non-negative integer primary key can serve as `_iid`; the foreign key columns then already hold `_iid` values.
+
+## DuckDB versions
+
+The loader links DuckDB 2.0.0, pinned exactly, and reads files written by DuckDB 0.9 to 2.0 (tested: 0.9.2, 0.10.3,
+1.0 to 1.5, 2.0). Directives need `COMMENT ON`, which arrived in DuckDB 0.10. A file written by a later DuckDB may use
+a storage version that 2.0 cannot read, and fails to open: "created with a newer version of DuckDB". The later DuckDB
+can write a copy that the loader reads, with its tables, keys and comments:
+
+```sql
+ATTACH 'data.duckdb' AS src (READ_ONLY);
+ATTACH 'for-loader.duckdb' AS dst (STORAGE_VERSION 'v2.0.0');
+COPY FROM DATABASE src TO dst;
+```
+
+The loader loads no DuckDB extension, so generated columns are computed without one: time zone conversions in UTC,
+and a column that needs an extension fails to read. Materialise such columns when staging.
+
+## Mapping
+
+The schema is a single `define` query. The loader matches by name and does not guess:
+
+- A table maps to the entity or relation type of its name, a column to the attribute of its name. Names match
+  exactly, or with `_` read as `-` (`country_code` matches `country-code`).
+- A table or column without a counterpart in the schema is an error; `@typedb skip` leaves it out. A schema type
+  without a source is a warning.
+- Only tables of DuckDB's `main` schema are read. Views and other schemas are reported and left out.
+- Labels that are TypeQL keywords (`from`, `end`, `in`, ...) are refused, as the server refuses them.
+
+Every mapped table has a column `_iid UBIGINT`: the row's instance id, unique within its type, present, and below
+2^63 ([Ids](#ids)).
+
+- **An entity type is a table.** Its columns are the attributes it owns; `NULL` is no ownership. A `LIST` column is
+  a multi-valued attribute: repeated elements are one ownership, `NULL` elements none.
+- **A relation type is a table** with one column per role, holding the players' `_iid`s. A `FOREIGN KEY` to the
+  player table's `_iid`, or `@typedb references <table>`, names the player table, and the role is the one that the
+  player's type plays in the relation. The other columns are the relation's attributes.
+- **Several columns may bind one role**, one per player table for instance; a row's players are the distinct
+  non-`NULL` values. When a player's type plays several roles of the relation, the table directive binds the columns.
+- **A relation playing a role** is a column referencing the relation table's `_iid`.
+- **Subtypes take tables of their own**, abstract types none. An instance belongs to one table, and a reference names
+  one table: a role open to subtypes takes a column per table. Subtypes inherit ownerships and roles.
+- **Several tables may map to one type** with a directive; their `_iid`s must differ.
+- **A reference on an entity table** has no TypeDB form: stage the relation as its own table and skip the column.
+- **`_iid` is not data**: it is not queryable after the import. Keep the ids you query by as ordinary columns, such
+  as `owns id @key`.
+
+```sql
+CREATE TABLE person (_iid UBIGINT PRIMARY KEY, name VARCHAR NOT NULL, nickname VARCHAR[]);
 CREATE TABLE company (_iid UBIGINT PRIMARY KEY, name VARCHAR);
-INSERT INTO company SELECT id, name FROM src.company;
-CREATE TABLE employment (
-    _iid UBIGINT PRIMARY KEY,
-    person_id UBIGINT NOT NULL REFERENCES person(_iid),
-    company_id UBIGINT NOT NULL REFERENCES company(_iid)
-);
-INSERT INTO employment SELECT row_number() OVER (), person_id, company_id FROM src.employment;
-```
-
-File readers and database scanners do not carry constraints over: a copied table arrives
-without its primary and foreign keys. Either declare them by creating each table with its
-keys and inserting into it, as above, or copy the tables without keys and mark each role
-column `@typedb references <table>`, which has the loader check what the keys would
-guarantee; for large data the latter stages within little memory (see
-[Keys are optional](#keys-are-optional)). When the source's primary key is a non-negative
-integer, use it as `_iid` too: the source's foreign key columns then already hold `_iid`
-values.
-
-## The TypeDB schema is the source of truth
-
-You write the TypeDB schema (`.tql`, a single `define` query). The loader maps tables and
-columns onto it by name and refuses to guess:
-
-- Anything in **DuckDB without a schema counterpart is an error**: an unmapped table or
-  column fails the run, unless marked `@typedb skip`.
-- Anything in the **schema without a DuckDB counterpart is a warning**: those types
-  produce no instances.
-
-Table and column names match exactly (case included), or with `_` read as `-`
-(`country_code` matches `country-code`); names given in directives are taken as written.
-Only tables of DuckDB's `main` schema are read: views and other schemas
-are reported and skipped. Subtypes inherit ownerships and roles as on the server; abstract
-types take no table.
-
-## Modelling
-
-Every mapped table identifies its rows by a column `_iid UBIGINT`, unique within its type,
-not null and below 2^63 (see [Ids](#ids)), and role columns reference it. The examples
-below declare these as keys (`PRIMARY KEY`, `REFERENCES`), which DuckDB enforces; the keys
-are optional, see [Keys are optional](#keys-are-optional). They also leave the attribute
-declarations out: every column name is an attribute of the matching name, e.g. `attribute
-name value string;`.
-
-**An entity type is a table**; its columns are the attributes it owns. `NULL` is no
-ownership.
-
-```sql
-CREATE TABLE person (_iid UBIGINT PRIMARY KEY, name VARCHAR NOT NULL, age INTEGER);
-```
-```typeql
-entity person, owns name @card(1), owns age;
-```
-
-**A multi-valued attribute is a LIST column.** Ownerships are a set: repeated elements are
-one attribute, `NULL` elements are nothing, and order is lost.
-
-```sql
-CREATE TABLE person (_iid UBIGINT PRIMARY KEY, nickname VARCHAR[]);
-```
-```typeql
-entity person, owns nickname @card(0..);
-```
-
-**A relation type is a table too**, with one column per role referencing the player
-table's `_iid`, by a foreign key or a `references` directive (composite foreign keys are
-not recognised: give the referenced table an `_iid`). The role is inferred from the role
-the player's type plays. The other columns are the relation's own attributes.
-
-```sql
 CREATE TABLE employment (
     _iid UBIGINT PRIMARY KEY,
     person_id UBIGINT NOT NULL REFERENCES person(_iid),
     company_id UBIGINT NOT NULL REFERENCES company(_iid),
     salary DECIMAL(12,2)
 );
-```
-```typeql
-entity person, plays employment:employee;
-entity company, plays employment:employer;
-relation employment, relates employee, relates employer, owns salary;
-```
-
-**Several columns may bind one role**, one per player table for instance. A row's
-players in the role are the distinct non-`NULL` values of those columns, within the role's
-`@card`, which the server enforces.
-
-```sql
-CREATE TABLE ownership (
-    _iid UBIGINT PRIMARY KEY,
-    person_id UBIGINT REFERENCES person(_iid),      -- owner: a person ...
-    company_id UBIGINT REFERENCES company(_iid),    -- ... or a company (one of the two)
-    car_id UBIGINT NOT NULL REFERENCES car(_iid)
-);
-```
-```typeql
-entity person, plays ownership:owner;
-entity company, plays ownership:owner;
-entity car, plays ownership:owned;
-relation ownership, relates owner, relates owned;
-```
-
-**Two roles played by one type** cannot be told apart by inference: bind the columns
-with a table directive. A directive settles only the columns it names: as several columns
-may bind one role, every other column whose players play more than one of the relation's
-roles is ambiguous and must be bound too.
-
-```sql
-CREATE TABLE mentorship (
-    _iid UBIGINT PRIMARY KEY,
-    mentor_id UBIGINT NOT NULL REFERENCES person(_iid),
-    student_id UBIGINT NOT NULL REFERENCES person(_iid)
-);
+CREATE TABLE mentorship (_iid UBIGINT, mentor_id UBIGINT, student_id UBIGINT);  -- without keys
 COMMENT ON TABLE mentorship IS '@typedb relation mentorship (mentor = mentor_id, student = student_id)';
+COMMENT ON COLUMN mentorship.mentor_id IS '@typedb references person';
+COMMENT ON COLUMN mentorship.student_id IS '@typedb references person';
 ```
+
 ```typeql
-entity person, plays mentorship:mentor, plays mentorship:student;
-relation mentorship, relates mentor, relates student;
+define
+  attribute name, value string;
+  attribute nickname, value string;
+  attribute salary, value decimal;
+  entity person, owns name @card(1), owns nickname @card(0..),
+    plays employment:employee, plays mentorship:mentor, plays mentorship:student;
+  entity company, owns name, plays employment:employer;
+  relation employment, relates employee, relates employer, owns salary;
+  relation mentorship, relates mentor, relates student;
 ```
 
-**A relation playing a role** is a column referencing the relation table's `_iid`.
+Directives are DuckDB comments, kept in the file:
 
-```sql
-CREATE TABLE approval (
-    _iid UBIGINT PRIMARY KEY,
-    employment_id UBIGINT NOT NULL REFERENCES employment(_iid),
-    manager_id UBIGINT NOT NULL REFERENCES person(_iid)
-);
-```
-```typeql
-relation employment, relates employee, relates employer, plays approval:subject;
-relation approval, relates subject, relates approver;
-entity person, plays employment:employee, plays approval:approver;
-```
-
-**Subtypes take tables of their own**, abstract types none. An instance belongs to one
-table, so an `employee` row is not also a `person` row, and its table carries the inherited
-columns. Inherited ownerships and roles are mapped like declared ones. A reference to
-`person(_iid)` names persons only; a role open to employees too takes a second column
-referencing `employee(_iid)`.
-
-```sql
-CREATE TABLE person (_iid UBIGINT PRIMARY KEY, name VARCHAR NOT NULL);
-CREATE TABLE employee (_iid UBIGINT PRIMARY KEY, name VARCHAR NOT NULL, salary DECIMAL(12,2));
-```
-```typeql
-entity person, owns name @card(1);
-entity employee sub person, owns salary;
-```
-
-**Several tables may map to one type**, for instance when staged from several sources.
-Their `_iid` values must differ, as an `_iid` is the instance's id within its type; a
-reference names the table.
-
-```sql
-CREATE TABLE person (_iid UBIGINT PRIMARY KEY, name VARCHAR);
-CREATE TABLE contractor (_iid UBIGINT PRIMARY KEY, full_name VARCHAR);
-COMMENT ON TABLE contractor IS '@typedb entity person';
-COMMENT ON COLUMN contractor.full_name IS '@typedb owns name';
-```
-
-**Names that differ from the schema's** are mapped with directives, stored as DuckDB
-comments inside the `.duckdb` file:
-
-```sql
-COMMENT ON TABLE staging_people IS '@typedb entity person';
-COMMENT ON TABLE works_for      IS '@typedb relation employment (employee = person_id, employer = company_id)';
-COMMENT ON TABLE scratch        IS '@typedb skip';
-COMMENT ON COLUMN people.full_name IS '@typedb owns name';
-COMMENT ON COLUMN people.photo     IS '@typedb skip';
-COMMENT ON COLUMN works_for.person_id IS '@typedb references people';  -- instead of a FOREIGN KEY
-```
-
-**A reference on an entity table has no TypeDB form** and is rejected, whether a foreign
-key or a `references` directive: a relation is a table of its own. Stage it (with its keys
-declared up front, as DuckDB cannot add foreign keys to an existing table, or without keys
-and with `references` directives), and skip the original column:
-
-```sql
-CREATE TABLE management (
-    _iid UBIGINT PRIMARY KEY,
-    manager_id UBIGINT NOT NULL REFERENCES person(_iid),
-    report_id UBIGINT NOT NULL REFERENCES person(_iid)
-);
-INSERT INTO management
-    SELECT row_number() OVER (), manager_id, _iid FROM person WHERE manager_id IS NOT NULL;
-COMMENT ON TABLE management IS '@typedb relation management (manager = manager_id, report = report_id)';
-COMMENT ON COLUMN person.manager_id IS '@typedb skip';
-```
-
-**Business ids** stay data: `_iid` is consumed by the loader and is not queryable after
-the import. Keep ids you query by as ordinary columns, ideally `@key`:
-
-```sql
-CREATE TABLE person (
-    _iid UBIGINT PRIMARY KEY,      -- instance id: consumed by the loader
-    id BIGINT NOT NULL,            -- business id: owns id @key in the schema, which the server enforces
-    ...
-);
-```
-
-For data without natural 64-bit ids, `row_number() OVER ()` at staging time is a fine
-`_iid`, as above.
+| Directive | On | Effect |
+|---|---|---|
+| `@typedb skip` | table, column | not loaded |
+| `@typedb entity <label>` | table | maps the table to that entity type |
+| `@typedb relation <label> (<role> = <column>, ...)` | table | maps the table to that relation type and binds the listed columns; the bindings are optional |
+| `@typedb owns <label>` | column | maps the column to that attribute |
+| `@typedb references <table>` | column | the column holds that table's `_iid`s (instead of a `FOREIGN KEY`) |
 
 ## Type conversions
 
-| DuckDB | TypeDB value | Notes |
+| DuckDB | TypeDB | Notes |
 |---|---|---|
 | `BOOLEAN` | `boolean` | |
-| integer types | `integer` | `UBIGINT`/`HUGEINT` values must fit 64 bits; also accepted into `decimal` (exactly) and `double` (only values a double holds exactly) |
-| `FLOAT`/`DOUBLE` | `double` | finite values only; `FLOAT` widens exactly; `-0.0` is loaded as `0.0`, since DuckDB does not keep the two apart |
-| `DECIMAL(w,s)` | `decimal` | exact; `s ≤ 19`, integer part within 64 bits; also accepted into `double` when the double, printed at the column's scale, reads back as the value, and no two distinct decimals of the attribute's columns make one double (`0.1` and `0.1000000000000000056` from a `DECIMAL(38,19)` column would) |
-| `VARCHAR`, `ENUM`, `UUID`, `JSON` | `string` | compared byte-wise, as in TypeDB, whatever the column's collation: `'Bob'` and `'BOB'` are distinct values |
-| `DATE` | `date` | finite, within TypeDB's range (years -262143 to 262142) |
-| `TIMESTAMP[_S/_MS/_NS]` | `datetime` | exact to the nanosecond; finite, within TypeDB's range. The columns of one attribute are read together in one type, so beside a `TIMESTAMP_NS` column, other timestamps must fit its range (years 1677 to 2262) |
-| `TIMESTAMPTZ` | `datetime-tz` | always UTC: DuckDB stores the instant, not the zone; keep the zone in a separate column if it is data |
-| `INTERVAL` | `duration` | months, days and nanoseconds map one to one, so `1 month` and `30 days` are distinct durations (DuckDB compares them equal); no negative components |
-| `BLOB`, `TIME`, `STRUCT`, `MAP`, `UNION` | — | rejected with a restructuring hint |
-| `UHUGEINT`, fixed-size `ARRAY`, nested lists, other types | — | rejected; cast an `ARRAY` to a `LIST` |
+| integer types | `integer` | must fit 64 bits; also into `decimal`, and into `double` when the double holds the value exactly |
+| `FLOAT`, `DOUBLE` | `double` | finite only; `-0.0` loads as `0.0` |
+| `DECIMAL(p,s)` | `decimal` | exact; scale at most 19, integer part within 64 bits. Into `double` only when the double, printed at the column's scale, reads back as the value, and no two distinct decimals of the attribute make one double |
+| `VARCHAR`, `ENUM`, `UUID`, `JSON` | `string` | compared byte-wise whatever the collation: `'Bob'` and `'BOB'` are two values |
+| `DATE` | `date` | finite, years -262143 to 262142 |
+| `TIMESTAMP`, `_S`, `_MS`, `_NS` | `datetime` | exact to the nanosecond, finite |
+| `TIMESTAMPTZ`, `TIMESTAMPTZ_NS` | `datetime-tz` | as `datetime`, in UTC: DuckDB stores the instant, not the zone |
+| `INTERVAL` | `duration` | months, days and nanoseconds kept apart (`1 month` and `30 days` are two values); no negative parts; time part below 2^64 ns (584 years) |
+| `BLOB`, `TIME`, `STRUCT`, `MAP`, `UNION`, `UHUGEINT`, fixed-size `ARRAY`, nested lists, others | | refused, with a hint |
+
+An attribute fed by a nanosecond column reads all its columns in nanoseconds, so their timestamps must fit years
+1677 to 2262. Text is never parsed into values: a column of an incompatible type is refused, naming the DuckDB type
+to stage it as.
 
 ## Keys are optional
 
-The loader needs two facts about the data: that `_iid` is unique and present in every row
-of its table, and which table each role column points into, with every value an `_iid`
-there. Declaring them as keys hands both to DuckDB:
+The loader needs to know that each `_iid` is unique within its type and present, and that each role value is an
+`_iid` of the referenced table. Declared keys (`PRIMARY KEY`, `UNIQUE` with `NOT NULL`, `FOREIGN KEY`) make DuckDB
+guarantee this. Without them, the loader checks every row, and a role column names its table with
+`@typedb references <table>`. Both give the same data file, and they can be mixed by table and by column. The
+mapping summary says which are declared and which are checked.
 
-```sql
-CREATE TABLE person (_iid UBIGINT PRIMARY KEY, name VARCHAR);
-CREATE TABLE employment (_iid UBIGINT PRIMARY KEY, person_id UBIGINT REFERENCES person(_iid));
-```
+The checks are fastest when a table's ids run in row order with a constant step, as `row_number() OVER ()` numbers
+them: a scan each then proves the ids unique and the references valid, in seconds per billion rows. Other ids take a
+GROUP BY and an ANTI JOIN, which spill: about 14 minutes for 10 billion rows on 10 cores.
 
-Leaving them out hands both to the loader, which checks every row before converting
-anything; a role column then names its table with a directive:
+DuckDB keeps the index of every declared key in memory while rows are inserted, and cannot spill it: about 70 bytes
+per row for random keys. The loader warns above 100 million keyed rows. For data that size, stage without keys.
 
-```sql
-CREATE TABLE person (_iid UBIGINT, name VARCHAR);
-CREATE TABLE employment (_iid UBIGINT, person_id UBIGINT);
-COMMENT ON COLUMN employment.person_id IS '@typedb references person';
-```
+## What is checked
 
-Both produce the same data file, and they may be mixed table by table and column by
-column. The mapping summary shows which tables' ids and references are declared and which
-are checked by the loader. The checks are a few seconds per hundred million rows and spill
-to disk like the conversion.
+Before converting anything, the loader checks the structure (the `_iid` column, role columns, column types,
+directives), the mapping against the schema (types, attributes and roles exist, with compatible value types), and
+the data, one DuckDB query per check: values TypeDB cannot hold (above), relation rows that fill no role, and, where
+no key declares them, duplicate or missing `_iid`s and role values that are no `_iid` of the referenced table. Each
+violation is reported with a count and a few examples. Any error stops the run with nothing written.
 
-Keys cost memory while the data is staged, not while it is loaded: DuckDB keeps the index
-of every `PRIMARY KEY`, `UNIQUE` and `FOREIGN KEY` constraint in memory whenever rows are
-inserted, and cannot spill it. With random keys that is about 70 bytes per relation row,
-so staging a billion rows with keys needs tens of GB of RAM, where the same inserts without
-keys need well under one. The loader warns when it reads more than 100 million rows from
-tables with declared keys; for data of that size, staging without keys is the safe choice.
-
-## Memory
-
-The loader limits DuckDB to half of the memory it detects by default (the machine's, or a
-container's limit), and DuckDB spills what does not fit to disk, next to the output
-(for `--dry-run`, in the system's temporary directory: set `TMPDIR` to a disk-backed
-directory if that is a RAM disk). `--memory-limit` sets another limit in DuckDB's syntax
-(`8GB`, `512MiB`), at least 256 MiB. DuckDB and the conversion run one thread per 64 MB of
-the limit, up to one per core, and the conversion needs about one to two GB more for its
-own buffers.
-
-On disk the conversion needs the data file's size, and, under a small memory limit, room
-for DuckDB's spills: up to about half the file again. With `--overwrite` the old
-file stays until the new one replaces it.
-
-A long run reports its progress: while it converts, every half minute, the table or
-attribute being read, its rows so far (and the table's total) and the bytes encoded; while
-it checks or DuckDB sorts, a line every minute with the time taken.
-
-## What is checked, and what is the server's
-
-Before anything is written, the loader checks the structure (the `_iid` contract, role
-columns referencing `_iid`, supported column types, well-formed directives) and the mapping (every
-mapped type, attribute and role exists in the schema, with the right kind and a compatible
-value type). It then checks, with one DuckDB query per column, what would make the data
-file invalid: values TypeDB cannot hold (see the table above), relation rows filling no
-role, since a relation cannot exist without players, and, where they are not declared as
-keys, duplicate or missing `_iid`s and role values that are no `_iid` of the referenced
-table. Each violation is reported with its
-count and the first few examples (`_iid`s, or the offending values), so a dry run finds
-them all in minutes, not after hours of conversion. Any error stops the run with nothing
-written; warnings are printed and the run proceeds.
-
-Everything the schema constrains is enforced by the server at import, as for any other
-data: `@regex`, `@values` and `@range` as each attribute is created, which the import does
-first; `@card` of ownerships, roles and `plays`, `@key` and `@unique` when the import
-completes. Equal values are one attribute, and a player named twice in a role is one
-player. A relation table without a role column fails validation.
+The schema's constraints (`@card`, `@key`, `@unique`, `@regex`, `@values`, `@range`) are the server's to enforce at
+import. Equal values are one attribute, and a player named twice in a role is one player.
 
 ## Ids
 
-`_iid` is the instance's id in TypeDB: the server creates each instance with its `_iid` as
-its number within its type, and names role players by type and number. Sparse ids and
-source keys are therefore fine, as long as they are unique within the type (tables mapped
-to one type must not share values) and below 2^63, which leaves TypeDB room to number the
-instances created later. Larger values, such as 64-bit hashes, are refused before the
-conversion: number such rows, and the columns referencing them, with smaller ids, e.g.
-`row_number() OVER ()`.
+The server creates each instance with its `_iid` as its number within its type, and resolves players by type and
+number, so sparse ids and source keys are fine. Values must be below 2^63, which leaves TypeDB room for instances
+created later; renumber larger ones, such as hashes, and the columns referencing them.
 
-Entities, relations and role players are named by their type and `_iid`, attributes by
-their type and value. No table is sorted: DuckDB reads every table in parallel. Only each
-attribute's values are written in order, which the server imports faster. The file also
-carries each item's id as a string (`person:1000`, `name:Alice`) for an importer that
-resolves ids by lookup; both name the same item.
+## Memory and disk
 
-## Output format
+DuckDB gets half of the memory it detects (the machine's, or the container's limit) unless `--memory-limit` sets
+another limit (`8GB`, `512MiB`, at least 256 MiB). It runs a thread per 64 MB of the limit, up to one per core, and
+spills what does not fit. The conversion needs one to two GB more for its own buffers.
 
-The data file is the `typedb export` format: length-delimited protobuf `Migration.Item`
-messages, in the order `database import` expects: a header stating the file's guarantees
-(the item order, unique attributes, players and owned attributes named as above), every
-attribute, every entity, every relation, then checksums. Within each kind, items come in
-no particular order, except attribute values, which are sorted because the server imports
-them faster. The schema is not copied: import the data file with the schema file it was
-prepared against.
+The output directory needs room for the data file (31 bytes per row on the benchmark's narrow tables) and for
+DuckDB's spill. `--dry-run` spills into the system's temporary directory (`TMPDIR`). With `--overwrite` the old file
+stays until the new one replaces it.
 
-The file is compressed with zstd: a sequence of zstd frames, each with a checksum of its
-content, which `zstd -d` and `database import` read as one stream. Importing it needs a
-console or driver that reads compressed files; files exported by the server are plain and
-import as before. A file cut short or damaged fails to decompress instead of importing
-part of the data.
+A run prints, every 30 seconds while rows are converted, the table or attribute, the rows so far and the bytes
+encoded, and a line every minute while it checks or DuckDB sorts.
 
-Tables are written in name order, entity tables first. A relation that plays a role may
-come after the relation it plays in; the import links such players once every relation is
-read. A one-shot load stages the data file as `<database>.data.typedb` next to the DuckDB
-file, or in `--output-dir`, and removes it once the import has succeeded; `--files-only`
-writes it without importing. Either way an existing file is refused unless `--overwrite`
-is passed, before the checks begin, as are a server that cannot be reached and a database
-that already exists. One loader at a time prepares a database in a directory: a lock,
-`.<database>.lock`, makes a second one fail at once; the lock file stays, and what a run
-that died left (its spill directory `.<database>.tmp` and partial file) is removed by the
-next. The file is written under a temporary name and renamed on completion, and an
-interrupted conversion (Ctrl+C, SIGTERM or SIGHUP) removes it. The import starts once the
-file is complete; if the connection opened at the start did not survive the conversion,
-the loader reconnects (up to twelve attempts, ten seconds apart) and starts the import
-over. Once an attempt has lost its connection, a database that is being imported or
-already exists may be that attempt's: the loader waits for the first; for the second it
-keeps the file until the database has been checked and exits with code 3, as it cannot
-confirm the import. Before any attempt has broken off, both mean another import of the
-name, and the loader fails. If the import still fails, or the run is interrupted after the
-file is complete, the file is kept and the loader prints the `typedb console` command that
-imports it, so the conversion need not be repeated.
+## The data file and the import
+
+The file is the `typedb export` format: length-delimited `Migration.Item` protobuf messages, as zstd frames that each
+carry a checksum, so a damaged or truncated file fails to decompress. It holds a header, every attribute (each
+attribute's values in sorted order, which the server imports faster), every entity, every relation, and checksums.
+The schema is not copied: import the file with the schema file it was prepared with.
+
+The file is `<database>.data.typedb` next to the DuckDB file, or in `--output-dir`. It is written under a
+temporary name and renamed when complete. An existing file is refused unless `--overwrite` is given; that, an
+unreachable server and an existing database are all found before the checks start. One loader at a time prepares a
+database in a directory: `.<database>.lock` makes a second one fail at once, and the next run removes what a run
+that died left behind.
+
+The import starts once the file is complete. If the connection was lost during the conversion, the loader reconnects
+(12 attempts, 10 s apart). If an import attempt loses its connection, the server may still complete it, so a
+database that is being imported is waited for, and an existing database ends the run with exit code 3 and the file
+kept, as the loader cannot confirm that the import was its own. A successful import removes the file. A failed or
+interrupted import (Ctrl+C, SIGTERM, SIGHUP) keeps it, and the loader prints the `typedb console` command that
+imports it. An interrupted conversion removes what it wrote.
