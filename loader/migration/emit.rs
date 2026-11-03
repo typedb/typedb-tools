@@ -31,7 +31,7 @@ use crate::{
 };
 
 // Each scan is a pipeline: this thread streams the rows out of DuckDB in record batches and groups them into
-// units; every core turns units into encoded items; one thread writes the units back in the order they were read.
+// units. Every core turns units into encoded items: one thread writes the units back in the order they were read.
 // A unit is cut by rows or by bytes, whichever comes first, so that wide rows do not inflate what is in flight.
 const UNIT_ROWS: usize = 32_768;
 const UNIT_BYTES: usize = 32 << 20;
@@ -41,11 +41,11 @@ const OUTPUT_BUFFER: usize = 8 << 20;
 // The file is a sequence of zstd frames, one per unit, which zstd reads as one stream. Each frame is complete
 // and carries a checksum of its content, so no stream is ever left unfinished and a file cut short or damaged
 // fails to decompress rather than import less.
-const COMPRESSION_LEVEL: i32 = 1;
+const ZSTD_COMPRESSION_LEVEL: i32 = 1;
 
 fn compress(bytes: &[u8]) -> Result<Vec<u8>, String> {
     let compress_error = |err: std::io::Error| format!("failed to compress the output: {err}");
-    let mut compressor = zstd::bulk::Compressor::new(COMPRESSION_LEVEL).map_err(compress_error)?;
+    let mut compressor = zstd::bulk::Compressor::new(ZSTD_COMPRESSION_LEVEL).map_err(compress_error)?;
     compressor.set_parameter(zstd::zstd_safe::CParameter::ChecksumFlag(true)).map_err(compress_error)?;
     compressor.compress(bytes).map_err(compress_error)
 }
@@ -299,7 +299,6 @@ fn emit_objects(
     Ok(())
 }
 
-// The encoded items of one group of batches.
 #[derive(Default)]
 struct Unit {
     bytes: Vec<u8>,
@@ -313,7 +312,6 @@ impl Unit {
     }
 }
 
-// What the items of earlier rows held, for the next rows' items to reuse with their allocations.
 #[derive(Default)]
 struct Spare {
     attributes: Vec<item::OwnedAttribute>,
@@ -518,7 +516,6 @@ fn pipeline(
     })
 }
 
-// Destructured whole, so that a field added to the protocol's checksums fails to compile here.
 fn add_checksums(total: &mut Checksums, unit: &Checksums) {
     let Checksums { entity_count, attribute_count, relation_count, role_count, ownership_count } = unit;
     total.entity_count += entity_count;

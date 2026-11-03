@@ -63,7 +63,6 @@ pub(crate) struct Plays {
 #[derive(Debug, Clone)]
 pub(crate) struct Relates {
     pub(crate) role: String,
-    // Role labels are scoped to the declaring relation, also when inherited.
     pub(crate) declared_by: String,
     pub(crate) specialises: Option<String>,
 }
@@ -117,7 +116,6 @@ impl Schema {
             }
         }
 
-        // Types are registered first, so declarations and extensions can come in any order.
         let mut schema = Schema::default();
         for declaration in &declarations {
             schema.register(declaration)?;
@@ -130,7 +128,6 @@ impl Schema {
         Ok(schema)
     }
 
-    // The server's TypeQL refuses reserved keywords as labels, though its parser reads them.
     fn check_labels(&self) -> Result<(), String> {
         let mut labels = self.attributes.iter().map(|attribute| &attribute.label).chain(
             self.entities.iter().chain(&self.relations).flat_map(|object| {
@@ -214,8 +211,6 @@ impl Schema {
         for types in [&mut self.entities, &mut self.relations] {
             let by_label: HashMap<String, ObjectType> = types.iter().map(|o| (o.label.clone(), o.clone())).collect();
             for object in types.iter_mut() {
-                // A specialised role is replaced by its specialisation everywhere below the
-                // specialising relation.
                 let mut specialised: HashSet<String> =
                     object.relates.iter().filter_map(|r| r.specialises.clone()).collect();
                 let mut ancestors = Vec::new();
