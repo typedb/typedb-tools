@@ -18,14 +18,9 @@ use crate::{
 
 const EXAMPLES: usize = 3;
 
-// Above this many rows in tables with declared keys, staging them is likely to need more memory than it should.
 const LARGE_KEYED_ROWS: u64 = 100_000_000;
 
-// What would make the data file invalid is looked for before anything is converted: each check is one query,
-// which DuckDB answers far faster than the conversion runs. The schema's constraints are the server's to
-// enforce at import.
 pub(crate) fn check_data(conn: &Connection, plan: &MappingPlan, diagnostics: &mut Diagnostics) {
-    // An attribute read from a nanosecond column anywhere is read in nanoseconds from every column.
     let nanosecond_attributes: HashSet<&str> = plan
         .tables
         .iter()

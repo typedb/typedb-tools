@@ -92,7 +92,7 @@ async fn dry_run(args: &Args, input: &Input) -> Result<(), Failure> {
         let started = Instant::now();
         let result =
             migration.run(io::sink(), VERSION.trim(), &original_database, &|message| progress.report(&message));
-        drop(migration); // closes DuckDB and removes its spill directory; exiting would not
+        drop(migration); // close the spill dir if it exists
         (result, started.elapsed())
     })
     .await;
@@ -282,7 +282,7 @@ async fn prepare(args: &Args, input: &Input, spill_dir: &Path) -> Result<Migrati
                 print_mapping(&migration.mapping_summary());
                 print_warnings(migration.warnings());
                 println!(
-                    "Checked in {} (DuckDB memory limit {}).",
+                    "Checked in {} (source DB memory limit {}).",
                     format_duration(started.elapsed()),
                     migration.memory_limit()
                 );
@@ -303,7 +303,6 @@ async fn prepare(args: &Args, input: &Input, spill_dir: &Path) -> Result<Migrati
     .await
 }
 
-// Consumes the migration so that DuckDB is closed, and its spill directory removed, before the caller exits.
 fn write_data_file(
     migration: Migration,
     path: &Path,
@@ -422,8 +421,6 @@ fn exit_now(code: i32) -> ! {
     unsafe { _exit(code) }
 }
 
-// One run per database name and directory: the data file, its partial file and the spill directory are the run's
-// alone, and what a run that died left of them is stale.
 struct OutputLock {
     path: PathBuf,
     _file: fs::File,
@@ -450,14 +447,12 @@ impl OutputLock {
                 }
                 Err(fs::TryLockError::Error(err)) => return Err(failed(err)),
             }
-            // A run removes its lock file as it ends, and a file opened before the removal is no lock any more.
             if is_at(&file, &path) {
                 return Ok(OutputLock { path, _file: file });
             }
         }
     }
 
-    // Where a removed file cannot be told from the file at its path, the lock file stays.
     fn removed_at_exit(&self) -> Option<PathBuf> {
         cfg!(unix).then(|| self.path.clone())
     }

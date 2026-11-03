@@ -184,7 +184,7 @@ fn strip_directive_prefix(comment: &str) -> Option<&str> {
     prefix.eq_ignore_ascii_case(DIRECTIVE_PREFIX).then(|| comment[DIRECTIVE_PREFIX.len()..].trim())
 }
 
-// A directive is `@typedb <keyword> [<argument>]`; the keyword is case-insensitive.
+// A directive is `@typedb <keyword> [<argument>]` (the keyword is case-insensitive).
 fn parse_directive(comment: Option<&str>) -> Option<(String, &str)> {
     let rest = comment.and_then(strip_directive_prefix)?;
     let (keyword, argument) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
@@ -298,7 +298,6 @@ pub(crate) fn resolve(catalog: &Catalog, schema: &Schema, diagnostics: &mut Diag
             "{ignored} is not loaded: only tables of the 'main' schema are read (materialise a view as a table)"
         ));
     }
-    // Entity tables first, as the plan lists them, so that a target's index is its table's index in the plan.
     let mut targets = resolve_tables(catalog, schema, diagnostics);
     targets.sort_by_key(|target| target.is_relation);
     let mut plan = MappingPlan::default();
@@ -749,7 +748,7 @@ fn bind_owns(
         ));
         return;
     }
-    if !is_compatible(element_type, value_type) {
+    if !is_value_compatible(element_type, value_type) {
         let reason = match element_type {
             ColumnType::Varchar | ColumnType::StringLike => "the loader never parses text into values",
             _ => "the types are incompatible",
@@ -775,7 +774,7 @@ fn bind_owns(
     });
 }
 
-fn is_compatible(column_type: &ColumnType, value_type: ValueType) -> bool {
+fn is_value_compatible(column_type: &ColumnType, value_type: ValueType) -> bool {
     use ValueType as V;
     match column_type {
         ColumnType::Boolean => value_type == V::Boolean,
