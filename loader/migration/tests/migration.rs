@@ -525,7 +525,7 @@ fn relations_may_play_in_relations_streamed_before_them() -> Result<(), Box<dyn 
 fn composite_foreign_keys_cannot_bind_roles() -> Result<(), Box<dyn Error>> {
     let dir = scratch(
         "composite-fk",
-        "define\n  attribute a value integer;\n  entity node, plays link:end;\n  relation link, relates end, owns a;\n",
+        "define\n  attribute a value integer;\n  entity node, plays link:tip;\n  relation link, relates tip, owns a;\n",
         "CREATE TABLE node (_iid UBIGINT PRIMARY KEY, a INTEGER, b INTEGER, UNIQUE (a, b));
          CREATE TABLE link (_iid UBIGINT PRIMARY KEY, a INTEGER, b INTEGER, FOREIGN KEY (a, b) REFERENCES node(a, b));",
     )?;
@@ -770,6 +770,18 @@ fn abstract_attributes_cannot_be_populated() -> Result<(), Box<dyn Error>> {
 }
 
 #[test]
+fn reserved_keywords_are_refused_as_labels() -> Result<(), Box<dyn Error>> {
+    let dir = scratch(
+        "reserved-labels",
+        "define\n  entity person, plays edge:from;\n  relation edge, relates from;\n",
+        "CREATE TABLE person (_iid UBIGINT PRIMARY KEY);",
+    )?;
+    let Err(PrepareError::Setup(message)) = prepare(&dir) else { panic!("a reserved keyword was accepted as a label") };
+    assert!(message.contains("'from' is a reserved TypeQL keyword"), "{message}");
+    Ok(())
+}
+
+#[test]
 fn exact_names_win_over_dashed_readings() -> Result<(), Box<dyn Error>> {
     let dir = scratch(
         "exact-names",
@@ -966,6 +978,46 @@ fn mixed_numeric_columns_of_one_attribute_keep_every_value() -> Result<(), Box<d
 }
 
 #[test]
+fn zoned_nanosecond_timestamps_convert_exactly_and_bound_their_attribute() -> Result<(), Box<dyn Error>> {
+    let schema = "define\n  attribute moment value datetime-tz;\n  entity event, owns moment;\n";
+    let rows = "CREATE TABLE event (_iid UBIGINT PRIMARY KEY, moment TIMESTAMPTZ_NS);
+         CREATE TABLE old_event (_iid UBIGINT PRIMARY KEY, moment TIMESTAMPTZ);
+         COMMENT ON TABLE old_event IS '@typedb entity event';
+         INSERT INTO event VALUES (1, '2020-01-01 00:00:00.000000001+00'), (2, '1969-12-31 23:59:59.999999999+00');
+         INSERT INTO old_event VALUES (3, '2020-01-01 00:00:00+00');";
+    let dir = scratch("zoned-nanos", schema, rows)?;
+    let mut instants = Vec::new();
+    for item in convert(&dir)? {
+        if let item::Item::Attribute(attribute) = item {
+            let Some(migration_value::Value::DatetimeTz(value)) = attribute.value.and_then(|value| value.value) else {
+                panic!("a datetime-tz expected")
+            };
+            let datetime = value.datetime.expect("an instant");
+            instants.push((datetime.seconds, datetime.nanos));
+        }
+    }
+    instants.sort();
+    assert_eq!(instants, [(-1, 999_999_999), (1_577_836_800, 0), (1_577_836_800, 1)]);
+
+    let dir = scratch(
+        "zoned-nanos-range",
+        schema,
+        &format!("{rows} INSERT INTO old_event VALUES (4, '1500-01-01 00:00:00+00');"),
+    )?;
+    let errors = validation_errors(&dir);
+    assert_error(
+        &errors,
+        &["table 'old_event': column 'moment': 1 row(s) hold a timestamp outside the nanosecond range"],
+    );
+    let dir = scratch("zoned-nanos-infinite", schema, &format!("{rows} INSERT INTO event VALUES (5, 'infinity');"))?;
+    assert_error(
+        &validation_errors(&dir),
+        &["table 'event': column 'moment': 1 row(s) hold a timestamp that is infinite"],
+    );
+    Ok(())
+}
+
+#[test]
 fn timestamps_beside_nanosecond_columns_must_fit_their_range() -> Result<(), Box<dyn Error>> {
     let dir = scratch(
         "mixed-timestamps",
@@ -1066,12 +1118,12 @@ fn intervals_of_millions_of_years_are_durations() -> Result<(), Box<dyn Error>> 
 fn repeated_values_and_players_are_written_once() -> Result<(), Box<dyn Error>> {
     let dir = scratch(
         "repeats",
-        "define\n  attribute tag value string;\n  entity node, owns tag @card(0..), plays link:end;\n  \
-         relation link, relates end @card(0..3);\n",
+        "define\n  attribute tag value string;\n  entity node, owns tag @card(0..), plays link:tip;\n  \
+         relation link, relates tip @card(0..3);\n",
         "CREATE TABLE node (_iid UBIGINT PRIMARY KEY, tag VARCHAR, tags VARCHAR[]);
          COMMENT ON COLUMN node.tags IS '@typedb owns tag';
          CREATE TABLE link (_iid UBIGINT PRIMARY KEY, a UBIGINT REFERENCES node(_iid), b UBIGINT REFERENCES node(_iid));
-         COMMENT ON TABLE link IS '@typedb relation link (end = a, end = b)';
+         COMMENT ON TABLE link IS '@typedb relation link (tip = a, tip = b)';
          INSERT INTO node VALUES (1, 'x', ['x', 'y', 'x']);
          INSERT INTO link VALUES (1, 1, 1);",
     )?;
@@ -1183,12 +1235,12 @@ fn one_role_is_inferred_for_several_player_tables() -> Result<(), Box<dyn Error>
 fn a_column_named_rowid_does_not_disturb_the_scan() -> Result<(), Box<dyn Error>> {
     let dir = scratch(
         "rowid",
-        "define\n  attribute rowid value integer;\n  entity node, owns rowid, plays link:end;\n  \
-         relation link, relates end @card(1..2);\n",
+        "define\n  attribute rowid value integer;\n  entity node, owns rowid, plays link:tip;\n  \
+         relation link, relates tip @card(1..2);\n",
         "CREATE TABLE node (_iid UBIGINT PRIMARY KEY, rowid INTEGER);
          CREATE TABLE link (_iid UBIGINT PRIMARY KEY, rowid UBIGINT REFERENCES node(_iid),
                             b UBIGINT REFERENCES node(_iid));
-         COMMENT ON TABLE link IS '@typedb relation link (end = rowid, end = b)';
+         COMMENT ON TABLE link IS '@typedb relation link (tip = rowid, tip = b)';
          INSERT INTO node VALUES (1, NULL), (2, -1), (3, 200000);
          INSERT INTO link VALUES (1, 1, 2), (2, NULL, 3), (3, 3, 1);",
     )?;
@@ -1203,7 +1255,7 @@ fn a_column_named_rowid_does_not_disturb_the_scan() -> Result<(), Box<dyn Error>
 fn foreign_keys_are_matched_as_duckdb_resolves_them() -> Result<(), Box<dyn Error>> {
     let dir = scratch(
         "fk-case",
-        "define\n  entity person, plays link:end;\n  entity company, plays link:end;\n  relation link, relates end;\n",
+        "define\n  entity person, plays link:tip;\n  entity company, plays link:tip;\n  relation link, relates tip;\n",
         "CREATE TABLE person (_iid UBIGINT PRIMARY KEY);
          CREATE TABLE company (_iid UBIGINT PRIMARY KEY);
          CREATE TABLE link (_iid UBIGINT PRIMARY KEY, a UBIGINT REFERENCES Person(_IID), b UBIGINT,
@@ -1466,6 +1518,63 @@ fn sparse_ids_without_declared_keys_convert_as_the_keyed_ones() -> Result<(), Bo
 }
 
 #[test]
+fn ids_numbered_in_row_order_are_checked_by_a_scan() -> Result<(), Box<dyn Error>> {
+    let schema = "define\n  entity person, plays knows:friend;\n  relation knows, relates friend @card(0..);\n";
+    let knows = |people: &str, values: &str| {
+        format!(
+            "CREATE TABLE person (_iid UBIGINT); {people}
+             CREATE TABLE knows (_iid UBIGINT, a UBIGINT); COMMENT ON COLUMN knows.a IS '@typedb references person';
+             INSERT INTO knows VALUES {values};"
+        )
+    };
+    let progression = "INSERT INTO person SELECT 5 + 3 * i FROM range(1000) t(i);";
+    convert(&scratch("progression", schema, &knows(progression, "(1, 5), (2, 2702), (3, 3002)"))?)?;
+    let dir = scratch("progression-off", schema, &knows(progression, "(1, 2), (2, 6), (3, 3005), (4, 8)"))?;
+    assert_error(
+        &validation_errors(&dir),
+        &["column 'a' (references 'person'): 3 row(s) hold a value that is no _iid", "e.g. value 2, 6, 3005"],
+    );
+
+    // References to deleted rows: in the middle the progression has a gap, at the end it is shorter.
+    for (deleted, value) in [("5 + 3 * 500", "1505"), ("5 + 3 * 999", "3002")] {
+        let people = format!("{progression} DELETE FROM person WHERE _iid = {deleted};");
+        let dir = scratch("progression-deleted", schema, &knows(&people, &format!("(1, 5), (2, {value})")))?;
+        assert_error(
+            &validation_errors(&dir),
+            &["column 'a' (references 'person'): 1 row(s)", &format!("e.g. value {value}")],
+        );
+    }
+    let dir = scratch("progression-empty", schema, &knows("", "(1, 0)"))?;
+    assert_error(&validation_errors(&dir), &["column 'a' (references 'person'): 1 row(s)", "e.g. value 0"]);
+
+    // Ids that a progression would fit by their count and extremes, but repeat or leave the row order, are
+    // checked as any others.
+    let dir =
+        scratch("progression-shuffled", schema, &knows("INSERT INTO person VALUES (2), (0), (1);", "(1, 1), (2, 3)"))?;
+    assert_error(&validation_errors(&dir), &["column 'a' (references 'person'): 1 row(s)", "e.g. value 3"]);
+    let dir = scratch(
+        "progression-repeats",
+        "define\n  entity person;\n",
+        "CREATE TABLE person (_iid UBIGINT); INSERT INTO person VALUES (0), (1), (1), (3);",
+    )?;
+    assert_error(
+        &validation_errors(&dir),
+        &["table 'person': 1 _iid value(s) appear in more than one row", "e.g. _iid 1"],
+    );
+    // A column named rowid hides DuckDB's, which would make these ids a progression.
+    let dir = scratch(
+        "progression-rowid",
+        "define\n  attribute rowid, value integer;\n  entity person, owns rowid;\n",
+        "CREATE TABLE person (_iid UBIGINT, rowid BIGINT); INSERT INTO person VALUES (0, 0), (1, 1), (1, 1), (3, 3);",
+    )?;
+    assert_error(
+        &validation_errors(&dir),
+        &["table 'person': 1 _iid value(s) appear in more than one row", "e.g. _iid 1"],
+    );
+    Ok(())
+}
+
+#[test]
 fn references_without_declared_keys_are_checked() -> Result<(), Box<dyn Error>> {
     let schema =
         "define\n  entity person, plays knows:friend;\n  entity robot;\n  relation knows, relates friend @card(0..);\n";
@@ -1559,5 +1668,44 @@ fn references_without_declared_keys_are_checked() -> Result<(), Box<dyn Error>> 
          COMMENT ON COLUMN knows.a IS '@typedb references person'; INSERT INTO knows VALUES (5, 1);",
     )?;
     convert(&dir)?;
+    Ok(())
+}
+
+// What the checks and the conversion take from DuckDB, pinned so that an upgrade which changes it fails here.
+#[test]
+fn duckdb_behaves_as_the_loader_relies_on() -> Result<(), Box<dyn Error>> {
+    let conn = Connection::open_in_memory()?;
+    let text = |sql: &str| -> String {
+        conn.query_row(&format!("SELECT ({sql})::VARCHAR"), [], |row| row.get(0))
+            .unwrap_or_else(|err| panic!("{sql}: {err}"))
+    };
+    let union_type =
+        |a: &str, b: &str| text(&format!("SELECT any_value(typeof(v)) FROM (SELECT {a} AS v UNION ALL SELECT {b})"));
+    // An attribute's columns are read in one UNION ALL: a coarser unit would drop precision.
+    assert_eq!(union_type("TIMESTAMP_S '2020-01-01'", "TIMESTAMP_MS '2020-01-01'"), "TIMESTAMP_MS");
+    assert_eq!(union_type("TIMESTAMP '2020-01-01'", "TIMESTAMP_NS '2020-01-01'"), "TIMESTAMP_NS");
+    assert_eq!(union_type("TIMESTAMPTZ '2020-01-01'", "TIMESTAMPTZ_NS '2020-01-01'"), "TIMESTAMPTZ_NS");
+    // The nanosecond range check compares microseconds with i64::MIN / 1000.
+    assert_eq!(text("epoch_us(TIMESTAMP '1677-09-21 00:12:43.145225')"), (i64::MIN / 1000).to_string());
+    assert_eq!(text("TIMESTAMP '1677-09-21 00:12:43.145225'::TIMESTAMP_NS"), "1677-09-21 00:12:43.145225");
+    assert!(conn.execute_batch("SELECT TIMESTAMP '1677-09-21 00:12:43.145224'::TIMESTAMP_NS").is_err());
+    assert_eq!(text("isinf(TIMESTAMP_S 'infinity') AND isinf('infinity'::TIMESTAMPTZ_NS::TIMESTAMPTZ)"), "true");
+    // Durations are parsed from INTERVAL's text, and checked with its parts.
+    assert_eq!(text("INTERVAL '1 year 2 months 3 days 04:05:06.5'"), "1 year 2 months 3 days 04:05:06.5");
+    assert_eq!(text("INTERVAL '1 year' - INTERVAL '1 day'"), "1 year -1 day");
+    assert_eq!(text("INTERVAL '2562047788 hours'"), "2562047788:00:00");
+    let parts = "SELECT [date_part('hour', i), date_part('minute', i), date_part('microseconds', i)] \
+                 FROM (SELECT INTERVAL '1 day 01:02:03.5' AS i)";
+    assert_eq!(text(parts), "[1, 2, 3500000]");
+    // A value feeds a double only when the double, printed at the value's scale, reads back as the value.
+    assert_eq!(text("printf('%.19f', 0.1::DOUBLE)"), "0.1000000000000000056");
+    assert_eq!(text("printf('%.0f', 9007199254740993::BIGINT::DOUBLE)"), "9007199254740992");
+    assert_eq!(text("0.10::DECIMAL(4,2)::DOUBLE = 0.1::DOUBLE"), "true");
+    // Strings are compared byte-wise; UUIDs and zeros are one value however written.
+    assert_eq!(text("SELECT count(DISTINCT v COLLATE \"binary\") FROM (VALUES ('a' COLLATE NOCASE), ('A')) t(v)"), "2");
+    assert_eq!(text("'A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11'::UUID"), "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11");
+    assert_eq!(text("SELECT count(DISTINCT v) FROM (VALUES (0.0::DOUBLE), ('-0.0'::DOUBLE)) t(v)"), "1");
+    // The checks quote the smallest few violations.
+    assert_eq!(text("SELECT min(v, 2) FROM (VALUES (3), (1), (2)) t(v)"), "[1, 2]");
     Ok(())
 }

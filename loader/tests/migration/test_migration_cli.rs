@@ -77,8 +77,8 @@ fn files_only_writes_the_data_file() -> Result<(), Box<dyn Error>> {
     );
     assert_eq!(
         file_names(&dir.join("out"))?,
-        [".fixture.lock", "fixture.data.typedb"],
-        "only the data file and the lock are left: the schema is referenced, not copied"
+        LEFT_BEHIND,
+        "only the data file is left: the schema is referenced, not copied"
     );
     let data = zstd::stream::decode_all(fs::File::open(dir.join("out/fixture.data.typedb"))?)?;
     let mut buf: &[u8] = &data;
@@ -145,15 +145,15 @@ fn csv_options_conflict_with_duckdb() -> Result<(), Box<dyn Error>> {
 }
 
 #[test]
-fn unsupported_extensions_point_to_the_right_path() -> Result<(), Box<dyn Error>> {
+fn files_of_other_formats_point_to_staging_them() -> Result<(), Box<dyn Error>> {
     let dir = setup("dispatch")?;
     fs::write(dir.join("rows.csv"), "a,b\n")?;
     let csv = dir.join("rows.csv").to_string_lossy().into_owned();
     let output = Command::new(loader_binary())
-        .args(["--duckdb", &csv, "--schema-file", &dir.join("schema.tql").to_string_lossy()])
+        .args(["--duckdb", &csv, "--schema-file", &dir.join("schema.tql").to_string_lossy(), "--dry-run"])
         .output()?;
-    assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("--data"), "CSV hint expected");
+    assert_eq!(output.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("staged into DuckDB first"), "staging hint expected");
 
     let _ = fs::remove_dir_all(&dir);
     Ok(())
@@ -211,7 +211,7 @@ fn a_termination_signal_removes_the_partial_file() -> Result<(), Box<dyn Error>>
     assert!(Command::new("kill").args(["-TERM", &loader.id().to_string()]).status()?.success());
     assert_eq!(loader.wait()?.code(), Some(143));
     assert!(!partial.exists(), "the partial file was left behind");
-    assert!(!out.join("fixture.data.typedb").exists());
+    assert_eq!(file_names(&out)?, Vec::<String>::new(), "nothing is left behind");
     let _ = fs::remove_dir_all(&dir);
     Ok(())
 }
@@ -249,11 +249,7 @@ fn checks_spill_into_an_output_directory_that_does_not_exist_yet() -> Result<(),
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    assert_eq!(
-        file_names(&dir.join("out/nested"))?,
-        [".fixture.lock", "fixture.data.typedb"],
-        "the spill directory is removed"
-    );
+    assert_eq!(file_names(&dir.join("out/nested"))?, LEFT_BEHIND, "the spill directory is removed");
     let _ = fs::remove_dir_all(&dir);
     Ok(())
 }
@@ -291,7 +287,7 @@ fn what_a_dead_run_left_is_swept() -> Result<(), Box<dyn Error>> {
     fs::write(out.join(".fixture.lock"), b"")?;
     let output = run_loader(&dir, &["--files-only", "--output-dir", out.to_str().unwrap()]);
     assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
-    assert_eq!(file_names(&out)?, [".fixture.lock", "fixture.data.typedb"]);
+    assert_eq!(file_names(&out)?, LEFT_BEHIND);
     let _ = fs::remove_dir_all(&dir);
     Ok(())
 }
@@ -309,6 +305,10 @@ fn an_existing_data_file_is_refused_before_the_checks() -> Result<(), Box<dyn Er
     let _ = fs::remove_dir_all(&dir);
     Ok(())
 }
+
+// Elsewhere than on Unix, the lock file stays.
+const LEFT_BEHIND: &[&str] =
+    if cfg!(unix) { &["fixture.data.typedb"] } else { &[".fixture.lock", "fixture.data.typedb"] };
 
 fn file_names(dir: &Path) -> io::Result<Vec<String>> {
     let mut names: Vec<String> = fs::read_dir(dir)?

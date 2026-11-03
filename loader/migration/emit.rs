@@ -41,7 +41,7 @@ const OUTPUT_BUFFER: usize = 8 << 20;
 // The file is a sequence of zstd frames, one per unit, which zstd reads as one stream. Each frame is complete
 // and carries a checksum of its content, so no stream is ever left unfinished and a file cut short or damaged
 // fails to decompress rather than import less.
-const COMPRESSION_LEVEL: i32 = 3;
+const COMPRESSION_LEVEL: i32 = 1;
 
 fn compress(bytes: &[u8]) -> Result<Vec<u8>, String> {
     let compress_error = |err: std::io::Error| format!("failed to compress the output: {err}");
@@ -89,17 +89,14 @@ fn write_item(output: &mut impl Write, item: item::Item) -> Result<(), String> {
     output.write_all(&bytes).map_err(|err| format!("failed to write the output file: {err}"))
 }
 
-// Sized up front: `format!` starts empty and grows the string, which costs more than writing the id.
-fn object_id(label: &str, label_scoped_id: u64) -> String {
-    let mut id = String::with_capacity(label.len() + 21);
+fn write_object_id(id: &mut String, label: &str, label_scoped_id: u64) {
+    id.clear();
     let _ = write!(id, "{label}:{label_scoped_id}");
-    id
 }
 
-fn attribute_id(label: &str, value: &TypeDBValue) -> String {
-    let mut id = String::with_capacity(label.len() + 32);
+fn write_attribute_id(id: &mut String, label: &str, value: &TypeDBValue) {
+    id.clear();
     let _ = write!(id, "{label}:{value}");
-    id
 }
 
 fn emit_attributes(
@@ -137,26 +134,29 @@ fn emit_attributes(
 
     for source in sources {
         // One aggregate over all the columns: an aggregate per column besides fails to spill under limits that a
-        // single one streams through. Values in order make the server's import of them faster (6% on 10M rows of 30
-        // attributes); a streamed result keeps its order only while insertion order is preserved, which this one
-        // statement can afford.
+        // single one streams through. Values in order make the server's import of them faster; a streamed result
+        // keeps its order only while insertion order is preserved, which this one statement can afford.
         let sql =
             format!("SELECT DISTINCT v FROM ({}) WHERE v IS NOT NULL ORDER BY 1", source.selects.join(" UNION ALL "));
         let with_context =
             |err: String| format!("attribute '{}' (from {}): {err}", source.label, source.columns.join(", "));
         let encode = |batches: &[RecordBatch]| {
             let mut unit = Unit::default();
+            let mut message = Item {
+                item: Some(item::Item::Attribute(item::Attribute {
+                    label: source.label.to_owned(),
+                    ..Default::default()
+                })),
+            };
             for batch in batches {
                 let cells = Cells::of(batch.column(0).as_ref()).map_err(with_context)?;
                 for row in 0..batch.num_rows() {
                     unit.rows += 1;
                     let Some(value) = cells.value(row, source.value_type).map_err(with_context)? else { continue };
-                    unit.write_item(item::Item::Attribute(item::Attribute {
-                        id: attribute_id(source.label, &value),
-                        label: source.label.to_owned(),
-                        attributes: Vec::new(),
-                        value: Some(value.into_proto()),
-                    }));
+                    let Some(item::Item::Attribute(attribute)) = &mut message.item else { unreachable!() };
+                    write_attribute_id(&mut attribute.id, source.label, &value);
+                    attribute.value = Some(value.into_proto());
+                    unit.write(&message);
                     unit.checksums.attribute_count += 1;
                 }
             }
@@ -216,6 +216,14 @@ fn emit_objects(
 
     let encode = |batches: &[RecordBatch]| {
         let mut unit = Unit::default();
+        let label = table.type_label.clone();
+        let mut message = Item {
+            item: Some(match &table.kind {
+                TableKind::Entity => item::Item::Entity(item::Entity { label, ..Default::default() }),
+                TableKind::Relation { .. } => item::Item::Relation(item::Relation { label, ..Default::default() }),
+            }),
+        };
+        let mut spare = Spare::default();
         for batch in batches {
             let columns: Vec<Cells<'_>> =
                 batch.columns().iter().map(|column| Cells::of(column.as_ref())).collect::<Result<_, _>>()?;
@@ -226,93 +234,58 @@ fn emit_objects(
                 let instance_id = iids.value(row);
                 unit.rows += 1;
                 let with_context = |err: String| format!("{IID_COLUMN} {instance_id}: {err}");
-
-                let mut owned = Vec::new();
-                let mut owned_ids = HashSet::new();
-                let mut own = |owns: &OwnsMapping, value: TypeDBValue| {
-                    let id = attribute_id(&owns.attribute, &value);
-                    if !ownerships_may_repeat || owned_ids.insert(id.clone()) {
-                        let by_value = item::owned_attribute::AttributeByValue {
-                            label: owns.attribute.clone(),
-                            value: Some(value.into_proto()),
-                        };
-                        owned.push(item::OwnedAttribute { id, attribute_by_value: Some(by_value) });
+                let (id, label_scoped_id, attributes, mut roles) = match &mut message.item {
+                    Some(item::Item::Entity(entity)) => {
+                        (&mut entity.id, &mut entity.label_scoped_id, &mut entity.attributes, None)
                     }
+                    Some(item::Item::Relation(relation)) => (
+                        &mut relation.id,
+                        &mut relation.label_scoped_id,
+                        &mut relation.attributes,
+                        Some(&mut relation.roles),
+                    ),
+                    _ => unreachable!(),
                 };
+                spare.recycle(attributes, roles.as_deref_mut());
+                write_object_id(id, &table.type_label, instance_id);
+                *label_scoped_id = Some(instance_id);
+
                 for (index, owns) in table.owns.iter().enumerate() {
                     let cells = &columns[1 + index];
                     if owns.multi {
                         let Some((elements, range)) = cells.list_range(row).map_err(&with_context)? else { continue };
                         for element in range {
                             if let Some(value) = elements.value(element, owns.value_type).map_err(&with_context)? {
-                                own(owns, value);
+                                spare.own(attributes, &owns.attribute, value, ownerships_may_repeat);
                             }
                         }
                     } else if let Some(value) = cells.value(row, owns.value_type).map_err(&with_context)? {
-                        own(owns, value);
+                        spare.own(attributes, &owns.attribute, value, ownerships_may_repeat);
                     }
                 }
-                unit.checksums.ownership_count += owned.len() as i64;
+                unit.checksums.ownership_count += attributes.len() as i64;
 
-                if let TableKind::Relation { roles: bindings } = &table.kind {
-                    let mut roles: Vec<item::relation::Role> = Vec::new();
+                if let (TableKind::Relation { roles: bindings }, Some(roles)) = (&table.kind, roles) {
                     for (index, (role, player)) in bindings.iter().zip(&players).enumerate() {
                         let Typed::UInt64(player_iids) = &columns[role_columns[index]].typed else {
                             return Err(with_context(format!("column '{}' was not read as UBIGINT", role.column)));
                         };
-                        if player_iids.is_null(row) {
-                            continue;
+                        if !player_iids.is_null(row)
+                            && spare.play(roles, &player.scoped_role, player.label, player_iids.value(row))
+                        {
+                            unit.checksums.role_count += 1;
                         }
-                        let player_id = player_iids.value(row);
-                        let grouped = roles.iter().position(|grouped| grouped.label == player.scoped_role);
-                        let known = |grouped: &item::relation::Role| {
-                            grouped
-                                .players
-                                .iter()
-                                .filter_map(|known| known.player_by_label_scoped_id.as_ref())
-                                .any(|known| known.label_scoped_id == player_id && known.label == player.label)
-                        };
-                        if grouped.is_some_and(|index| known(&roles[index])) {
-                            continue;
-                        }
-                        let item_player = item::relation::role::Player {
-                            id: object_id(player.label, player_id),
-                            player_by_label_scoped_id: Some(item::relation::role::player::PlayerByLabelScopedId {
-                                label: player.label.to_owned(),
-                                label_scoped_id: player_id,
-                            }),
-                        };
-                        match grouped {
-                            Some(index) => roles[index].players.push(item_player),
-                            None => roles.push(item::relation::Role {
-                                label: player.scoped_role.clone(),
-                                players: vec![item_player],
-                            }),
-                        }
-                        unit.checksums.role_count += 1;
                     }
                     if roles.is_empty() {
                         return Err(with_context(
                             "no role is filled; a relation cannot exist without players".to_owned(),
                         ));
                     }
-                    unit.write_item(item::Item::Relation(item::Relation {
-                        id: object_id(&table.type_label, instance_id),
-                        label: table.type_label.clone(),
-                        label_scoped_id: Some(instance_id),
-                        attributes: owned,
-                        roles,
-                    }));
                     unit.checksums.relation_count += 1;
                 } else {
-                    unit.write_item(item::Item::Entity(item::Entity {
-                        id: object_id(&table.type_label, instance_id),
-                        label: table.type_label.clone(),
-                        label_scoped_id: Some(instance_id),
-                        attributes: owned,
-                    }));
                     unit.checksums.entity_count += 1;
                 }
+                unit.write(&message);
             }
         }
         Ok(unit)
@@ -335,8 +308,72 @@ struct Unit {
 }
 
 impl Unit {
-    fn write_item(&mut self, item: item::Item) {
-        Item { item: Some(item) }.encode_length_delimited(&mut self.bytes).expect("a Vec grows to fit");
+    fn write(&mut self, item: &Item) {
+        item.encode_length_delimited(&mut self.bytes).expect("a Vec grows to fit");
+    }
+}
+
+// What the items of earlier rows held, for the next rows' items to reuse with their allocations.
+#[derive(Default)]
+struct Spare {
+    attributes: Vec<item::OwnedAttribute>,
+    roles: Vec<item::relation::Role>,
+    players: Vec<item::relation::role::Player>,
+    owned_ids: HashSet<String>,
+}
+
+impl Spare {
+    fn recycle(&mut self, attributes: &mut Vec<item::OwnedAttribute>, roles: Option<&mut Vec<item::relation::Role>>) {
+        self.attributes.append(attributes);
+        for mut role in roles.into_iter().flat_map(|roles| roles.drain(..)) {
+            self.players.append(&mut role.players);
+            self.roles.push(role);
+        }
+        self.owned_ids.clear();
+    }
+
+    fn own(&mut self, attributes: &mut Vec<item::OwnedAttribute>, label: &str, value: TypeDBValue, may_repeat: bool) {
+        let mut owned = self.attributes.pop().unwrap_or_default();
+        write_attribute_id(&mut owned.id, label, &value);
+        if may_repeat && !self.owned_ids.insert(owned.id.clone()) {
+            self.attributes.push(owned);
+            return;
+        }
+        let by_value = owned.attribute_by_value.get_or_insert_default();
+        by_value.label.clear();
+        by_value.label.push_str(label);
+        by_value.value = Some(value.into_proto());
+        attributes.push(owned);
+    }
+
+    // Whether the player is new to the role: one player bound by several of the role's columns is listed once.
+    fn play(&mut self, roles: &mut Vec<item::relation::Role>, role: &str, label: &str, label_scoped_id: u64) -> bool {
+        let grouped = match roles.iter().position(|grouped| grouped.label == role) {
+            Some(index) => &mut roles[index],
+            None => {
+                let mut grouped = self.roles.pop().unwrap_or_default();
+                grouped.label.clear();
+                grouped.label.push_str(role);
+                roles.push(grouped);
+                roles.last_mut().expect("just pushed")
+            }
+        };
+        let known = grouped
+            .players
+            .iter()
+            .filter_map(|known| known.player_by_label_scoped_id.as_ref())
+            .any(|known| known.label_scoped_id == label_scoped_id && known.label == label);
+        if known {
+            return false;
+        }
+        let mut player = self.players.pop().unwrap_or_default();
+        write_object_id(&mut player.id, label, label_scoped_id);
+        let by_id = player.player_by_label_scoped_id.get_or_insert_default();
+        by_id.label.clear();
+        by_id.label.push_str(label);
+        by_id.label_scoped_id = label_scoped_id;
+        grouped.players.push(player);
+        true
     }
 }
 
