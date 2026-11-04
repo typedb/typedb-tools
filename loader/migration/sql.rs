@@ -36,21 +36,18 @@ pub(crate) mod catalog {
 
     pub(crate) const TABLE_CONSTRAINTS: &str = "SELECT constraint_type, constraint_column_names, referenced_table, \
          referenced_column_names FROM duckdb_constraints() WHERE schema_name = 'main' AND table_name = ?";
-
-    pub(crate) const TABLE_HAS_ROWID_COLUMN: &str = "SELECT count(*) > 0 FROM duckdb_columns() \
-         WHERE schema_name = 'main' AND table_name = ? AND lower(column_name) = 'rowid'";
 }
 
 pub(crate) mod setting {
     pub(crate) fn current(name: &str) -> String {
-        format!("SELECT current_setting('{name}')")
+        format!("SELECT current_setting('{name}')::VARCHAR")
     }
 
     pub(crate) fn set_memory_limit(limit: &str) -> String {
         format!("SET memory_limit = '{}'", limit.replace('\'', "''"))
     }
 
-    pub(crate) fn set_threads(threads: i64) -> String {
+    pub(crate) fn set_threads(threads: usize) -> String {
         format!("SET threads = {threads}")
     }
 
@@ -109,40 +106,20 @@ pub(crate) mod check {
         )
     }
 
-    pub(crate) fn id_extent(table: &str) -> String {
+    pub(crate) fn id_order(table: &str) -> String {
         let iid = quoted(IID_COLUMN);
         format!(
-            "SELECT count(*)::UBIGINT, count({iid})::UBIGINT, min({iid}), max({iid}), min(rowid) FROM {}",
+            "SELECT count(*)::UBIGINT, count({iid})::UBIGINT, min({iid}), max({iid}), \
+             min({iid}::HUGEINT - rowid) = max({iid}::HUGEINT - rowid) FROM {}",
             quoted(table)
         )
     }
 
-    pub(crate) fn any_id_off_progression(table: &str, first: u64, step: u64, first_row: i64) -> String {
-        format!(
-            "SELECT count(*)::UBIGINT FROM (SELECT 1 FROM {} \
-             WHERE {} - {first} <> {step} * (rowid - {first_row})::UBIGINT LIMIT 1)",
-            quoted(table),
-            quoted(IID_COLUMN)
-        )
-    }
-
-    pub(crate) fn references_off_progression(table: &str, column: &str, first: u64, last: u64, step: u64) -> String {
+    pub(crate) fn references_outside(table: &str, column: &str, first: u64, last: u64) -> String {
         let column = quoted(column);
         format!(
-            "SELECT {column} AS example FROM {} WHERE {column} IS NOT NULL \
-             AND NOT ({column} BETWEEN {first} AND {last} AND {column} % {step} = {})",
-            quoted(table),
-            first % step
-        )
-    }
-
-    pub(crate) fn dangling_references(table: &str, column: &str, player_table: &str) -> String {
-        let column = quoted(column);
-        format!(
-            "SELECT t.{column} AS example FROM {} t ANTI JOIN {} p ON t.{column} = p.{} WHERE t.{column} IS NOT NULL",
-            quoted(table),
-            quoted(player_table),
-            quoted(IID_COLUMN)
+            "SELECT {column} AS example FROM {} WHERE {column} IS NOT NULL AND {column} NOT BETWEEN {first} AND {last}",
+            quoted(table)
         )
     }
 

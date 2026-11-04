@@ -29,8 +29,9 @@ CREATE TABLE company AS SELECT id::UBIGINT AS _iid, name FROM src.company;
 ```
 
 Copied tables carry no keys. Either create the tables with their keys and insert into them, or mark each role column
-`@typedb references <table>` and let the loader check what the keys would guarantee ([Keys](#keys-are-optional)).
-A non-negative integer primary key can serve as `_iid`, and the foreign key columns then already hold `_iid` values.
+`@typedb references <table>` and number the referenced table's rows with `row_number() OVER ()`
+([Keys](#keys-are-optional)). A non-negative integer primary key, declared as one, can serve as `_iid`, and the
+foreign key columns then already hold `_iid` values.
 
 ## DuckDB versions
 
@@ -136,17 +137,18 @@ to stage it as.
 
 The loader needs to know that each `_iid` is unique within its type and present, and that each role value is an
 `_iid` of the referenced table. Declared keys (`PRIMARY KEY`, `UNIQUE` with `NOT NULL`, `FOREIGN KEY`) make DuckDB
-guarantee this. Without them, the loader checks every row, and a role column names its table with
+guarantee this. Without them, the loader checks the data, and a role column names its table with
 `@typedb references <table>`. Both give the same data file, and they can be mixed by table and by column. The
 mapping summary says which are declared and which are checked.
 
-The checks are fastest when a table's ids run in row order with a constant step, as `row_number() OVER ()` numbers
-them while DuckDB preserves insertion order (its default): one scan then proves the ids unique and the references
-valid. Other ids take a GROUP BY and an ANTI JOIN, which
-spill to disk on large data.
+Without a `FOREIGN KEY`, the `_iid`s of the referenced table must be dense in row order, `first, first + 1, ...`, as
+`row_number() OVER ()` numbers the rows while DuckDB preserves insertion order (its default). One scan then proves
+them unique, and every reference is checked against their range. Other ids of a referenced table are refused. The
+ids of a table that no such column references may be anything: their uniqueness takes a GROUP BY, which spills to
+disk on large data.
 
-DuckDB keeps the index of every declared key in memory while rows are inserted, and cannot spill it. The loader warns
-above 100 million keyed rows. For data that size, stage without keys.
+DuckDB keeps the index of every declared key in memory while rows are inserted, and cannot spill it. For data of
+hundreds of millions of rows and more, stage without keys.
 
 ## What is checked
 
@@ -162,8 +164,9 @@ import. Equal values are one attribute, and a player named twice in a role is on
 ## Ids
 
 The server creates each instance with its `_iid` as its number within its type, and resolves players by type and
-number, so sparse ids and source keys are fine. Values must be below 2^63, which leaves TypeDB room for instances
-created later. Renumber larger ones, such as hashes, and the columns referencing them.
+number, so ids need not start at 0 or be dense, unless undeclared references point at them. Values must be below
+2^63, which leaves TypeDB room for instances created later. Renumber larger ones, such as hashes, and the columns
+referencing them.
 
 ## Memory and disk
 

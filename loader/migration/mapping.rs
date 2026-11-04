@@ -7,7 +7,7 @@
 use crate::{
     Findings,
     catalog::{Catalog, Column, ColumnType, ForeignKey, Table},
-    schema::{ObjectType, Relates, Schema, ValueType},
+    schema::{ObjectKind, ObjectType, Relates, Schema, ValueType},
     sql::{self, IID_COLUMN, duckdb_type},
     value::DECIMAL_FRACTIONAL_DIGITS,
 };
@@ -18,8 +18,7 @@ pub(crate) fn resolve(catalog: &Catalog, schema: &Schema, findings: &mut Finding
             "{unread} is not loaded: only tables of the 'main' schema are read (materialise a view as a table)"
         ));
     }
-    let mut targets = type_tables(catalog, schema, findings);
-    targets.sort_by_key(|target| target.is_relation);
+    let targets = table_targets(catalog, schema, findings);
     let tables =
         targets.iter().map(|target| TableMapper::new(target, &targets, schema, findings).map()).collect::<Vec<_>>();
     let plan = MappingPlan { tables };
@@ -48,7 +47,7 @@ pub(crate) struct TableMapping {
     pub(crate) kind: TableKind,
     pub(crate) ownerships: Vec<OwnershipColumn>,
     pub(crate) id_guarantees: DeclaredIdGuarantees,
-    pub(crate) has_declared_keys: bool,
+    pub(crate) has_rowid_column: bool,
 }
 
 impl TableMapping {
@@ -115,8 +114,7 @@ pub(crate) struct OwnershipColumn {
 }
 
 impl OwnershipColumn {
-    // The column as an object scan reads it.
-    pub(crate) fn scanned(&self) -> String {
+    pub(crate) fn object_scan_projection(&self) -> String {
         let column = sql::column_of_scanned_table(&self.column);
         match (self.read_type(), self.is_list) {
             (Some(read_type), true) => sql::list_cast(&column, &read_type),
@@ -125,17 +123,16 @@ impl OwnershipColumn {
         }
     }
 
-    // One row per value, a list's elements unnested.
-    pub(crate) fn values(&self) -> String {
+    pub(crate) fn unnested_values(&self) -> String {
         let column = sql::quoted(&self.column);
         if self.is_list { sql::unnest(&column) } else { column }
     }
 
-    // Every column of an attribute is read in the attribute's type, and strings are compared byte-wise.
+    // Every column of an attribute is read in the attribute's type.
     pub(crate) fn attribute_values(&self) -> String {
         let values = match self.read_type() {
-            Some(read_type) => sql::cast(&self.values(), &read_type),
-            None => self.values(),
+            Some(read_type) => sql::cast(&self.unnested_values(), &read_type),
+            None => self.unnested_values(),
         };
         if self.value_type == ValueType::String { sql::byte_wise(&values) } else { values }
     }
@@ -159,12 +156,11 @@ const RELATION_IS_A_TABLE: &str = "relations are tables; stage the relation as i
 struct TableTarget<'a> {
     table: &'a Table,
     object: &'a ObjectType,
-    is_relation: bool,
     role_bindings: Vec<RoleBinding>,
     id_guarantees: DeclaredIdGuarantees,
 }
 
-fn type_tables<'a>(catalog: &'a Catalog, schema: &'a Schema, findings: &mut Findings) -> Vec<TableTarget<'a>> {
+fn table_targets<'a>(catalog: &'a Catalog, schema: &'a Schema, findings: &mut Findings) -> Vec<TableTarget<'a>> {
     let mut targets = Vec::new();
     for table in &catalog.tables {
         let directive = match parse_table_directive(table) {
@@ -178,16 +174,19 @@ fn type_tables<'a>(catalog: &'a Catalog, schema: &'a Schema, findings: &mut Find
                 continue;
             }
         };
-        let (label, is_relation, role_bindings) = match directive {
+        let (label, kind, role_bindings) = match directive {
             TableDirective::Skip => continue,
-            TableDirective::Entity { label } => (label, false, Vec::new()),
-            TableDirective::Relation { label, role_bindings } => (label, true, role_bindings),
+            TableDirective::Entity { label } => (label, ObjectKind::Entity, Vec::new()),
+            TableDirective::Relation { label, role_bindings } => (label, ObjectKind::Relation, role_bindings),
         };
-        let Some(object) = schema.object(&label, is_relation) else {
+        let Some(object) = schema.object(&label, kind) else {
+            let expected = match kind {
+                ObjectKind::Entity => "an entity type",
+                ObjectKind::Relation => "a relation type",
+            };
             findings.error(format!(
-                "table '{}' is mapped to '{label}', which is not {} in the TypeDB schema",
-                table.name,
-                if is_relation { "a relation type" } else { "an entity type" }
+                "table '{}' is mapped to '{label}', which is not {expected} in the TypeDB schema",
+                table.name
             ));
             continue;
         };
@@ -199,14 +198,15 @@ fn type_tables<'a>(catalog: &'a Catalog, schema: &'a Schema, findings: &mut Find
             continue;
         }
         let Some(id_guarantees) = instance_id_guarantees(table, findings) else { continue };
-        targets.push(TableTarget { table, object, is_relation, role_bindings, id_guarantees });
+        targets.push(TableTarget { table, object, role_bindings, id_guarantees });
     }
     targets
 }
 
 fn directive_implied_by_name(table: &Table, schema: &Schema, findings: &mut Findings) -> Option<TableDirective> {
-    let entity = find_by_name(&schema.entities, &table.name, |entity| &entity.label);
-    let relation = find_by_name(&schema.relations, &table.name, |relation| &relation.label);
+    let entity = find_by_name_or_dashed(schema.objects(ObjectKind::Entity), &table.name, |entity| &entity.label);
+    let relation =
+        find_by_name_or_dashed(schema.objects(ObjectKind::Relation), &table.name, |relation| &relation.label);
     match (entity, relation) {
         (Some(entity), None) => Some(TableDirective::Entity { label: entity.label.clone() }),
         (None, Some(relation)) => {
@@ -311,18 +311,21 @@ impl<'a, 'f> TableMapper<'a, 'f> {
             self.map_column(column);
         }
         self.check_role_bindings();
-        if target.is_relation {
+        if target.object.kind == ObjectKind::Relation {
             self.check_roles_filled();
         }
-        let TableTarget { table, object, is_relation, id_guarantees, .. } = target;
-        let kind = if *is_relation { TableKind::Relation { roles: self.roles } } else { TableKind::Entity };
+        let TableTarget { table, object, id_guarantees, .. } = target;
+        let kind = match object.kind {
+            ObjectKind::Entity => TableKind::Entity,
+            ObjectKind::Relation => TableKind::Relation { roles: self.roles },
+        };
         TableMapping {
             name: table.name.clone(),
             type_label: object.label.clone(),
             kind,
             ownerships: self.ownerships,
             id_guarantees: *id_guarantees,
-            has_declared_keys: table.has_declared_keys(),
+            has_rowid_column: table.has_rowid_column(),
         }
     }
 
@@ -358,7 +361,9 @@ impl<'a, 'f> TableMapper<'a, 'f> {
                 ))
             }
             (_, Some(binding), reference) => self.bind_role(column, &binding.role, reference),
-            (_, None, Some(reference)) if target.is_relation => self.infer_role(column, reference),
+            (_, None, Some(reference)) if target.object.kind == ObjectKind::Relation => {
+                self.infer_role(column, reference)
+            }
             (_, None, Some(reference)) => self.findings.error(format!(
                 "table '{table}': column '{}' references table '{}', which on an entity table has no TypeDB form: \
                  {RELATION_IS_A_TABLE}",
@@ -427,7 +432,7 @@ impl<'a, 'f> TableMapper<'a, 'f> {
         }
     }
 
-    // The relation's roles that the player's type plays, also through the relation's supertypes.
+    // Also through the relation's supertypes.
     fn roles_played_in_relation(&self, player: &ObjectType) -> Vec<&'a Relates> {
         let relations = self.schema.relation_and_supertypes(&self.target.object.label);
         self.target
@@ -454,15 +459,23 @@ impl<'a, 'f> TableMapper<'a, 'f> {
                     ));
                     return None;
                 }
-                let player = self.target_index(named);
-                if player.is_none() {
+                let Some(player) = self.target_index(named) else {
                     self.findings.error(format!(
                         "table '{table}': column '{}' references table '{named}', which is not mapped (is it skipped, \
                          invalid or misspelt?)",
                         column.name
                     ));
+                    return None;
+                };
+                if self.targets[player].table.has_rowid_column() {
+                    self.findings.error(format!(
+                        "table '{table}': column '{}' references '{named}', whose column 'rowid' hides the row ids \
+                         that checking the references reads; rename that column, or declare this one a FOREIGN KEY",
+                        column.name
+                    ));
+                    return None;
                 }
-                return player;
+                return Some(player);
             }
         };
         if foreign_key.columns.len() > 1 {
@@ -511,16 +524,18 @@ impl<'a, 'f> TableMapper<'a, 'f> {
         let (table, owner) = (&target.table.name, &target.object.label);
         let attribute_label = match named_attribute {
             Some(label) => label.to_owned(),
-            None => match find_by_name(&schema.attributes, &column.name, |attribute| &attribute.label) {
-                Some(attribute) => attribute.label.clone(),
-                None => {
+            None => {
+                let found =
+                    find_by_name_or_dashed(schema.attributes.iter(), &column.name, |attribute| &attribute.label);
+                let Some(attribute) = found else {
                     return self.findings.error(format!(
                         "table '{table}': column '{}' has no matching attribute in the TypeDB schema (add the \
                          attribute, or mark the column '@typedb skip' / '@typedb owns <label>')",
                         column.name
                     ));
-                }
-            },
+                };
+                attribute.label.clone()
+            }
         };
         let Some(attribute) = schema.attribute(&attribute_label) else {
             return self.findings.error(format!(
@@ -555,7 +570,7 @@ impl<'a, 'f> TableMapper<'a, 'f> {
             ColumnType::List(element) => (element.as_ref(), true),
             other => (other, false),
         };
-        if let Err(problem) = element_type_problem(column, element_type, value_type, &attribute_label) {
+        if let Some(problem) = element_type_problem(column, element_type, value_type, &attribute_label) {
             return self.findings.error(format!("table '{table}': column '{}' {problem}", column.name));
         }
         self.ownerships.push(OwnershipColumn {
@@ -642,18 +657,18 @@ fn role_column(
     }
 }
 
-// What follows "table 't': column 'c'" in the error, if the column cannot populate the attribute.
+// Completes the error "table 't': column 'c' ...".
 fn element_type_problem(
     column: &Column,
     element_type: &ColumnType,
     value_type: ValueType,
     attribute: &str,
-) -> Result<(), String> {
+) -> Option<String> {
     let duckdb_type = &column.duckdb_type;
     match element_type {
-        ColumnType::Unsupported { hint } => Err(format!("has unsupported type {duckdb_type}: {hint}")),
-        ColumnType::List(_) => Err("is a nested list, which has no TypeDB mapping".to_owned()),
-        ColumnType::Decimal { scale, .. } if *scale > DECIMAL_FRACTIONAL_DIGITS => Err(format!(
+        ColumnType::Unsupported { hint } => Some(format!("has unsupported type {duckdb_type}: {hint}")),
+        ColumnType::List(_) => Some("is a nested list, which has no TypeDB mapping".to_owned()),
+        ColumnType::Decimal { scale, .. } if *scale > DECIMAL_FRACTIONAL_DIGITS => Some(format!(
             "has DECIMAL scale {scale}, beyond TypeDB's {DECIMAL_FRACTIONAL_DIGITS} fractional digits; DuckDB would \
              round the values when reading them"
         )),
@@ -662,14 +677,14 @@ fn element_type_problem(
                 ColumnType::Varchar | ColumnType::ReadAsVarchar => "the loader never parses text into values",
                 _ => "the types are incompatible",
             };
-            Err(format!(
+            Some(format!(
                 "({duckdb_type}) cannot populate attribute '{attribute}' (value type '{}'): {reason}; stage the \
                  column as {}",
                 value_type.name(),
                 column_type_holding(value_type)
             ))
         }
-        _ => Ok(()),
+        _ => None,
     }
 }
 
@@ -704,14 +719,13 @@ fn column_type_holding(value_type: ValueType) -> &'static str {
 }
 
 fn warn_about_types_without_source(plan: &MappingPlan, schema: &Schema, findings: &mut Findings) {
-    for (types, kind) in [(&schema.entities, "entity"), (&schema.relations, "relation")] {
-        for object in types.iter().filter(|object| !object.is_abstract) {
-            if !plan.tables.iter().any(|table| table.type_label == object.label) {
-                findings.warning(format!(
-                    "{kind} type '{}' has no DuckDB source; no instances will be produced",
-                    object.label
-                ));
-            }
+    for object in schema.objects.iter().filter(|object| !object.is_abstract) {
+        if !plan.tables.iter().any(|table| table.type_label == object.label) {
+            findings.warning(format!(
+                "{} type '{}' has no DuckDB source; no instances will be produced",
+                object.kind.name(),
+                object.label
+            ));
         }
     }
     for attribute in schema.attributes.iter().filter(|attribute| !attribute.is_abstract) {
@@ -728,10 +742,14 @@ fn warn_about_types_without_source(plan: &MappingPlan, schema: &Schema, findings
     }
 }
 
-fn find_by_name<'a, T>(types: &'a [T], name: &str, label: impl Fn(&T) -> &str) -> Option<&'a T> {
-    types.iter().find(|t| label(t) == name).or_else(|| {
+fn find_by_name_or_dashed<'a, T: 'a>(
+    types: impl Iterator<Item = &'a T> + Clone,
+    name: &str,
+    label: impl Fn(&T) -> &str,
+) -> Option<&'a T> {
+    types.clone().find(|declared| label(declared) == name).or_else(|| {
         let dashed = name.replace('_', "-");
-        types.iter().find(|t| label(t) == dashed)
+        types.clone().find(|declared| label(declared) == dashed)
     })
 }
 

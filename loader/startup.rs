@@ -21,58 +21,77 @@ use crate::{ExitCode, checkpoint::Checkpoint, cli::Args, fatal, fatal_with, outp
 /// drain in-flight batches and write a final checkpoint; a second interrupt force-exits.
 pub(crate) fn install_shutdown_handler() -> Arc<AtomicBool> {
     let shutdown = Arc::new(AtomicBool::new(false));
-    let mut signals = match Termination::listen() {
-        Ok(signals) => signals,
-        Err(err) => {
-            println_warning!("interrupts will not be handled: {err}");
-            return shutdown;
-        }
-    };
+    let mut termination = Termination::listen();
     let shutdown_signal = shutdown.clone();
     tokio::spawn(async move {
-        let Some(_) = signals.recv().await else { return };
+        termination.next().await;
         shutdown_signal.store(true, Ordering::SeqCst);
         eprintln!("\nInterrupt received; finishing in-flight batches. Interrupt again to force exit.");
-        let Some(exit_code) = signals.recv().await else { return };
+        let exit_code = termination.next().await;
         eprintln!("Force-exiting.");
         std::process::exit(exit_code);
     });
     shutdown
 }
 
-// SIGINT and SIGTERM alike, registered at once; `recv` resolves to the exit code a shell reports.
+// SIGINT and SIGTERM alike, as the exit code a shell reports for each. Never one when they cannot be handled.
+pub(crate) struct Termination(Option<Signals>);
+
+impl Termination {
+    pub(crate) fn listen() -> Self {
+        match Signals::register() {
+            Ok(signals) => Termination(Some(signals)),
+            Err(err) => {
+                println_warning!("interrupts will not be handled: {err}");
+                Termination(None)
+            }
+        }
+    }
+
+    pub(crate) async fn next(&mut self) -> i32 {
+        match &mut self.0 {
+            Some(signals) => signals.next().await,
+            None => std::future::pending().await,
+        }
+    }
+}
+
 #[cfg(unix)]
-pub(crate) struct Termination {
+struct Signals {
     interrupt: tokio::signal::unix::Signal,
     terminate: tokio::signal::unix::Signal,
 }
 
 #[cfg(unix)]
-impl Termination {
-    pub(crate) fn listen() -> io::Result<Self> {
+impl Signals {
+    fn register() -> io::Result<Self> {
         use tokio::signal::unix::{SignalKind, signal};
         Ok(Self { interrupt: signal(SignalKind::interrupt())?, terminate: signal(SignalKind::terminate())? })
     }
 
-    pub(crate) async fn recv(&mut self) -> Option<i32> {
+    async fn next(&mut self) -> i32 {
         tokio::select! {
-            received = self.interrupt.recv() => received.map(|()| 130),
-            received = self.terminate.recv() => received.map(|()| 143),
+            Some(()) = self.interrupt.recv() => 130,
+            Some(()) = self.terminate.recv() => 143,
+            else => std::future::pending().await,
         }
     }
 }
 
 #[cfg(not(unix))]
-pub(crate) struct Termination;
+struct Signals;
 
 #[cfg(not(unix))]
-impl Termination {
-    pub(crate) fn listen() -> io::Result<Self> {
+impl Signals {
+    fn register() -> io::Result<Self> {
         Ok(Self)
     }
 
-    pub(crate) async fn recv(&mut self) -> Option<i32> {
-        tokio::signal::ctrl_c().await.ok().map(|()| 130)
+    async fn next(&mut self) -> i32 {
+        match tokio::signal::ctrl_c().await {
+            Ok(()) => 130,
+            Err(_) => std::future::pending().await,
+        }
     }
 }
 

@@ -32,8 +32,8 @@ fn setup(test_name: &str) -> Result<std::path::PathBuf, Box<dyn Error>> {
     let dir = std::env::temp_dir().join(format!("typedb-migration-cli-{test_name}-{}", std::process::id()));
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir)?;
-    let conn = Connection::open(dir.join("fixture.duckdb"))?;
-    conn.execute_batch(
+    let connection = Connection::open(dir.join("fixture.duckdb"))?;
+    connection.execute_batch(
         "CREATE TABLE person (_iid UBIGINT PRIMARY KEY, name VARCHAR NOT NULL);
          INSERT INTO person VALUES (1, 'Alice'), (2, 'Bob');",
     )?;
@@ -105,9 +105,9 @@ fn files_only_writes_the_data_file() -> Result<(), Box<dyn Error>> {
 #[test]
 fn validation_errors_exit_nonzero_with_no_output() -> Result<(), Box<dyn Error>> {
     let dir = setup("invalid")?;
-    let conn = Connection::open(dir.join("fixture.duckdb"))?;
-    conn.execute_batch("ALTER TABLE person ADD COLUMN mystery VARCHAR;")?;
-    drop(conn);
+    let connection = Connection::open(dir.join("fixture.duckdb"))?;
+    connection.execute_batch("ALTER TABLE person ADD COLUMN mystery VARCHAR;")?;
+    drop(connection);
 
     let out = dir.join("out").to_string_lossy().into_owned();
     let output = run_loader(&dir, &["--files-only", "--output-dir", &out]);
@@ -125,7 +125,7 @@ fn dry_run_writes_nothing() -> Result<(), Box<dyn Error>> {
     let dir = setup("dry")?;
     let output = run_loader(&dir, &["--dry-run"]);
     assert!(output.status.success());
-    assert!(!dir.join("out").exists(), "--dry-run created the output directory");
+    assert_eq!(file_names(&dir)?, ["fixture.duckdb", "schema.tql"], "--dry-run wrote next to the DuckDB file");
     let output = run_loader(&dir, &["--dry-run", "--files-only"]);
     assert!(String::from_utf8_lossy(&output.stderr).contains("cannot be used with"), "clap conflict expected");
 

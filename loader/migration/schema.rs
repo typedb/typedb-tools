@@ -20,8 +20,7 @@ use typeql::{
 #[derive(Debug, Default)]
 pub(crate) struct Schema {
     pub(crate) attributes: Vec<AttributeType>,
-    pub(crate) entities: Vec<ObjectType>,
-    pub(crate) relations: Vec<ObjectType>,
+    pub(crate) objects: Vec<ObjectType>,
 }
 
 impl Schema {
@@ -40,16 +39,19 @@ impl Schema {
         self.attributes.iter().find(|attribute| attribute.label == label)
     }
 
-    pub(crate) fn object(&self, label: &str, is_relation: bool) -> Option<&ObjectType> {
-        let types = if is_relation { &self.relations } else { &self.entities };
-        types.iter().find(|object| object.label == label)
+    pub(crate) fn object(&self, label: &str, kind: ObjectKind) -> Option<&ObjectType> {
+        self.objects.iter().find(|object| object.label == label && object.kind == kind)
+    }
+
+    pub(crate) fn objects(&self, kind: ObjectKind) -> impl Iterator<Item = &ObjectType> + Clone {
+        self.objects.iter().filter(move |object| object.kind == kind)
     }
 
     pub(crate) fn relation_and_supertypes(&self, label: &str) -> Vec<String> {
         let mut labels = Vec::new();
         let mut current = Some(label.to_owned());
         while let Some(label) = current {
-            current = self.object(&label, true).and_then(|relation| relation.supertype.clone());
+            current = self.object(&label, ObjectKind::Relation).and_then(|relation| relation.supertype.clone());
             labels.push(label);
         }
         labels
@@ -66,16 +68,18 @@ impl Schema {
                         self.attributes.push(AttributeType::new(label));
                     }
                 }
-                Some(kind @ (token::Kind::Entity | token::Kind::Relation)) => {
-                    let types = if kind == token::Kind::Relation { &mut self.relations } else { &mut self.entities };
-                    if !types.iter().any(|object| object.label == label) {
-                        types.push(ObjectType::new(label));
-                    }
-                }
+                Some(token::Kind::Entity) => self.declare_object(label, ObjectKind::Entity),
+                Some(token::Kind::Relation) => self.declare_object(label, ObjectKind::Relation),
                 Some(token::Kind::Role) => return Err(format!("unexpected top-level role declaration '{label}'")),
             }
         }
         Ok(())
+    }
+
+    fn declare_object(&mut self, label: String, kind: ObjectKind) {
+        if !self.objects.iter().any(|object| object.label == label && object.kind == kind) {
+            self.objects.push(ObjectType::new(label, kind));
+        }
     }
 
     fn apply_capabilities(&mut self, declarations: Vec<TypeDeclaration>) -> Result<(), String> {
@@ -90,20 +94,14 @@ impl Schema {
                 }
                 continue;
             }
-            let object = self
-                .entities
-                .iter_mut()
-                .map(|object| (object, false))
-                .chain(self.relations.iter_mut().map(|object| (object, true)))
-                .find(|(object, _)| object.label == label);
-            let Some((object, is_relation)) = object else {
+            let Some(object) = self.objects.iter_mut().find(|object| object.label == label) else {
                 return Err(format!(
                     "type '{label}' has no kinded declaration (entity/relation/attribute) in this schema"
                 ));
             };
             object.is_abstract |= is_abstract;
             for capability in declaration.capabilities {
-                object.apply(capability, is_relation)?;
+                object.apply(capability)?;
             }
         }
         Ok(())
@@ -130,11 +128,11 @@ impl Schema {
     }
 
     fn inherit_capabilities(&mut self) -> Result<(), String> {
-        for types in [&mut self.entities, &mut self.relations] {
+        for kind in [ObjectKind::Entity, ObjectKind::Relation] {
             let declared: HashMap<String, ObjectType> =
-                types.iter().map(|object| (object.label.clone(), object.clone())).collect();
-            for object in types.iter_mut() {
-                let supertypes = supertypes(object, &declared)?;
+                self.objects(kind).map(|object| (object.label.clone(), object.clone())).collect();
+            for object in self.objects.iter_mut().filter(|object| object.kind == kind) {
+                let supertypes = supertypes_nearest_first(object, &declared)?;
                 object.inherit_from(&supertypes);
             }
         }
@@ -143,11 +141,10 @@ impl Schema {
 
     // The server's TypeQL refuses reserved keywords as labels, though its parser reads them.
     fn refuse_reserved_labels(&self) -> Result<(), String> {
-        let mut labels = self.attributes.iter().map(|attribute| &attribute.label).chain(
-            self.entities.iter().chain(&self.relations).flat_map(|object| {
+        let mut labels =
+            self.attributes.iter().map(|attribute| &attribute.label).chain(self.objects.iter().flat_map(|object| {
                 std::iter::once(&object.label).chain(object.relates.iter().map(|relates| &relates.role))
-            }),
-        );
+            }));
         match labels.find(|label| typeql::is_reserved_keyword(label)) {
             Some(label) => Err(format!("'{label}' is a reserved TypeQL keyword, which TypeDB refuses as a label")),
             None => Ok(()),
@@ -189,6 +186,7 @@ impl AttributeType {
 #[derive(Debug, Clone)]
 pub(crate) struct ObjectType {
     pub(crate) label: String,
+    pub(crate) kind: ObjectKind,
     pub(crate) is_abstract: bool,
     pub(crate) supertype: Option<String>,
     pub(crate) owns: Vec<String>,
@@ -197,9 +195,10 @@ pub(crate) struct ObjectType {
 }
 
 impl ObjectType {
-    fn new(label: String) -> Self {
+    fn new(label: String, kind: ObjectKind) -> Self {
         ObjectType {
             label,
+            kind,
             is_abstract: false,
             supertype: None,
             owns: Vec::new(),
@@ -208,7 +207,7 @@ impl ObjectType {
         }
     }
 
-    fn apply(&mut self, capability: Capability, is_relation: bool) -> Result<(), String> {
+    fn apply(&mut self, capability: Capability) -> Result<(), String> {
         match capability.base {
             CapabilityBase::Sub(sub) => self.supertype = Some(sub.supertype_label.ident.to_string()),
             CapabilityBase::Owns(owns) => {
@@ -223,7 +222,7 @@ impl ObjectType {
             CapabilityBase::Plays(plays) => self
                 .plays
                 .push(Plays { relation: plays.role.scope.ident.to_string(), role: plays.role.name.ident.to_string() }),
-            CapabilityBase::Relates(relates) if is_relation => {
+            CapabilityBase::Relates(relates) if self.kind == ObjectKind::Relation => {
                 let role = type_ref_label(&relates.related).ok_or_else(|| {
                     format!(
                         "'{} relates {}': ordered (list) roles are not implemented in TypeDB 3.x",
@@ -258,15 +257,33 @@ impl ObjectType {
                 }
             }
             for plays in &supertype.plays {
-                if !self.plays.iter().any(|own| own.relation == plays.relation && own.role == plays.role) {
+                if !self.plays.iter().any(|existing| existing.relation == plays.relation && existing.role == plays.role)
+                {
                     self.plays.push(plays.clone());
                 }
             }
             for relates in &supertype.relates {
-                if !specialised.contains(&relates.role) && !self.relates.iter().any(|own| own.role == relates.role) {
+                if !specialised.contains(&relates.role)
+                    && !self.relates.iter().any(|existing| existing.role == relates.role)
+                {
                     self.relates.push(relates.clone());
                 }
             }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ObjectKind {
+    Entity,
+    Relation,
+}
+
+impl ObjectKind {
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            ObjectKind::Entity => "entity",
+            ObjectKind::Relation => "relation",
         }
     }
 }
@@ -342,8 +359,7 @@ fn type_declarations(schema_text: &str) -> Result<Vec<TypeDeclaration>, String> 
     Ok(declarations)
 }
 
-// From the nearest supertype up.
-fn supertypes<'a>(
+fn supertypes_nearest_first<'a>(
     object: &ObjectType,
     declared: &'a HashMap<String, ObjectType>,
 ) -> Result<Vec<&'a ObjectType>, String> {

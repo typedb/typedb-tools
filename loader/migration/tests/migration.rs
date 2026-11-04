@@ -16,7 +16,7 @@ use std::{
 
 use duckdb::Connection;
 use prost::Message;
-use typedb_migration::{Cancellation, Checksums, Migration, PrepareError, ProgressListener, ScanProgress, Source};
+use typedb_migration::{Cancellation, Checksums, Migration, PrepareError, ProgressListener, ScanProgress};
 use typedb_protocol::migration::{Item, MigrationValue, item, migration_value};
 
 const SCHEMA: &str = r#"define
@@ -106,7 +106,7 @@ fn scratch(test_name: &str, schema: &str, sql: &str) -> Result<Scratch, Box<dyn 
 
 fn prepare(dir: &Scratch) -> Result<Migration, PrepareError> {
     let schema = fs::read_to_string(dir.0.join("schema.tql")).expect("schema");
-    let source = Source::DuckDb(dir.0.join("fixture.duckdb"));
+    let source = dir.0.join("fixture.duckdb");
     Migration::prepare(&source, &schema, &dir.0.join("spill"), None, Arc::new(Cancellation::default()))
 }
 
@@ -145,21 +145,20 @@ fn decode_items(data: &[u8]) -> Result<Vec<item::Item>, Box<dyn Error>> {
 
 // Items in a canonical order: only the order of the kinds is part of the format.
 fn canonical(items: &[item::Item]) -> Vec<(usize, Vec<u8>)> {
-    let mut encoded: Vec<(usize, Vec<u8>)> = items
-        .iter()
-        .map(|item| {
-            let kind = match item {
-                item::Item::Header(_) => 0,
-                item::Item::Attribute(_) => 1,
-                item::Item::Entity(_) => 2,
-                item::Item::Relation(_) => 3,
-                item::Item::Checksums(_) => 4,
-            };
-            (kind, Item { item: Some(item.clone()) }.encode_to_vec())
-        })
-        .collect();
+    let mut encoded: Vec<(usize, Vec<u8>)> =
+        items.iter().map(|item| (kind_rank(item), Item { item: Some(item.clone()) }.encode_to_vec())).collect();
     encoded.sort();
     encoded
+}
+
+fn kind_rank(item: &item::Item) -> usize {
+    match item {
+        item::Item::Header(_) => 0,
+        item::Item::Attribute(_) => 1,
+        item::Item::Entity(_) => 2,
+        item::Item::Relation(_) => 3,
+        item::Item::Checksums(_) => 4,
+    }
 }
 
 fn assert_error(errors: &[String], fragments: &[&str]) {
@@ -172,9 +171,11 @@ fn assert_error(errors: &[String], fragments: &[&str]) {
 fn assert_file_guarantees(items: &[item::Item]) {
     let item::Item::Header(header) = &items[0] else { panic!("the header comes first") };
     let guarantees = header.guarantees.as_ref().expect("the header states its guarantees");
-    assert_eq!(guarantees.ordering(), item::header::guarantees::Ordering::AttributesEntitiesRelations);
+    assert_eq!(guarantees.item_order(), item::header::guarantees::ItemOrder::OrderAttributesEntitiesRelations);
     assert!(
-        guarantees.attributes_unique && guarantees.players_by_label_scoped_ids && guarantees.owned_attributes_by_value
+        guarantees.attributes_unique
+            && guarantees.label_scoped_ids_present
+            && guarantees.owned_inlined_attributes_referenced_by_value
     );
 
     let mut attributes: HashMap<&str, &item::Attribute> = HashMap::new();
@@ -182,22 +183,22 @@ fn assert_file_guarantees(items: &[item::Item]) {
     let mut scoped_ids = HashSet::new();
     let mut last_kind = 0;
     for item in items {
-        let kind = match item {
-            item::Item::Header(_) => 0,
-            item::Item::Attribute(_) => 1,
-            item::Item::Entity(_) => 2,
-            item::Item::Relation(_) => 3,
-            item::Item::Checksums(_) => 4,
-        };
+        let kind = kind_rank(item);
         assert!(kind >= last_kind, "items out of order");
         last_kind = kind;
         let (id, object) = match item {
             item::Item::Attribute(attribute) => {
-                assert!(attributes.insert(&attribute.id, attribute).is_none(), "attribute {} twice", attribute.id);
+                assert!(
+                    attributes.insert(&attribute.globally_unique_id, attribute).is_none(),
+                    "attribute {} twice",
+                    attribute.globally_unique_id
+                );
                 continue;
             }
-            item::Item::Entity(entity) => (&entity.id, (entity.label.as_str(), entity.label_scoped_id)),
-            item::Item::Relation(relation) => (&relation.id, (relation.label.as_str(), relation.label_scoped_id)),
+            item::Item::Entity(entity) => (&entity.globally_unique_id, (entity.label.as_str(), entity.label_scoped_id)),
+            item::Item::Relation(relation) => {
+                (&relation.globally_unique_id, (relation.label.as_str(), relation.label_scoped_id))
+            }
             _ => continue,
         };
         let object = (object.0, object.1.expect("every object carries its label-scoped id"));
@@ -208,7 +209,10 @@ fn assert_file_guarantees(items: &[item::Item]) {
     // Values compare by their encoding, which tells -0.0 from 0.0.
     let encoded = |value: &Option<MigrationValue>| value.as_ref().map(Message::encode_to_vec);
     let mut values = HashSet::new();
-    assert!(attributes.values().all(|a| values.insert((a.label.as_str(), encoded(&a.value)))), "an attribute repeats");
+    assert!(
+        attributes.values().all(|attribute| values.insert((attribute.label.as_str(), encoded(&attribute.value)))),
+        "an attribute repeats"
+    );
 
     let mut counts = Checksums::default();
     for item in items {
@@ -220,31 +224,41 @@ fn assert_file_guarantees(items: &[item::Item]) {
             item::Item::Relation(relation) => {
                 counts.relation_count += 1;
                 for role in &relation.roles {
-                    let ids: HashSet<&str> = role.players.iter().map(|player| player.id.as_str()).collect();
-                    assert_eq!(ids.len(), role.players.len(), "{} repeats a player in {}", relation.id, role.label);
+                    let ids: HashSet<&str> =
+                        role.players.iter().map(|player| player.globally_unique_id.as_str()).collect();
+                    assert_eq!(
+                        ids.len(),
+                        role.players.len(),
+                        "{} repeats a player in {}",
+                        relation.globally_unique_id,
+                        role.label
+                    );
                 }
                 (&relation.attributes, relation.roles.iter().flat_map(|role| role.players.iter()).collect())
             }
             _ => continue,
         };
-        let owned_ids: HashSet<&str> = owned.iter().map(|ownership| ownership.id.as_str()).collect();
+        let owned_ids: HashSet<&str> = owned.iter().map(|ownership| ownership.globally_unique_id.as_str()).collect();
         assert_eq!(owned_ids.len(), owned.len(), "an item repeats an ownership");
         counts.ownership_count += owned.len() as i64;
         counts.role_count += players.len() as i64;
         for ownership in owned {
-            let attribute =
-                attributes.get(ownership.id.as_str()).unwrap_or_else(|| panic!("missing attribute {}", ownership.id));
+            let attribute = attributes
+                .get(ownership.globally_unique_id.as_str())
+                .unwrap_or_else(|| panic!("missing attribute {}", ownership.globally_unique_id));
             let by_value = ownership.attribute_by_value.as_ref().expect("owned attributes carry their value");
             assert!(
                 by_value.label == attribute.label && encoded(&by_value.value) == encoded(&attribute.value),
                 "{} differs",
-                ownership.id
+                ownership.globally_unique_id
             );
         }
         for player in players {
-            let object = objects.get(player.id.as_str()).unwrap_or_else(|| panic!("missing role player {}", player.id));
-            let by_id = player.player_by_label_scoped_id.as_ref().expect("players carry their label-scoped id");
-            assert_eq!((by_id.label.as_str(), by_id.label_scoped_id), *object, "{} differs", player.id);
+            let object = objects
+                .get(player.globally_unique_id.as_str())
+                .unwrap_or_else(|| panic!("missing role player {}", player.globally_unique_id));
+            let by_id = player.label_scoped_id.as_ref().expect("players carry their label-scoped id");
+            assert_eq!((by_id.label.as_str(), by_id.label_scoped_id), *object, "{} differs", player.globally_unique_id);
         }
     }
     counts.attribute_count = attributes.len() as i64;
@@ -259,30 +273,38 @@ fn converts_and_produces_a_well_formed_import_file() -> Result<(), Box<dyn Error
     let items = decode_items(&first)?;
     assert_file_guarantees(&items);
 
-    let attributes: Vec<_> =
-        items.iter().filter_map(|i| if let item::Item::Attribute(a) = i { Some(a) } else { None }).collect();
-    let entities: Vec<_> =
-        items.iter().filter_map(|i| if let item::Item::Entity(e) = i { Some(e) } else { None }).collect();
-    let relations: Vec<_> =
-        items.iter().filter_map(|i| if let item::Item::Relation(r) = i { Some(r) } else { None }).collect();
+    let attributes: Vec<_> = items
+        .iter()
+        .filter_map(|item| if let item::Item::Attribute(attribute) = item { Some(attribute) } else { None })
+        .collect();
+    let entities: Vec<_> = items
+        .iter()
+        .filter_map(|item| if let item::Item::Entity(entity) = item { Some(entity) } else { None })
+        .collect();
+    let relations: Vec<_> = items
+        .iter()
+        .filter_map(|item| if let item::Item::Relation(relation) = item { Some(relation) } else { None })
+        .collect();
 
     assert_eq!(entities.len(), 3);
     assert_eq!(relations.len(), 3);
     assert_eq!(attributes.len(), 3 + 1 + 2 + 1); // names, age, tags, salary
 
     let mut role_labels: Vec<&str> =
-        relations.iter().flat_map(|r| r.roles.iter().map(|role| role.label.as_str())).collect();
+        relations.iter().flat_map(|relation| relation.roles.iter().map(|role| role.label.as_str())).collect();
     role_labels.sort();
     role_labels.dedup();
     assert_eq!(role_labels, ["employment:employee", "employment:employer", "mentorship:mentor", "mentorship:student"]);
 
-    let mut ids: Vec<(&str, Option<u64>)> = entities.iter().map(|e| (e.id.as_str(), e.label_scoped_id)).collect();
+    let mut ids: Vec<(&str, Option<u64>)> =
+        entities.iter().map(|entity| (entity.globally_unique_id.as_str(), entity.label_scoped_id)).collect();
     ids.sort();
     assert_eq!(ids, [("company:10", Some(10)), ("person:1", Some(1)), ("person:2", Some(2))]);
-    let mut ids: Vec<(&str, Option<u64>)> = relations.iter().map(|r| (r.id.as_str(), r.label_scoped_id)).collect();
+    let mut ids: Vec<(&str, Option<u64>)> =
+        relations.iter().map(|relation| (relation.globally_unique_id.as_str(), relation.label_scoped_id)).collect();
     ids.sort();
     assert_eq!(ids, [("employment:100", Some(100)), ("employment:101", Some(101)), ("mentorship:200", Some(200))]);
-    let mut ids: Vec<&str> = attributes.iter().map(|a| a.id.as_str()).collect();
+    let mut ids: Vec<&str> = attributes.iter().map(|attribute| attribute.globally_unique_id.as_str()).collect();
     ids.sort();
     assert_eq!(
         ids,
@@ -481,7 +503,7 @@ fn inherited_roles_are_scoped_to_their_declaring_relation() -> Result<(), Box<dy
     let items = convert(&dir)?;
     let relation = items
         .iter()
-        .find_map(|i| if let item::Item::Relation(r) = i { Some(r) } else { None })
+        .find_map(|item| if let item::Item::Relation(relation) = item { Some(relation) } else { None })
         .expect("one relation emitted");
     let mut labels: Vec<&str> = relation.roles.iter().map(|role| role.label.as_str()).collect();
     labels.sort();
@@ -510,8 +532,9 @@ fn relations_may_play_in_relations_streamed_before_them() -> Result<(), Box<dyn 
         .into_iter()
         .filter_map(|item| match item {
             item::Item::Relation(relation) => {
-                let players = relation.roles.iter().flat_map(|role| role.players.iter().map(|player| &player.id));
-                Some(format!("{} <- {}", relation.id, players.cloned().collect::<Vec<_>>().join(" ")))
+                let players =
+                    relation.roles.iter().flat_map(|role| role.players.iter().map(|player| &player.globally_unique_id));
+                Some(format!("{} <- {}", relation.globally_unique_id, players.cloned().collect::<Vec<_>>().join(" ")))
             }
             _ => None,
         })
@@ -833,11 +856,11 @@ fn instances_are_numbered_by_their_iid() -> Result<(), Box<dyn Error>> {
     let mut names: HashMap<String, String> = HashMap::new();
     for item in &items {
         let (id, owned) = match item {
-            item::Item::Entity(entity) => (&entity.id, &entity.attributes),
-            item::Item::Relation(relation) => (&relation.id, &relation.attributes),
+            item::Item::Entity(entity) => (&entity.globally_unique_id, &entity.attributes),
+            item::Item::Relation(relation) => (&relation.globally_unique_id, &relation.attributes),
             _ => continue,
         };
-        names.insert(id.clone(), owned[0].id.trim_start_matches("name:").to_owned());
+        names.insert(id.clone(), owned[0].globally_unique_id.trim_start_matches("name:").to_owned());
     }
     // An instance's number is its _iid, whichever of its type's tables it comes from.
     let expected = [("person:7", "Cid"), ("person:20", "Dee"), ("person:5", "Bob"), ("person:1000", "Ann")];
@@ -848,9 +871,11 @@ fn instances_are_numbered_by_their_iid() -> Result<(), Box<dyn Error>> {
     let mut friends: Vec<String> = Vec::new();
     for item in &items {
         if let item::Item::Relation(relation) = item {
-            let players =
-                relation.roles.iter().flat_map(|role| role.players.iter().map(|player| names[&player.id].as_str()));
-            friends.push(format!("{}: {}", names[&relation.id], players.collect::<Vec<_>>().join(" ")));
+            let players = relation
+                .roles
+                .iter()
+                .flat_map(|role| role.players.iter().map(|player| names[&player.globally_unique_id].as_str()));
+            friends.push(format!("{}: {}", names[&relation.globally_unique_id], players.collect::<Vec<_>>().join(" ")));
         }
     }
     friends.sort();
@@ -901,15 +926,15 @@ fn iids_must_fit_typedb_and_differ_within_a_type() -> Result<(), Box<dyn Error>>
 }
 
 #[test]
-fn large_tables_are_numbered_by_their_iid() -> Result<(), Box<dyn Error>> {
+fn instances_spanning_many_chunks_keep_their_iid() -> Result<(), Box<dyn Error>> {
     let dir = scratch(
-        "pages",
+        "many-chunks",
         "define\n  attribute age value integer;\n  entity person, owns age, plays knows:friend;\n  \
          relation knows, relates friend;\n",
         "CREATE TABLE person (_iid UBIGINT PRIMARY KEY, age BIGINT);
          CREATE TABLE knows (_iid UBIGINT PRIMARY KEY, friend_id UBIGINT REFERENCES person(_iid));
-         INSERT INTO person SELECT 1000000 - 3 * i, 1000000 - 3 * i FROM range(250000) t(i);
-         INSERT INTO knows SELECT i, 1000000 - 3 * i FROM range(250000) t(i);",
+         INSERT INTO person SELECT 1000000 - 3 * i, 1000000 - 3 * i FROM range(100000) t(i);
+         INSERT INTO knows SELECT i, 1000000 - 3 * i FROM range(100000) t(i);",
     )?;
     let items = convert(&dir)?;
     assert_file_guarantees(&items);
@@ -917,20 +942,22 @@ fn large_tables_are_numbered_by_their_iid() -> Result<(), Box<dyn Error>> {
     let age_of_person: HashMap<u64, &str> = items
         .iter()
         .filter_map(|item| match item {
-            item::Item::Entity(entity) => Some((entity.label_scoped_id?, entity.attributes[0].id.as_str())),
+            item::Item::Entity(entity) => {
+                Some((entity.label_scoped_id?, entity.attributes[0].globally_unique_id.as_str()))
+            }
             _ => None,
         })
         .collect();
-    assert_eq!(age_of_person.len(), 250_000);
-    assert_eq!(age_of_person[&250_003], "age:250003");
+    assert_eq!(age_of_person.len(), 100_000);
+    assert_eq!(age_of_person[&700_003], "age:700003");
     assert_eq!(age_of_person[&1_000_000], "age:1000000");
     for item in &items {
         if let item::Item::Relation(relation) = item {
             let friend_iid = 1_000_000 - 3 * relation.label_scoped_id.unwrap();
             let player = &relation.roles[0].players[0];
-            assert_eq!(player.player_by_label_scoped_id.as_ref().unwrap().label_scoped_id, friend_iid);
+            assert_eq!(player.label_scoped_id.as_ref().unwrap().label_scoped_id, friend_iid);
             assert_eq!(
-                age_of_person[&player.player_by_label_scoped_id.as_ref().unwrap().label_scoped_id],
+                age_of_person[&player.label_scoped_id.as_ref().unwrap().label_scoped_id],
                 format!("age:{friend_iid}")
             );
         }
@@ -949,8 +976,8 @@ fn views_and_other_schemas_are_reported() -> Result<(), Box<dyn Error>> {
     )?;
     let migration = prepare(&dir).expect("validation passes");
     let warnings: Vec<&str> = migration.warnings().iter().map(|warning| warning.as_str()).collect();
-    assert!(warnings.iter().any(|w| w.contains("view main.node_view is not loaded")), "{warnings:?}");
-    assert!(warnings.iter().any(|w| w.contains("table staging.node is not loaded")), "{warnings:?}");
+    assert!(warnings.iter().any(|warning| warning.contains("view main.node_view is not loaded")), "{warnings:?}");
+    assert!(warnings.iter().any(|warning| warning.contains("table staging.node is not loaded")), "{warnings:?}");
     Ok(())
 }
 
@@ -1177,7 +1204,7 @@ fn a_directive_does_not_settle_the_roles_of_columns_it_leaves_out() -> Result<()
     let items = convert(&complete)?;
     let item::Item::Relation(relation) = &items[items.len() - 2] else { panic!("the relation precedes the checksums") };
     let mut players: Vec<String> =
-        relation.roles.iter().map(|role| format!("{}={}", role.label, role.players[0].id)).collect();
+        relation.roles.iter().map(|role| format!("{}={}", role.label, role.players[0].globally_unique_id)).collect();
     players.sort();
     assert_eq!(players, ["mentorship:mentor=person:2", "mentorship:student=person:1"]);
     Ok(())
@@ -1277,7 +1304,9 @@ fn directives_take_any_whitespace_and_keyword_case() -> Result<(), Box<dyn Error
     )?;
     let items = convert(&dir)?;
     assert_file_guarantees(&items);
-    assert!(items.iter().any(|item| matches!(item, item::Item::Entity(entity) if entity.id == "person:1")));
+    assert!(
+        items.iter().any(|item| matches!(item, item::Item::Entity(entity) if entity.globally_unique_id == "person:1"))
+    );
     Ok(())
 }
 
@@ -1440,66 +1469,7 @@ fn tables_without_declared_keys_convert_as_the_keyed_ones() -> Result<(), Box<dy
 }
 
 #[test]
-fn sparse_ids_without_declared_keys_convert_as_the_keyed_ones() -> Result<(), Box<dyn Error>> {
-    let schema = "define\n  attribute name value string;\n  entity person, owns name, plays knows:a, plays knows:b;\n  \
-                  relation knows, relates a, relates b;\n";
-    let rows = "INSERT INTO person SELECT 7 * i + 3, 'p' || i FROM range(5000) t(i);
-                INSERT INTO knows SELECT 11 * i, 7 * ((i * 37) % 5000) + 3, 7 * ((i * 91) % 5000) + 3
-                FROM range(9000) t(i);";
-    let keyed = scratch(
-        "sparse-keyed",
-        schema,
-        &format!(
-            "CREATE TABLE person (_iid UBIGINT PRIMARY KEY, name VARCHAR);
-             CREATE TABLE knows (_iid UBIGINT PRIMARY KEY, a UBIGINT REFERENCES person(_iid),
-                                 b UBIGINT REFERENCES person(_iid));
-             COMMENT ON TABLE knows IS '@typedb relation knows (a = a, b = b)'; {rows}"
-        ),
-    )?;
-    let key_free = scratch(
-        "sparse-key-free",
-        schema,
-        &format!(
-            "CREATE TABLE person (_iid UBIGINT, name VARCHAR);
-             CREATE TABLE knows (_iid UBIGINT, a UBIGINT, b UBIGINT);
-             COMMENT ON TABLE knows IS '@typedb relation knows (a = a, b = b)';
-             COMMENT ON COLUMN knows.a IS '@typedb references person';
-             COMMENT ON COLUMN knows.b IS '@typedb references person'; {rows}"
-        ),
-    )?;
-    let items = convert(&key_free)?;
-    assert_file_guarantees(&items);
-    assert_eq!(canonical(&items), canonical(&convert(&keyed)?));
-    // Ids are the _iid values, gaps included: person p<i> has _iid 7i + 3, relation <i> 11i.
-    let mut relations = 0;
-    for item in &items {
-        match item {
-            item::Item::Entity(entity) => {
-                let i: u64 = entity.attributes[0].id.trim_start_matches("name:p").parse()?;
-                assert_eq!(entity.label_scoped_id, Some(7 * i + 3));
-            }
-            item::Item::Relation(relation) => {
-                relations += 1;
-                let i = relation.label_scoped_id.expect("label-scoped id") / 11;
-                let ids: Vec<u64> = relation
-                    .roles
-                    .iter()
-                    .map(|role| role.players[0].player_by_label_scoped_id.as_ref().unwrap().label_scoped_id)
-                    .collect();
-                assert!(
-                    ids.contains(&(7 * ((i * 37) % 5000) + 3)) && ids.contains(&(7 * ((i * 91) % 5000) + 3)),
-                    "{ids:?}"
-                );
-            }
-            _ => {}
-        }
-    }
-    assert_eq!(relations, 9000);
-    Ok(())
-}
-
-#[test]
-fn ids_numbered_in_row_order_are_checked_by_a_scan() -> Result<(), Box<dyn Error>> {
+fn undeclared_references_need_dense_ids_in_row_order() -> Result<(), Box<dyn Error>> {
     let schema = "define\n  entity person, plays knows:friend;\n  relation knows, relates friend @card(0..);\n";
     let knows = |people: &str, values: &str| {
         format!(
@@ -1508,33 +1478,68 @@ fn ids_numbered_in_row_order_are_checked_by_a_scan() -> Result<(), Box<dyn Error
              INSERT INTO knows VALUES {values};"
         )
     };
-    let progression = "INSERT INTO person SELECT 5 + 3 * i FROM range(1000) t(i);";
-    convert(&scratch("progression", schema, &knows(progression, "(1, 5), (2, 2702), (3, 3002)"))?)?;
-    let dir = scratch("progression-off", schema, &knows(progression, "(1, 2), (2, 6), (3, 3005), (4, 8)"))?;
+    let dense = "INSERT INTO person SELECT 5 + i FROM range(1000) t(i);";
+    convert(&scratch("dense", schema, &knows(dense, "(1, 5), (2, 500), (3, 1004)"))?)?;
+    let dir = scratch("dense-outside", schema, &knows(dense, "(1, 4), (2, 6), (3, 1005), (4, 0)"))?;
     assert_error(
         &validation_errors(&dir),
-        &["column 'a' (references 'person'): 3 row(s) hold a value that is no _iid", "e.g. value 2, 6, 3005"],
+        &["column 'a' (references 'person'): 3 row(s) hold a value that is no _iid", "e.g. value 0, 4, 1005"],
     );
-
-    // References to deleted rows: in the middle the progression has a gap, at the end it is shorter.
-    for (deleted, value) in [("5 + 3 * 500", "1505"), ("5 + 3 * 999", "3002")] {
-        let people = format!("{progression} DELETE FROM person WHERE _iid = {deleted};");
-        let dir = scratch("progression-deleted", schema, &knows(&people, &format!("(1, 5), (2, {value})")))?;
-        assert_error(
-            &validation_errors(&dir),
-            &["column 'a' (references 'person'): 1 row(s)", &format!("e.g. value {value}")],
-        );
-    }
-    let dir = scratch("progression-empty", schema, &knows("", "(1, 0)"))?;
+    let deleted_last = format!("{dense} DELETE FROM person WHERE _iid = 1004;");
+    let dir = scratch("dense-shorter", schema, &knows(&deleted_last, "(1, 5), (2, 1004)"))?;
+    assert_error(&validation_errors(&dir), &["column 'a' (references 'person'): 1 row(s)", "e.g. value 1004"]);
+    let dir = scratch("dense-empty", schema, &knows("", "(1, 0)"))?;
     assert_error(&validation_errors(&dir), &["column 'a' (references 'person'): 1 row(s)", "e.g. value 0"]);
 
-    // Ids that a progression would fit by their count and extremes, but repeat or leave the row order, are
-    // checked as any others.
-    let dir =
-        scratch("progression-shuffled", schema, &knows("INSERT INTO person VALUES (2), (0), (1);", "(1, 1), (2, 3)"))?;
-    assert_error(&validation_errors(&dir), &["column 'a' (references 'person'): 1 row(s)", "e.g. value 3"]);
+    let not_dense = "the _iids of 'person' are not dense in row order, so the references cannot be checked; \
+                     declare the column a FOREIGN KEY to 'person'(_iid), or number the rows of 'person' in order";
+    for (case, people) in [
+        ("sparse", "INSERT INTO person SELECT 5 + 3 * i FROM range(1000) t(i);".to_owned()),
+        ("gap", format!("{dense} DELETE FROM person WHERE _iid = 500;")),
+        ("shuffled", "INSERT INTO person VALUES (2), (0), (1);".to_owned()),
+        ("repeated", "INSERT INTO person VALUES (0), (1), (1), (3);".to_owned()),
+        ("null", "INSERT INTO person VALUES (0), (NULL), (1);".to_owned()),
+    ] {
+        let dir = scratch(&format!("not-dense-{case}"), schema, &knows(&people, "(1, 1)"))?;
+        assert_error(&validation_errors(&dir), &[not_dense]);
+    }
     let dir = scratch(
-        "progression-repeats",
+        "rowid-column",
+        "define\n  attribute rowid, value integer;\n  entity person, owns rowid, plays knows:friend;\n  \
+         relation knows, relates friend @card(0..);\n",
+        &knows("ALTER TABLE person ADD COLUMN rowid BIGINT; INSERT INTO person VALUES (0, 0), (1, 1);", "(1, 1)"),
+    )?;
+    assert_error(
+        &validation_errors(&dir),
+        &["column 'a' references 'person', whose column 'rowid' hides the row ids that checking the references reads"],
+    );
+    Ok(())
+}
+
+#[test]
+fn staging_with_row_number_numbers_the_rows_densely() -> Result<(), Box<dyn Error>> {
+    let csv = std::env::temp_dir().join(format!("typedb-migration-people-{}.csv", std::process::id()));
+    let csv = csv.to_string_lossy();
+    let dir = scratch(
+        "row-number",
+        "define\n  entity person, plays knows:friend;\n  relation knows, relates friend;\n",
+        &format!(
+            "COPY (SELECT i FROM range(2000000) t(i)) TO '{csv}';
+             CREATE TABLE person (_iid UBIGINT); INSERT INTO person SELECT row_number() OVER () FROM '{csv}';
+             CREATE TABLE knows (_iid UBIGINT, a UBIGINT); COMMENT ON COLUMN knows.a IS '@typedb references person';
+             INSERT INTO knows VALUES (1, 1), (2, 2000000);"
+        ),
+    )?;
+    let prepared = prepare(&dir);
+    let _ = fs::remove_file(&*csv);
+    prepared.map_err(|err| format!("{err:?}"))?;
+    Ok(())
+}
+
+#[test]
+fn repeated_ids_are_found_whatever_their_row_order() -> Result<(), Box<dyn Error>> {
+    let dir = scratch(
+        "repeated-ids",
         "define\n  entity person;\n",
         "CREATE TABLE person (_iid UBIGINT); INSERT INTO person VALUES (0), (1), (1), (3);",
     )?;
@@ -1542,9 +1547,9 @@ fn ids_numbered_in_row_order_are_checked_by_a_scan() -> Result<(), Box<dyn Error
         &validation_errors(&dir),
         &["table 'person': 1 _iid value(s) appear in more than one row", "e.g. _iid 1"],
     );
-    // A column named rowid hides DuckDB's, which would make these ids a progression.
+    // A column named rowid hides DuckDB's: read in its place, it would make these ids dense.
     let dir = scratch(
-        "progression-rowid",
+        "repeated-ids-rowid",
         "define\n  attribute rowid, value integer;\n  entity person, owns rowid;\n",
         "CREATE TABLE person (_iid UBIGINT, rowid BIGINT); INSERT INTO person VALUES (0, 0), (1, 1), (1, 1), (3, 3);",
     )?;
@@ -1614,6 +1619,14 @@ fn references_without_declared_keys_are_checked() -> Result<(), Box<dyn Error>> 
          COMMENT ON COLUMN knows.a IS '@typedb references person';",
         &["table 'robot': _iid holds the instances' ids and takes no directive"],
     )?;
+    check(
+        "CREATE TABLE knows (_iid UBIGINT); COMMENT ON TABLE knows IS '@typedb entity knows';",
+        &["table 'knows' is mapped to 'knows', which is not an entity type in the TypeDB schema"],
+    )?;
+    check(
+        "CREATE TABLE knows (_iid UBIGINT); COMMENT ON TABLE robot IS '@typedb relation robot';",
+        &["table 'robot' is mapped to 'robot', which is not a relation type in the TypeDB schema"],
+    )?;
     let dir = scratch(
         "references-without-ids",
         schema,
@@ -1655,9 +1668,10 @@ fn references_without_declared_keys_are_checked() -> Result<(), Box<dyn Error>> 
 // What the checks and the conversion take from DuckDB, pinned so that an upgrade which changes it fails here.
 #[test]
 fn duckdb_behaves_as_the_loader_relies_on() -> Result<(), Box<dyn Error>> {
-    let conn = Connection::open_in_memory()?;
+    let connection = Connection::open_in_memory()?;
     let text = |sql: &str| -> String {
-        conn.query_row(&format!("SELECT ({sql})::VARCHAR"), [], |row| row.get(0))
+        connection
+            .query_row(&format!("SELECT ({sql})::VARCHAR"), [], |row| row.get(0))
             .unwrap_or_else(|err| panic!("{sql}: {err}"))
     };
     let union_type =
@@ -1669,7 +1683,7 @@ fn duckdb_behaves_as_the_loader_relies_on() -> Result<(), Box<dyn Error>> {
     // The nanosecond range check compares microseconds with i64::MIN / 1000.
     assert_eq!(text("epoch_us(TIMESTAMP '1677-09-21 00:12:43.145225')"), (i64::MIN / 1000).to_string());
     assert_eq!(text("TIMESTAMP '1677-09-21 00:12:43.145225'::TIMESTAMP_NS"), "1677-09-21 00:12:43.145225");
-    assert!(conn.execute_batch("SELECT TIMESTAMP '1677-09-21 00:12:43.145224'::TIMESTAMP_NS").is_err());
+    assert!(connection.execute_batch("SELECT TIMESTAMP '1677-09-21 00:12:43.145224'::TIMESTAMP_NS").is_err());
     assert_eq!(text("isinf(TIMESTAMP_S 'infinity') AND isinf('infinity'::TIMESTAMPTZ_NS::TIMESTAMPTZ)"), "true");
     // Durations are parsed from INTERVAL's text, and checked with its parts.
     assert_eq!(text("INTERVAL '1 year 2 months 3 days 04:05:06.5'"), "1 year 2 months 3 days 04:05:06.5");
@@ -1702,7 +1716,7 @@ fn cancelling_stops_the_checks_and_reports_cancelled() -> Result<(), Box<dyn Err
          CREATE TABLE c AS FROM a;",
     )?;
     let schema = fs::read_to_string(dir.0.join("schema.tql"))?;
-    let source = Source::DuckDb(dir.0.join("fixture.duckdb"));
+    let source = dir.0.join("fixture.duckdb");
     let spill_dir = dir.0.join("spill");
 
     let cancelled = Arc::new(Cancellation::default());
