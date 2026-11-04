@@ -5,7 +5,7 @@
  */
 
 use std::{
-    env, io,
+    io,
     path::PathBuf,
     process::{Child, Command},
 };
@@ -34,29 +34,20 @@ impl TypeDBBinaryRunner {
     }
 
     pub fn run(&self, options: &[impl AsRef<str>]) -> io::Result<Child> {
-        let typedb_command = self.typedb_command(&self.distribution);
-        let mut cmd = Command::new(typedb_command.join(" "));
-
-        // Add options to command
-        let mut args = options.iter().map(|s| s.as_ref().to_owned()).collect::<Vec<_>>();
-        args.insert(0, self.subcommand.clone());
-        cmd.args(args);
-
-        // Execute and wait for the process
-        let child = cmd.stdout(std::process::Stdio::inherit()).stderr(std::process::Stdio::inherit()).spawn()?;
-
-        Ok(child)
+        let mut command = self.typedb_command();
+        command.arg(&self.subcommand).args(options.iter().map(AsRef::as_ref));
+        command.stdout(std::process::Stdio::inherit()).stderr(std::process::Stdio::inherit()).spawn()
     }
 
-    fn typedb_command(&self, distribution_path: &PathBuf) -> Vec<String> {
-        let mut command = vec![distribution_path.to_string_lossy().to_string()];
-        if !env::consts::OS.to_lowercase().contains("win") {
-            command[0].push_str("/typedb");
+    // Windows runs the distribution's batch file through cmd.exe.
+    fn typedb_command(&self) -> Command {
+        if cfg!(windows) {
+            let mut command = Command::new("cmd.exe");
+            command.arg("/c").arg(self.distribution.join("typedb.bat"));
+            command
         } else {
-            command[0].push_str("\\cmd.exe");
-            command.extend(vec!["/c".to_string(), "typedb.bat".to_string()]);
+            Command::new(self.distribution.join("typedb"))
         }
-        command
     }
 
     pub fn distribution_path(&self) -> &PathBuf {

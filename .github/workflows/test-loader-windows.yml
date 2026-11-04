@@ -68,10 +68,8 @@ jobs:
           call refreshenv
           bazel --output_base=C:/b test --enable_runfiles //loader/tests/migration:test-migration-cli --test_output=streamed
 
-  # The test runner cannot launch a Windows distribution yet.
   assembly-tests:
     name: Loader assembly tests (windows-x86_64)
-    if: false
     runs-on: windows-2022
     timeout-minutes: 150
     env:
