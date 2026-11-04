@@ -46,6 +46,8 @@ jobs:
         shell: cmd
     steps:
       - uses: actions/checkout@v4
+      # Bazel's git_repository deletes .git right after a fetch, which races git's detached background maintenance.
+      - run: git config --global maintenance.auto false && git config --global gc.auto 0
       - uses: bazel-contrib/setup-bazel@0.15.0
         with:
           bazelisk-cache: true
@@ -79,6 +81,8 @@ jobs:
         shell: cmd
     steps:
       - uses: actions/checkout@v4
+      # Bazel's git_repository deletes .git right after a fetch, which races git's detached background maintenance.
+      - run: git config --global maintenance.auto false && git config --global gc.auto 0
       - uses: bazel-contrib/setup-bazel@0.15.0
         with:
           bazelisk-cache: true

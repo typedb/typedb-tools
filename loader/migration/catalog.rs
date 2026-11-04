@@ -20,15 +20,15 @@ pub(crate) struct Catalog {
 }
 
 impl Catalog {
-    pub(crate) fn read(conn: &Connection) -> Result<Catalog, String> {
-        let mut tables = read_main_tables(conn).map_err(|err| format!("failed to list tables: {err}"))?;
+    pub(crate) fn read(connection: &Connection) -> Result<Catalog, String> {
+        let mut tables = read_main_tables(connection).map_err(|err| format!("failed to list tables: {err}"))?;
         for table in &mut tables {
-            read_columns(conn, table)
-                .and_then(|()| read_constraints(conn, table))
+            read_columns(connection, table)
+                .and_then(|()| read_constraints(connection, table))
                 .map_err(|err| format!("failed to read table '{}': {err}", table.name))?;
         }
-        let unread_tables_and_views =
-            read_unread_tables_and_views(conn).map_err(|err| format!("failed to list schemas and views: {err}"))?;
+        let unread_tables_and_views = read_unread_tables_and_views(connection)
+            .map_err(|err| format!("failed to list schemas and views: {err}"))?;
         Ok(Catalog { tables, unread_tables_and_views })
     }
 }
@@ -49,12 +49,12 @@ impl Table {
         self.columns.iter().find(|column| column.name == name)
     }
 
-    pub(crate) fn foreign_key_of(&self, column: &str) -> Option<&ForeignKey> {
-        self.foreign_keys.iter().find(|foreign_key| foreign_key.columns.iter().any(|name| name == column))
+    pub(crate) fn has_rowid_column(&self) -> bool {
+        self.columns.iter().any(|column| column.name.eq_ignore_ascii_case("rowid"))
     }
 
-    pub(crate) fn has_declared_keys(&self) -> bool {
-        !self.primary_key.is_empty() || !self.unique_column_sets.is_empty() || !self.foreign_keys.is_empty()
+    pub(crate) fn foreign_key_of(&self, column: &str) -> Option<&ForeignKey> {
+        self.foreign_keys.iter().find(|foreign_key| foreign_key.columns.iter().any(|name| name == column))
     }
 
     fn without_columns(name: String, comment: Option<String>) -> Table {
@@ -128,7 +128,6 @@ impl ColumnType {
         )
     }
 
-    // The spellings of `duckdb_columns().data_type`.
     fn parse(duckdb_type: &str) -> ColumnType {
         let upper = duckdb_type.to_uppercase();
         if let Some(element) = upper.strip_suffix("[]") {
@@ -191,19 +190,19 @@ fn decimal_precision_and_scale(upper: &str) -> (u8, u8) {
     (next().unwrap_or(18), next().unwrap_or(3))
 }
 
-fn read_main_tables(conn: &Connection) -> duckdb::Result<Vec<Table>> {
-    let mut statement = conn.prepare(sql::catalog::MAIN_TABLES)?;
+fn read_main_tables(connection: &Connection) -> duckdb::Result<Vec<Table>> {
+    let mut statement = connection.prepare(sql::catalog::MAIN_TABLES)?;
     let tables = statement.query_map([], |row| Ok(Table::without_columns(row.get(0)?, row.get(1)?)))?;
     tables.collect()
 }
 
-fn read_unread_tables_and_views(conn: &Connection) -> duckdb::Result<Vec<String>> {
-    let mut statement = conn.prepare(sql::catalog::UNREAD_TABLES_AND_VIEWS)?;
+fn read_unread_tables_and_views(connection: &Connection) -> duckdb::Result<Vec<String>> {
+    let mut statement = connection.prepare(sql::catalog::UNREAD_TABLES_AND_VIEWS)?;
     statement.query_map([], |row| row.get(0))?.collect()
 }
 
-fn read_columns(conn: &Connection, table: &mut Table) -> duckdb::Result<()> {
-    let mut statement = conn.prepare(sql::catalog::TABLE_COLUMNS)?;
+fn read_columns(connection: &Connection, table: &mut Table) -> duckdb::Result<()> {
+    let mut statement = connection.prepare(sql::catalog::TABLE_COLUMNS)?;
     let mut rows = statement.query([&table.name])?;
     while let Some(row) = rows.next()? {
         let duckdb_type: String = row.get(1)?;
@@ -217,8 +216,8 @@ fn read_columns(conn: &Connection, table: &mut Table) -> duckdb::Result<()> {
     Ok(())
 }
 
-fn read_constraints(conn: &Connection, table: &mut Table) -> duckdb::Result<()> {
-    let mut statement = conn.prepare(sql::catalog::TABLE_CONSTRAINTS)?;
+fn read_constraints(connection: &Connection, table: &mut Table) -> duckdb::Result<()> {
+    let mut statement = connection.prepare(sql::catalog::TABLE_CONSTRAINTS)?;
     let mut rows = statement.query([&table.name])?;
     while let Some(row) = rows.next()? {
         let constraint_type: String = row.get(0)?;
@@ -304,8 +303,8 @@ mod test {
             ("VARCHAR", "VARCHAR", ColumnType::Varchar),
             ("VARIANT", "VARIANT", refused()),
         ];
-        let conn = Connection::open_in_memory().unwrap();
-        let listed: Vec<String> = conn
+        let connection = Connection::open_in_memory().unwrap();
+        let listed: Vec<String> = connection
             .prepare("SELECT DISTINCT logical_type FROM duckdb_types() WHERE logical_type <> 'TYPE' ORDER BY 1")
             .unwrap()
             .query_map([], |row| row.get(0))
@@ -323,15 +322,16 @@ mod test {
             .filter(|(_, (_, declared, _))| !declared.is_empty())
             .map(|(index, (_, declared, _))| format!("c{index} {declared}"))
             .collect();
-        conn.execute_batch(&format!(
-            "CREATE TABLE t ({}); CREATE TABLE u AS SELECT NULL AS null_column, (1, 'a') AS tuple_column;",
-            declared.join(", ")
-        ))
-        .unwrap();
+        connection
+            .execute_batch(&format!(
+                "CREATE TABLE t ({}); CREATE TABLE u AS SELECT NULL AS null_column, (1, 'a') AS tuple_column;",
+                declared.join(", ")
+            ))
+            .unwrap();
         let mut found = Vec::new();
         for name in ["t", "u"] {
             let mut table = Table::without_columns(name.to_owned(), None);
-            read_columns(&conn, &mut table).unwrap();
+            read_columns(&connection, &mut table).unwrap();
             found.extend(table.columns);
         }
         let expected = types

@@ -16,7 +16,7 @@ use std::{
 
 use typedb_cli_common::{build_tls_config, format_error, parse_addresses, println_error, println_warning};
 use typedb_driver::{Addresses, Credentials, DriverOptions, TypeDBDriver};
-use typedb_migration::{Cancellation, Checksums, Migration, PrepareError, ProgressListener, ScanProgress, Source};
+use typedb_migration::{Cancellation, Checksums, Migration, PrepareError, ProgressListener, ScanProgress};
 
 use crate::{
     ExitCode, VERSION,
@@ -39,20 +39,20 @@ async fn migrate(args: &Args, input: &MigrationInput) -> Result<(), Failure> {
     let output = Output::prepare(args, input)?;
     let server = match &output {
         Output::DataFile(_) if !args.files_only => Some(connect(args, &input.database).await?),
-        Output::DataFile(_) | Output::Discarded { .. } => None,
+        Output::DataFile(_) | Output::DryRun { .. } => None,
     };
-    let mut interruptions = Interruptions::listen();
-    say(format_args!("Migrating from {}", input.source()));
+    let mut termination = Termination::listen();
+    say(format_args!("Migrating from DuckDB file '{}'", input.db_path.display()));
     let progress = Progress::new();
-    let heartbeat = progress.keep_alive();
+    let heartbeat = progress.keep_reporting();
     let cancellation = Arc::new(Cancellation::default());
-    let migration = prepare(args, input, output.spill_dir(), &progress, &cancellation, &mut interruptions).await?;
-    let (checksums, elapsed) = convert(migration, input, &output, &progress, &cancellation, &mut interruptions).await?;
+    let migration = prepare(args, input, output.spill_dir(), &cancellation, &mut termination).await?;
+    let (checksums, elapsed) = convert(migration, input, &output, &progress, &cancellation, &mut termination).await?;
     drop(heartbeat);
     print_summary(&checksums, elapsed);
 
     let data_file = match output {
-        Output::Discarded { .. } => {
+        Output::DryRun { .. } => {
             say(format_args!("Nothing was written or loaded (--dry-run)."));
             return Ok(());
         }
@@ -72,13 +72,12 @@ async fn migrate(args: &Args, input: &MigrationInput) -> Result<(), Failure> {
     let database = &input.database;
     say(format_args!("Importing into '{database}' from {} (kept if the import fails)...", data_file.path.display()));
     let started = Instant::now();
-    let imported = interruptions
-        .guard(import(&connection, driver, database, &input.schema_text, &data_file.path))
+    let imported = guard(&mut termination, import(&connection, driver, database, &input.schema_text, &data_file.path))
         .await
         .map_err(|signal| kept(Failure::interrupted_import(signal)))?;
     match imported.map_err(kept)? {
         Imported::Confirmed => {
-            remove_if_exists(&data_file.path);
+            remove_file_if_exists(&data_file.path);
             say(format_args!("Imported in {}.", format_duration(started.elapsed())));
             Ok(())
         }
@@ -114,10 +113,6 @@ impl MigrationInput {
         let original_database = format!("duckdb:{}", db_path.file_name().unwrap_or_default().to_string_lossy());
         MigrationInput { db_path, schema_path, schema_text, database, original_database }
     }
-
-    fn source(&self) -> Source {
-        Source::DuckDb(self.db_path.clone())
-    }
 }
 
 fn check_source_file(db_path: &Path) {
@@ -139,9 +134,8 @@ fn database_name(args: &Args, db_path: &Path) -> String {
     name
 }
 
-// A dry run spills into the system's temporary directory.
 enum Output {
-    Discarded { spill_dir: PathBuf },
+    DryRun { spill_dir: PathBuf },
     DataFile(DataFileOutput),
 }
 
@@ -155,7 +149,7 @@ impl Output {
     fn prepare(args: &Args, input: &MigrationInput) -> Result<Output, Failure> {
         if args.dry_run {
             let spill_dir = std::env::temp_dir().join(format!(".typedb-loader.{}.tmp", process::id()));
-            return Ok(Output::Discarded { spill_dir });
+            return Ok(Output::DryRun { spill_dir });
         }
         let work_dir = match args.output_dir.as_deref() {
             Some(dir) => PathBuf::from(if dir.is_empty() { "." } else { dir }),
@@ -169,13 +163,13 @@ impl Output {
         let path = output_data_path(&work_dir, &input.database, args.overwrite)?;
         let spill_dir = work_dir.join(format!(".{}.tmp", input.database));
         remove_spill_left_behind(&spill_dir)?;
-        remove_if_exists(&partial_path(&path));
+        remove_file_if_exists(&partial_path(&path));
         Ok(Output::DataFile(DataFileOutput { path, spill_dir, _lock: lock }))
     }
 
     fn spill_dir(&self) -> &Path {
         match self {
-            Output::Discarded { spill_dir } | Output::DataFile(DataFileOutput { spill_dir, .. }) => spill_dir,
+            Output::DryRun { spill_dir } | Output::DataFile(DataFileOutput { spill_dir, .. }) => spill_dir,
         }
     }
 }
@@ -226,7 +220,7 @@ impl OutputLock {
 impl Drop for OutputLock {
     fn drop(&mut self) {
         if cfg!(unix) {
-            remove_if_exists(&self.path);
+            remove_file_if_exists(&self.path);
         }
     }
 }
@@ -262,7 +256,7 @@ fn remove_spill_left_behind(spill_dir: &Path) -> Result<(), Failure> {
     {
         for entry in entries.flatten() {
             if entry.file_name().to_string_lossy().starts_with("duckdb_temp_") {
-                remove_if_exists(&entry.path());
+                remove_file_if_exists(&entry.path());
             }
         }
     }
@@ -272,9 +266,8 @@ fn remove_spill_left_behind(spill_dir: &Path) -> Result<(), Failure> {
     })
 }
 
-fn remove_if_exists(path: &Path) {
-    let removed = if path.is_dir() { fs::remove_dir_all(path) } else { fs::remove_file(path) };
-    match removed {
+fn remove_file_if_exists(path: &Path) {
+    match fs::remove_file(path) {
         Ok(()) => {}
         Err(err) if err.kind() == io::ErrorKind::NotFound => {}
         Err(err) => {
@@ -343,12 +336,19 @@ impl Failure {
         Failure { exit_code: signal, message: "interrupted; nothing was loaded".to_owned(), kept_hint: None }
     }
 
+    fn interrupted_after_conversion(signal: i32, data_path: &Path) -> Failure {
+        let message = format!(
+            "interrupted after the conversion, before anything was loaded: the data file is complete at {}",
+            data_path.display()
+        );
+        Failure { exit_code: signal, message, kept_hint: None }
+    }
+
     fn interrupted_import(signal: i32) -> Failure {
         let message = "interrupted before the import completed; the server discards a partial import".to_owned();
         Failure { exit_code: signal, message, kept_hint: None }
     }
 
-    // Writes that fail are ignored: the terminal or the pipe may be gone.
     fn report(self) -> i32 {
         let _ = writeln!(io::stderr(), "{} {}", format_error!("error:"), self.message);
         if let Some(kept_hint) = self.kept_hint {
@@ -358,58 +358,37 @@ impl Failure {
     }
 }
 
-// SIGINT or SIGTERM, as the exit code a shell reports for each. Without signal handling, nothing arrives.
-struct Interruptions(Option<Termination>);
-
-impl Interruptions {
-    fn listen() -> Self {
-        match Termination::listen() {
-            Ok(signals) => Interruptions(Some(signals)),
-            Err(err) => {
-                println_warning!("interrupts will not be handled: {err}");
-                Interruptions(None)
-            }
-        }
+async fn guard<T>(termination: &mut Termination, work: impl Future<Output = T>) -> Result<T, i32> {
+    tokio::select! {
+        result = work => Ok(result),
+        signal = termination.next() => Err(signal),
     }
+}
 
-    async fn guard<T>(&mut self, work: impl Future<Output = T>) -> Result<T, i32> {
+struct Interrupted<T> {
+    signal: i32,
+    outcome: T,
+}
+
+async fn guard_blocking<T: Send + 'static>(
+    termination: &mut Termination,
+    cancellation: &Cancellation,
+    work: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, Interrupted<T>> {
+    let mut task = tokio::task::spawn_blocking(work);
+    let signal = tokio::select! {
+        outcome = &mut task => return Ok(joined(outcome)),
+        signal = termination.next() => signal,
+    };
+    let mut repeat = tokio::time::interval(Duration::from_millis(100));
+    loop {
         tokio::select! {
-            result = work => Ok(result),
-            signal = self.next() => Err(signal),
-        }
-    }
-
-    // Cancels and awaits the work, interrupting again as DuckDB forgets it between queries; a second signal exits.
-    async fn guard_blocking<T: Send + 'static>(
-        &mut self,
-        cancellation: &Cancellation,
-        work: impl FnOnce() -> T + Send + 'static,
-    ) -> Result<T, (i32, T)> {
-        let mut task = tokio::task::spawn_blocking(work);
-        let signal = tokio::select! {
-            outcome = &mut task => return Ok(joined(outcome)),
-            signal = self.next() => signal,
-        };
-        let mut repeat = tokio::time::interval(Duration::from_millis(100));
-        loop {
-            tokio::select! {
-                outcome = &mut task => return Err((signal, joined(outcome))),
-                _ = repeat.tick() => cancellation.cancel(),
-                second = self.next() => {
-                    let _ = writeln!(io::stderr(), "Force-exiting.");
-                    process::exit(second)
-                }
+            outcome = &mut task => return Err(Interrupted { signal, outcome: joined(outcome) }),
+            _ = repeat.tick() => cancellation.cancel(),
+            second = termination.next() => {
+                let _ = writeln!(io::stderr(), "Force-exiting.");
+                process::exit(second)
             }
-        }
-    }
-
-    async fn next(&mut self) -> i32 {
-        match &mut self.0 {
-            Some(signals) => match signals.recv().await {
-                Some(signal) => signal,
-                None => std::future::pending().await,
-            },
-            None => std::future::pending().await,
         }
     }
 }
@@ -422,21 +401,18 @@ async fn prepare(
     args: &Args,
     input: &MigrationInput,
     spill_dir: &Path,
-    progress: &Progress,
     cancellation: &Arc<Cancellation>,
-    interruptions: &mut Interruptions,
+    termination: &mut Termination,
 ) -> Result<Migration, Failure> {
-    let (source, schema_text) = (input.source(), input.schema_text.clone());
+    let (source, schema_text) = (input.db_path.clone(), input.schema_text.clone());
     let (spill_dir, memory_limit, task_cancellation) =
         (spill_dir.to_path_buf(), args.memory_limit.clone(), cancellation.clone());
     let started = Instant::now();
-    let prepared = interruptions
-        .guard_blocking(cancellation, move || {
-            Migration::prepare(&source, &schema_text, &spill_dir, memory_limit.as_deref(), task_cancellation)
-        })
-        .await
-        .map_err(|(signal, _)| Failure::interrupted(signal))?;
-    progress.mark_reported();
+    let prepared = guard_blocking(termination, cancellation, move || {
+        Migration::prepare(&source, &schema_text, &spill_dir, memory_limit.as_deref(), task_cancellation)
+    })
+    .await
+    .map_err(|interrupted| Failure::interrupted(interrupted.signal))?;
     match prepared {
         Ok(migration) => {
             print_mapping(&migration.mapping_summary());
@@ -469,36 +445,30 @@ async fn convert(
     output: &Output,
     progress: &Progress,
     cancellation: &Cancellation,
-    interruptions: &mut Interruptions,
+    termination: &mut Termination,
 ) -> Result<(Checksums, Duration), Failure> {
     let data_path = match output {
-        Output::Discarded { .. } => None,
+        Output::DryRun { .. } => None,
         Output::DataFile(data_file) => Some(data_file.path.clone()),
     };
     let (original_database, progress) = (input.original_database.clone(), progress.clone());
     let data_file = data_path.clone();
-    let converted = interruptions
-        .guard_blocking(cancellation, move || {
-            let started = Instant::now();
-            let checksums = match &data_file {
-                None => migration.run(io::sink(), VERSION.trim(), &original_database, &progress),
-                Some(path) => write_data_file(&migration, path, &original_database, &progress),
-            };
-            drop(migration);
-            checksums.map(|checksums| (checksums, started.elapsed()))
-        })
-        .await;
+    let converted = guard_blocking(termination, cancellation, move || {
+        let started = Instant::now();
+        let checksums = match &data_file {
+            None => migration.run(io::sink(), VERSION.trim(), &original_database, &progress),
+            Some(path) => write_data_file(&migration, path, &original_database, &progress),
+        };
+        drop(migration);
+        checksums.map(|checksums| (checksums, started.elapsed()))
+    })
+    .await;
     match (converted, data_path) {
         (Ok(converted), _) => converted.map_err(|message| Failure::new(ExitCode::MigrationError, message)),
-        (Err((signal, Ok(_))), Some(path)) => Err(Failure {
-            exit_code: signal,
-            message: format!(
-                "interrupted after the conversion, before anything was loaded: the data file is complete at {}",
-                path.display()
-            ),
-            kept_hint: None,
-        }),
-        (Err((signal, _)), _) => Err(Failure::interrupted(signal)),
+        (Err(Interrupted { signal, outcome: Ok(_) }), Some(path)) => {
+            Err(Failure::interrupted_after_conversion(signal, &path))
+        }
+        (Err(Interrupted { signal, .. }), _) => Err(Failure::interrupted(signal)),
     }
 }
 
@@ -533,7 +503,7 @@ struct PartialFile(PathBuf);
 
 impl Drop for PartialFile {
     fn drop(&mut self) {
-        remove_if_exists(&self.0);
+        remove_file_if_exists(&self.0);
     }
 }
 
@@ -542,51 +512,40 @@ fn partial_path(path: &Path) -> PathBuf {
     path.with_file_name(format!(".{}.partial", file_name.trim_start_matches('.')))
 }
 
+// Checks and sorts report nothing for up to hours: each interval says what the latest scan reached, or "working".
 #[derive(Clone)]
 struct Progress {
     started: Instant,
-    last_reported: Arc<Mutex<Instant>>,
+    latest_scan: Arc<Mutex<Option<String>>>,
 }
 
 impl Progress {
-    const QUIET: Duration = Duration::from_secs(60);
+    const INTERVAL: Duration = Duration::from_secs(30);
 
     fn new() -> Progress {
-        let now = Instant::now();
-        Progress { started: now, last_reported: Arc::new(Mutex::new(now)) }
+        Progress { started: Instant::now(), latest_scan: Arc::new(Mutex::new(None)) }
     }
 
-    // Checks and sorts report nothing for up to hours: whenever nothing was reported for a while, says it works.
-    fn keep_alive(&self) -> Heartbeat {
+    fn keep_reporting(&self) -> Heartbeat {
         let progress = self.clone();
         Heartbeat(tokio::spawn(async move {
+            let mut ticks = tokio::time::interval_at((Instant::now() + Progress::INTERVAL).into(), Progress::INTERVAL);
             loop {
-                let last_reported = *progress.last_reported();
-                tokio::time::sleep_until((last_reported + Progress::QUIET).into()).await;
-                if *progress.last_reported() == last_reported {
-                    progress.say("working");
-                }
+                ticks.tick().await;
+                let latest = progress.latest_scan().take().unwrap_or_else(|| "working".to_owned());
+                say(format_args!("  {latest} ({} elapsed)", format_duration(progress.started.elapsed())));
             }
         }))
     }
 
-    fn mark_reported(&self) {
-        *self.last_reported() = Instant::now();
-    }
-
-    fn say(&self, message: &str) {
-        self.mark_reported();
-        say(format_args!("  {message} ({} elapsed)", format_duration(self.started.elapsed())));
-    }
-
-    fn last_reported(&self) -> MutexGuard<'_, Instant> {
-        self.last_reported.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    fn latest_scan(&self) -> MutexGuard<'_, Option<String>> {
+        self.latest_scan.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 }
 
 impl ProgressListener for Progress {
     fn report(&self, progress: &ScanProgress<'_>) {
-        self.say(&progress.to_string());
+        *self.latest_scan() = Some(progress.to_string());
     }
 }
 

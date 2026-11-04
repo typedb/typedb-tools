@@ -49,6 +49,8 @@ jobs:
       CARGO_BAZEL_GENERATOR_URL: https://repo.typedb.com/public/public-tools/raw/versions/0.0.0/cargo-bazel-${{ matrix.platform }}
     steps:
       - uses: actions/checkout@v4
+      # Bazel's git_repository deletes .git right after a fetch, which races git's detached background maintenance.
+      - run: git config --global maintenance.auto false && git config --global gc.auto 0
       - uses: bazel-contrib/setup-bazel@0.15.0
         with:
           bazelisk-cache: true
@@ -77,6 +79,8 @@ jobs:
       CARGO_BAZEL_GENERATOR_URL: https://repo.typedb.com/public/public-tools/raw/versions/0.0.0/cargo-bazel-${{ matrix.platform }}
     steps:
       - uses: actions/checkout@v4
+      # Bazel's git_repository deletes .git right after a fetch, which races git's detached background maintenance.
+      - run: git config --global maintenance.auto false && git config --global gc.auto 0
       - uses: bazel-contrib/setup-bazel@0.15.0
         with:
           bazelisk-cache: true
