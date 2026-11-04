@@ -1,0 +1,95 @@
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
+name: Loader tests (Windows)
+
+# `paths` here narrows PR triggers to changes that could affect the Loader binary or its tests.
+# Pushes to development/master use the unfiltered branch trigger so we always validate on
+# integration regardless of what the patch touched.
+on:
+  push:
+  pull_request:
+    paths:
+      - 'loader/**'
+      - 'common/**'
+      - 'tool/connect/**'
+      - 'tool/runner/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'MODULE.bazel'
+      - 'MODULE.bazel.lock'
+      - 'WORKSPACE'
+      - 'BUILD'
+      - 'deployment.bzl'
+      - '.bazelversion'
+      - '.github/windows/**'
+      - '.github/workflows/test-loader-windows.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  unit-tests:
+    name: Loader unit tests (windows-x86_64)
+    runs-on: windows-2022
+    timeout-minutes: 150
+    env:
+      CARGO_BAZEL_GENERATOR_URL: https://repo.typedb.com/public/public-tools/raw/versions/0.0.0/cargo-bazel-win-x86_64
+    defaults:
+      run:
+        shell: cmd
+    steps:
+      - uses: actions/checkout@v4
+      - uses: bazel-contrib/setup-bazel@0.15.0
+        with:
+          bazelisk-cache: true
+          disk-cache: true
+          repository-cache: true
+          google-credentials: ${{ secrets.BAZEL_CACHE_CREDENTIAL_JSON }}
+          bazelrc: |
+            build --remote_cache https://storage.googleapis.com/typedb-engineers-bazel-remote-cache-europe-west1
+            build --remote_upload_local_results=${{ secrets.BAZEL_CACHE_CREDENTIAL_JSON != '' }}
+      - run: .github\windows\prepare.bat
+      - run: |
+          call refreshenv
+          bazel --output_base=C:/b test --enable_runfiles //loader:loader-unit-tests --test_output=streamed
+      - run: |
+          call refreshenv
+          bazel --output_base=C:/b test --enable_runfiles //loader/migration:unit-tests //loader/migration:test-migration --test_output=streamed
+      - run: |
+          call refreshenv
+          bazel --output_base=C:/b test --enable_runfiles //loader/tests/migration:test-migration-cli --test_output=streamed
+
+  # The test runner cannot launch a Windows distribution yet.
+  assembly-tests:
+    name: Loader assembly tests (windows-x86_64)
+    if: false
+    runs-on: windows-2022
+    timeout-minutes: 150
+    env:
+      CARGO_BAZEL_GENERATOR_URL: https://repo.typedb.com/public/public-tools/raw/versions/0.0.0/cargo-bazel-win-x86_64
+    defaults:
+      run:
+        shell: cmd
+    steps:
+      - uses: actions/checkout@v4
+      - uses: bazel-contrib/setup-bazel@0.15.0
+        with:
+          bazelisk-cache: true
+          disk-cache: true
+          repository-cache: true
+          google-credentials: ${{ secrets.BAZEL_CACHE_CREDENTIAL_JSON }}
+          bazelrc: |
+            build --remote_cache https://storage.googleapis.com/typedb-engineers-bazel-remote-cache-europe-west1
+            build --remote_upload_local_results=${{ secrets.BAZEL_CACHE_CREDENTIAL_JSON != '' }}
+      - run: .github\windows\prepare.bat
+      - run: git apply .github\windows\package_binary_as_exe.patch
+      - run: |
+          call refreshenv
+          bazel --output_base=C:/b test --enable_runfiles //loader/tests/assembly:test-loader --test_output=streamed

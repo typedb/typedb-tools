@@ -5,123 +5,29 @@
  */
 
 use crate::{
-    Diagnostics,
+    Findings,
     catalog::{Catalog, Column, ColumnType, ForeignKey, Table},
     schema::{ObjectType, Relates, Schema, ValueType},
+    sql::{self, IID_COLUMN, duckdb_type},
     value::DECIMAL_FRACTIONAL_DIGITS,
 };
 
-pub(crate) const IID_COLUMN: &str = "_iid";
-
-pub(crate) fn quoted(identifier: &str) -> String {
-    format!("\"{}\"", identifier.replace('"', "\"\""))
-}
-
-#[derive(Debug)]
-pub(crate) struct OwnsMapping {
-    pub(crate) column: String,
-    pub(crate) attribute: String,
-    pub(crate) value_type: ValueType,
-    pub(crate) multi: bool,
-    pub(crate) column_type: ColumnType,
-}
-
-impl OwnsMapping {
-    pub(crate) fn typed(&self, expr: &str) -> String {
-        match self.cast() {
-            Some(sql_type) => format!("{expr}::{sql_type}"),
-            None => expr.to_owned(),
-        }
+pub(crate) fn resolve(catalog: &Catalog, schema: &Schema, findings: &mut Findings) -> MappingPlan {
+    for unread in &catalog.unread_tables_and_views {
+        findings.warning(format!(
+            "{unread} is not loaded: only tables of the 'main' schema are read (materialise a view as a table)"
+        ));
     }
-
-    pub(crate) fn read(&self, expr: &str) -> String {
-        let value = self.typed(expr);
-        if self.value_type == ValueType::String { format!("{value} COLLATE \"binary\"") } else { value }
+    let mut targets = type_tables(catalog, schema, findings);
+    targets.sort_by_key(|target| target.is_relation);
+    let tables =
+        targets.iter().map(|target| TableMapper::new(target, &targets, schema, findings).map()).collect::<Vec<_>>();
+    let plan = MappingPlan { tables };
+    // Types the errors leave unmapped would only repeat them.
+    if !findings.has_errors() {
+        warn_about_types_without_source(&plan, schema, findings);
     }
-
-    pub(crate) fn projection(&self, table_alias: &str) -> String {
-        let column = format!("{table_alias}.{}", quoted(&self.column));
-        if self.multi { self.list(&column) } else { self.typed(&column) }
-    }
-
-    pub(crate) fn element(&self) -> String {
-        let column = quoted(&self.column);
-        if self.multi { format!("unnest({column})") } else { column }
-    }
-
-    fn list(&self, column: &str) -> String {
-        match self.cast() {
-            Some(sql_type) => format!("{column}::{sql_type}[]"),
-            None => column.to_owned(),
-        }
-    }
-
-    // A UNION's own type unification can round decimals, so every column of an attribute is read in one type:
-    // integers as BIGINT (the checks have proven that they fit), doubles as DOUBLE, decimals at TypeDB's scale.
-    // Intervals are read as text: DuckDB compares them normalised (1 month = 30 days), TypeDB does not.
-    pub(crate) fn cast(&self) -> Option<String> {
-        if matches!(self.column_type, ColumnType::StringLike | ColumnType::Interval) {
-            return Some("VARCHAR".to_owned());
-        }
-        match self.value_type {
-            ValueType::Integer => matches!(self.column_type, ColumnType::Integer { .. }).then(|| "BIGINT".to_owned()),
-            ValueType::Double => Some("DOUBLE".to_owned()),
-            ValueType::Decimal => Some(format!("DECIMAL(38,{DECIMAL_FRACTIONAL_DIGITS})")),
-            ValueType::Boolean
-            | ValueType::String
-            | ValueType::Date
-            | ValueType::Datetime
-            | ValueType::DatetimeTz
-            | ValueType::Duration => None,
-        }
-    }
-}
-
-#[derive(Debug)]
-pub(crate) struct RoleBinding {
-    pub(crate) column: String,
-    pub(crate) relates: Relates,
-    // The players' table, as an index into `MappingPlan::tables`.
-    pub(crate) player: usize,
-    // Named by a `references` directive rather than a declared FOREIGN KEY, so the loader checks every value.
-    pub(crate) verify_reference: bool,
-}
-
-// What DuckDB guarantees about a table's `_iid`; the loader checks every value for what is not declared.
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct DeclaredIds {
-    pub(crate) unique: bool,
-    pub(crate) not_null: bool,
-}
-
-#[derive(Debug)]
-pub(crate) enum TableKind {
-    Entity,
-    Relation { roles: Vec<RoleBinding> },
-}
-
-#[derive(Debug)]
-pub(crate) struct TableMapping {
-    pub(crate) name: String,
-    pub(crate) type_label: String,
-    pub(crate) kind: TableKind,
-    pub(crate) owns: Vec<OwnsMapping>,
-    pub(crate) declared_ids: DeclaredIds,
-    // DuckDB holds an index in memory for each PRIMARY KEY, UNIQUE and FOREIGN KEY constraint of the table.
-    pub(crate) declares_keys: bool,
-}
-
-impl TableMapping {
-    pub(crate) fn is_relation(&self) -> bool {
-        matches!(self.kind, TableKind::Relation { .. })
-    }
-
-    pub(crate) fn roles(&self) -> &[RoleBinding] {
-        match &self.kind {
-            TableKind::Relation { roles } => roles,
-            TableKind::Entity => &[],
-        }
-    }
+    plan
 }
 
 #[derive(Debug, Default)]
@@ -131,39 +37,713 @@ pub(crate) struct MappingPlan {
 
 impl MappingPlan {
     pub(crate) fn summary(&self) -> Vec<String> {
-        self.tables
+        self.tables.iter().map(TableMapping::summary).collect()
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct TableMapping {
+    pub(crate) name: String,
+    pub(crate) type_label: String,
+    pub(crate) kind: TableKind,
+    pub(crate) ownerships: Vec<OwnershipColumn>,
+    pub(crate) id_guarantees: DeclaredIdGuarantees,
+    pub(crate) has_declared_keys: bool,
+}
+
+impl TableMapping {
+    pub(crate) fn is_relation(&self) -> bool {
+        matches!(self.kind, TableKind::Relation { .. })
+    }
+
+    pub(crate) fn roles(&self) -> &[RoleColumn] {
+        match &self.kind {
+            TableKind::Relation { roles } => roles,
+            TableKind::Entity => &[],
+        }
+    }
+
+    fn summary(&self) -> String {
+        let checked = |declared: bool| if declared { "declared" } else { "checked by the loader" };
+        let are_ids_declared = self.id_guarantees.is_unique && self.id_guarantees.is_not_null;
+        let are_references_declared = self.roles().iter().all(|role| role.is_reference_declared);
+        let (roles, references) = match self.roles() {
+            [] => (String::new(), String::new()),
+            roles => (
+                format!(", {} role column(s)", roles.len()),
+                format!(", references {}", checked(are_references_declared)),
+            ),
+        };
+        format!(
+            "table '{}' -> {} '{}' ({} attribute column(s){roles}; ids {}{references})",
+            self.name,
+            if self.is_relation() { "relation" } else { "entity" },
+            self.type_label,
+            self.ownerships.len(),
+            checked(are_ids_declared),
+        )
+    }
+}
+
+#[derive(Debug)]
+pub(crate) enum TableKind {
+    Entity,
+    Relation { roles: Vec<RoleColumn> },
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct DeclaredIdGuarantees {
+    pub(crate) is_unique: bool,
+    pub(crate) is_not_null: bool,
+}
+
+#[derive(Debug)]
+pub(crate) struct RoleColumn {
+    pub(crate) column: String,
+    pub(crate) relates: Relates,
+    pub(crate) player_table_index: usize,
+    pub(crate) is_reference_declared: bool,
+}
+
+#[derive(Debug)]
+pub(crate) struct OwnershipColumn {
+    pub(crate) column: String,
+    pub(crate) attribute: String,
+    pub(crate) value_type: ValueType,
+    pub(crate) is_list: bool,
+    pub(crate) element_type: ColumnType,
+}
+
+impl OwnershipColumn {
+    // The column as an object scan reads it.
+    pub(crate) fn scanned(&self) -> String {
+        let column = sql::column_of_scanned_table(&self.column);
+        match (self.read_type(), self.is_list) {
+            (Some(read_type), true) => sql::list_cast(&column, &read_type),
+            (Some(read_type), false) => sql::cast(&column, &read_type),
+            (None, _) => column,
+        }
+    }
+
+    // One row per value, a list's elements unnested.
+    pub(crate) fn values(&self) -> String {
+        let column = sql::quoted(&self.column);
+        if self.is_list { sql::unnest(&column) } else { column }
+    }
+
+    // Every column of an attribute is read in the attribute's type, and strings are compared byte-wise.
+    pub(crate) fn attribute_values(&self) -> String {
+        let values = match self.read_type() {
+            Some(read_type) => sql::cast(&self.values(), &read_type),
+            None => self.values(),
+        };
+        if self.value_type == ValueType::String { sql::byte_wise(&values) } else { values }
+    }
+
+    fn read_type(&self) -> Option<String> {
+        match (&self.element_type, self.value_type) {
+            (ColumnType::ReadAsVarchar, _) => Some(duckdb_type::VARCHAR.to_owned()),
+            // DuckDB compares intervals normalised (1 month = 30 days), TypeDB does not.
+            (ColumnType::Interval, _) => Some(duckdb_type::VARCHAR.to_owned()),
+            (ColumnType::Integer { .. }, ValueType::Integer) => Some(duckdb_type::BIGINT.to_owned()),
+            (_, ValueType::Double) => Some(duckdb_type::DOUBLE.to_owned()),
+            (_, ValueType::Decimal) => Some(duckdb_type::decimal(38, DECIMAL_FRACTIONAL_DIGITS)),
+            (_, _) => None,
+        }
+    }
+}
+
+const RELATION_IS_A_TABLE: &str = "relations are tables; stage the relation as its own table, \
+     then '@typedb skip' this column (see the README's modelling section)";
+
+struct TableTarget<'a> {
+    table: &'a Table,
+    object: &'a ObjectType,
+    is_relation: bool,
+    role_bindings: Vec<RoleBinding>,
+    id_guarantees: DeclaredIdGuarantees,
+}
+
+fn type_tables<'a>(catalog: &'a Catalog, schema: &'a Schema, findings: &mut Findings) -> Vec<TableTarget<'a>> {
+    let mut targets = Vec::new();
+    for table in &catalog.tables {
+        let directive = match parse_table_directive(table) {
+            Ok(Some(directive)) => directive,
+            Ok(None) => match directive_implied_by_name(table, schema, findings) {
+                Some(directive) => directive,
+                None => continue,
+            },
+            Err(message) => {
+                findings.error(message);
+                continue;
+            }
+        };
+        let (label, is_relation, role_bindings) = match directive {
+            TableDirective::Skip => continue,
+            TableDirective::Entity { label } => (label, false, Vec::new()),
+            TableDirective::Relation { label, role_bindings } => (label, true, role_bindings),
+        };
+        let Some(object) = schema.object(&label, is_relation) else {
+            findings.error(format!(
+                "table '{}' is mapped to '{label}', which is not {} in the TypeDB schema",
+                table.name,
+                if is_relation { "a relation type" } else { "an entity type" }
+            ));
+            continue;
+        };
+        if object.is_abstract {
+            findings.error(format!(
+                "table '{}' is mapped to abstract type '{label}', which cannot have instances",
+                table.name
+            ));
+            continue;
+        }
+        let Some(id_guarantees) = instance_id_guarantees(table, findings) else { continue };
+        targets.push(TableTarget { table, object, is_relation, role_bindings, id_guarantees });
+    }
+    targets
+}
+
+fn directive_implied_by_name(table: &Table, schema: &Schema, findings: &mut Findings) -> Option<TableDirective> {
+    let entity = find_by_name(&schema.entities, &table.name, |entity| &entity.label);
+    let relation = find_by_name(&schema.relations, &table.name, |relation| &relation.label);
+    match (entity, relation) {
+        (Some(entity), None) => Some(TableDirective::Entity { label: entity.label.clone() }),
+        (None, Some(relation)) => {
+            Some(TableDirective::Relation { label: relation.label.clone(), role_bindings: Vec::new() })
+        }
+        (Some(_), Some(_)) => {
+            findings.error(format!(
+                "table '{}' matches both an entity and a relation type; disambiguate with \
+                 COMMENT ON TABLE ... IS '@typedb entity <label>' or '@typedb relation <label> (...)'",
+                table.name
+            ));
+            None
+        }
+        (None, None) => {
+            findings.error(format!(
+                "table '{}' has no matching entity or relation type in the TypeDB schema \
+                 (add the type, or mark the table '@typedb skip')",
+                table.name
+            ));
+            None
+        }
+    }
+}
+
+fn instance_id_guarantees(table: &Table, findings: &mut Findings) -> Option<DeclaredIdGuarantees> {
+    let contract = format!(
+        "add `{IID_COLUMN} UBIGINT`, unique and not null, holding the row's instance id (unsigned 64-bit; see the \
+         README's modelling section)"
+    );
+    let Some(column) = table.column(IID_COLUMN) else {
+        findings.error(format!("table '{}' has no {IID_COLUMN} column: {contract}", table.name));
+        return None;
+    };
+    if table.foreign_key_of(IID_COLUMN).is_some() {
+        findings.error(format!(
+            "table '{}': {IID_COLUMN} is a FOREIGN KEY, which cannot stand for an instance of another table; \
+             an instance belongs to one table (see the README's modelling section)",
+            table.name
+        ));
+        return None;
+    }
+    if column.column_type != ColumnType::INSTANCE_ID {
+        findings.error(format!(
+            "table '{}': {IID_COLUMN} must be UBIGINT (an instance id is unsigned 64-bit), found {}: {contract}",
+            table.name, column.duckdb_type
+        ));
+        return None;
+    }
+    let is_primary_key = table.primary_key.as_slice() == [IID_COLUMN];
+    Some(DeclaredIdGuarantees {
+        is_unique: is_primary_key || table.unique_column_sets.iter().any(|set| set.as_slice() == [IID_COLUMN]),
+        is_not_null: is_primary_key || table.not_null_columns.contains(IID_COLUMN),
+    })
+}
+
+#[derive(Clone, Copy)]
+enum PlayerTableReference<'a> {
+    ForeignKey(&'a ForeignKey),
+    Directive(&'a str),
+}
+
+impl PlayerTableReference<'_> {
+    fn table(&self) -> &str {
+        match self {
+            PlayerTableReference::ForeignKey(foreign_key) => &foreign_key.referenced_table,
+            PlayerTableReference::Directive(table) => table,
+        }
+    }
+}
+
+struct TableMapper<'a, 'f> {
+    target: &'a TableTarget<'a>,
+    targets: &'a [TableTarget<'a>],
+    schema: &'a Schema,
+    findings: &'f mut Findings,
+    ownerships: Vec<OwnershipColumn>,
+    roles: Vec<RoleColumn>,
+    skipped_columns: Vec<&'a str>,
+}
+
+impl<'a, 'f> TableMapper<'a, 'f> {
+    fn new(
+        target: &'a TableTarget<'a>,
+        targets: &'a [TableTarget<'a>],
+        schema: &'a Schema,
+        findings: &'f mut Findings,
+    ) -> Self {
+        TableMapper {
+            target,
+            targets,
+            schema,
+            findings,
+            ownerships: Vec::new(),
+            roles: Vec::new(),
+            skipped_columns: Vec::new(),
+        }
+    }
+
+    fn map(mut self) -> TableMapping {
+        let target = self.target;
+        for column in &target.table.columns {
+            self.map_column(column);
+        }
+        self.check_role_bindings();
+        if target.is_relation {
+            self.check_roles_filled();
+        }
+        let TableTarget { table, object, is_relation, id_guarantees, .. } = target;
+        let kind = if *is_relation { TableKind::Relation { roles: self.roles } } else { TableKind::Entity };
+        TableMapping {
+            name: table.name.clone(),
+            type_label: object.label.clone(),
+            kind,
+            ownerships: self.ownerships,
+            id_guarantees: *id_guarantees,
+            has_declared_keys: table.has_declared_keys(),
+        }
+    }
+
+    fn map_column(&mut self, column: &'a Column) {
+        let target = self.target;
+        let table = &target.table.name;
+        if column.name == IID_COLUMN {
+            if column.comment.as_deref().and_then(strip_directive_prefix).is_some() {
+                self.findings
+                    .error(format!("table '{table}': {IID_COLUMN} holds the instances' ids and takes no directive"));
+            }
+            return;
+        }
+        let directive = match parse_column_directive(target.table, column) {
+            Ok(directive) => directive,
+            Err(message) => return self.findings.error(message),
+        };
+        if directive == Some(ColumnDirective::Skip) {
+            self.skipped_columns.push(&column.name);
+            return;
+        }
+        let reference = match player_table_reference(target.table, column, &directive) {
+            Ok(reference) => reference,
+            Err(message) => return self.findings.error(message),
+        };
+        let binding = target.role_bindings.iter().find(|binding| binding.column == column.name);
+        match (&directive, binding, reference) {
+            (Some(ColumnDirective::Owns(_)), Some(_), _) | (Some(ColumnDirective::Owns(_)), _, Some(_)) => {
+                self.findings.error(format!(
+                    "table '{table}': column '{}' holds role players (a FOREIGN KEY or a bound column), so it cannot \
+                     own an attribute",
+                    column.name
+                ))
+            }
+            (_, Some(binding), reference) => self.bind_role(column, &binding.role, reference),
+            (_, None, Some(reference)) if target.is_relation => self.infer_role(column, reference),
+            (_, None, Some(reference)) => self.findings.error(format!(
+                "table '{table}': column '{}' references table '{}', which on an entity table has no TypeDB form: \
+                 {RELATION_IS_A_TABLE}",
+                column.name,
+                reference.table()
+            )),
+            (Some(ColumnDirective::Owns(attribute)), None, None) => self.bind_ownership(column, Some(attribute)),
+            (_, None, None) => self.bind_ownership(column, None),
+        }
+    }
+
+    fn bind_role(&mut self, column: &Column, role: &str, reference: Option<PlayerTableReference<'_>>) {
+        let target = self.target;
+        let (table, relation) = (&target.table.name, &target.object.label);
+        let Some(relates) = target.object.relates.iter().find(|relates| relates.role == role) else {
+            return self.findings.error(format!(
+                "table '{table}': column '{}' is bound to role '{role}', but relation '{relation}' has no such role",
+                column.name
+            ));
+        };
+        let Some(reference) = reference else {
+            return self.findings.error(format!(
+                "table '{table}': column '{}' is bound to role '{role}' but names no players' table: declare it a \
+                 FOREIGN KEY to that table's {IID_COLUMN}, or mark it '@typedb references <table>'",
+                column.name
+            ));
+        };
+        let Some(player_table_index) = self.resolve_player_table(column, reference) else { return };
+        let player = &self.targets[player_table_index];
+        if !self.roles_played_in_relation(player.object).iter().any(|played| played.role == role) {
+            return self.findings.error(format!(
+                "table '{table}': column '{}' is bound to role '{relation}:{role}', but its players' type '{}' \
+                 (table '{}') does not play that role",
+                column.name, player.object.label, player.table.name
+            ));
+        }
+        self.roles.push(role_column(relates, column, player_table_index, reference));
+    }
+
+    // Inferred only when the players play one role: a role bound elsewhere may take several columns.
+    fn infer_role(&mut self, column: &Column, reference: PlayerTableReference<'_>) {
+        let Some(player_table_index) = self.resolve_player_table(column, reference) else { return };
+        let target = self.target;
+        let player = &self.targets[player_table_index];
+        let played_roles = self.roles_played_in_relation(player.object);
+        let (table, relation) = (&target.table.name, &target.object.label);
+        match played_roles.as_slice() {
+            [relates] => self.roles.push(role_column(relates, column, player_table_index, reference)),
+            [] => self.findings.error(format!(
+                "table '{table}': column '{}' references '{}', whose type '{}' plays no role of relation '{relation}'",
+                column.name, player.table.name, player.object.label
+            )),
+            _ => self.findings.error(format!(
+                "table '{table}': column '{}' is ambiguous: '{}' plays {} roles of '{relation}'; bind the columns with \
+                 COMMENT ON TABLE {} IS '@typedb relation {relation} ({})'",
+                column.name,
+                player.object.label,
+                played_roles.len(),
+                sql::quoted(table),
+                played_roles
+                    .iter()
+                    .map(|relates| format!("{} = <column>", relates.role))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )),
+        }
+    }
+
+    // The relation's roles that the player's type plays, also through the relation's supertypes.
+    fn roles_played_in_relation(&self, player: &ObjectType) -> Vec<&'a Relates> {
+        let relations = self.schema.relation_and_supertypes(&self.target.object.label);
+        self.target
+            .object
+            .relates
             .iter()
-            .map(|table| {
-                let checked = |declared: bool| if declared { "declared" } else { "checked by the loader" };
-                let ids = table.declared_ids.unique && table.declared_ids.not_null;
-                let references = table.roles().iter().all(|role| !role.verify_reference);
-                format!(
-                    "table '{}' -> {} '{}' ({} attribute column(s){}; ids {}{})",
-                    table.name,
-                    if table.is_relation() { "relation" } else { "entity" },
-                    table.type_label,
-                    table.owns.len(),
-                    if table.roles().is_empty() {
-                        String::new()
-                    } else {
-                        format!(", {} role column(s)", table.roles().len())
-                    },
-                    checked(ids),
-                    if table.roles().is_empty() {
-                        String::new()
-                    } else {
-                        format!(", references {}", checked(references))
-                    },
-                )
+            .filter(|relates| {
+                player.plays.iter().any(|plays| plays.role == relates.role && relations.contains(&plays.relation))
             })
             .collect()
     }
+
+    fn resolve_player_table(&mut self, column: &Column, reference: PlayerTableReference<'_>) -> Option<usize> {
+        let target = self.target;
+        let table = &target.table.name;
+        let foreign_key = match reference {
+            PlayerTableReference::ForeignKey(foreign_key) => foreign_key,
+            PlayerTableReference::Directive(named) => {
+                if column.column_type != ColumnType::INSTANCE_ID {
+                    self.findings.error(format!(
+                        "table '{table}': column '{}' references '{named}' and must hold its {IID_COLUMN} values, so \
+                         it must be UBIGINT; found {}",
+                        column.name, column.duckdb_type
+                    ));
+                    return None;
+                }
+                let player = self.target_index(named);
+                if player.is_none() {
+                    self.findings.error(format!(
+                        "table '{table}': column '{}' references table '{named}', which is not mapped (is it skipped, \
+                         invalid or misspelt?)",
+                        column.name
+                    ));
+                }
+                return player;
+            }
+        };
+        if foreign_key.columns.len() > 1 {
+            self.findings.error(format!(
+                "table '{table}': column '{}' is part of the composite FOREIGN KEY {:?}, which cannot bind a role: \
+                 reference the players' table by its {IID_COLUMN} column instead",
+                column.name, foreign_key.columns
+            ));
+            return None;
+        }
+        let foreign_keys = target.table.foreign_keys.iter().filter(|other| other.columns.contains(&column.name));
+        if foreign_keys.count() > 1 {
+            self.findings.error(format!(
+                "table '{table}': column '{}' is in several FOREIGN KEYs, so its players' table is ambiguous",
+                column.name
+            ));
+            return None;
+        }
+        let Some(player) = self.target_index(&foreign_key.referenced_table) else {
+            self.findings.error(format!(
+                "table '{table}': FK column '{}' references table '{}', which is not mapped (is it skipped or \
+                 invalid?)",
+                column.name, foreign_key.referenced_table
+            ));
+            return None;
+        };
+        let referenced_columns = foreign_key.referenced_columns.as_slice();
+        if !matches!(referenced_columns, [referenced] if referenced.eq_ignore_ascii_case(IID_COLUMN)) {
+            self.findings.error(format!(
+                "table '{table}': FK column '{}' must reference '{}.{IID_COLUMN}' (the instance-id column); found \
+                 {referenced_columns:?}",
+                column.name, foreign_key.referenced_table
+            ));
+            return None;
+        }
+        Some(player)
+    }
+
+    // DuckDB resolves identifiers case-insensitively but records references as written.
+    fn target_index(&self, table: &str) -> Option<usize> {
+        self.targets.iter().position(|target| target.table.name.eq_ignore_ascii_case(table))
+    }
+
+    fn bind_ownership(&mut self, column: &Column, named_attribute: Option<&str>) {
+        let (target, schema) = (self.target, self.schema);
+        let (table, owner) = (&target.table.name, &target.object.label);
+        let attribute_label = match named_attribute {
+            Some(label) => label.to_owned(),
+            None => match find_by_name(&schema.attributes, &column.name, |attribute| &attribute.label) {
+                Some(attribute) => attribute.label.clone(),
+                None => {
+                    return self.findings.error(format!(
+                        "table '{table}': column '{}' has no matching attribute in the TypeDB schema (add the \
+                         attribute, or mark the column '@typedb skip' / '@typedb owns <label>')",
+                        column.name
+                    ));
+                }
+            },
+        };
+        let Some(attribute) = schema.attribute(&attribute_label) else {
+            return self.findings.error(format!(
+                "table '{table}': column '{}' maps to attribute '{attribute_label}', which does not exist in the \
+                 schema",
+                column.name
+            ));
+        };
+        if !target.object.owns.contains(&attribute_label) {
+            return self.findings.error(format!(
+                "table '{table}': column '{}' maps to attribute '{attribute_label}', but type '{owner}' does not \
+                 own it",
+                column.name
+            ));
+        }
+        if attribute.is_abstract {
+            return self.findings.error(format!(
+                "table '{table}': column '{}' maps to attribute '{attribute_label}', which is abstract and cannot \
+                 have instances; declare a concrete subtype, let '{owner}' own it, and map the column to it with \
+                 '@typedb owns <label>'",
+                column.name
+            ));
+        }
+        let Some(value_type) = attribute.value_type else {
+            return self.findings.error(format!(
+                "table '{table}': column '{}' maps to attribute '{attribute_label}', which has no value type in the \
+                 schema",
+                column.name
+            ));
+        };
+        let (element_type, is_list) = match &column.column_type {
+            ColumnType::List(element) => (element.as_ref(), true),
+            other => (other, false),
+        };
+        if let Err(problem) = element_type_problem(column, element_type, value_type, &attribute_label) {
+            return self.findings.error(format!("table '{table}': column '{}' {problem}", column.name));
+        }
+        self.ownerships.push(OwnershipColumn {
+            column: column.name.clone(),
+            attribute: attribute_label,
+            value_type,
+            is_list,
+            element_type: element_type.clone(),
+        });
+    }
+
+    fn check_role_bindings(&mut self) {
+        let target = self.target;
+        let bindings = &target.role_bindings;
+        for (index, RoleBinding { role, column }) in bindings.iter().enumerate() {
+            let problem = if target.table.column(column).is_none() {
+                "which the table does not have"
+            } else if column == IID_COLUMN {
+                "which holds the relations' own ids"
+            } else if bindings[..index].iter().any(|earlier| earlier.column == *column) {
+                "which the directive already binds; a column holds one role's players"
+            } else if self.skipped_columns.contains(&column.as_str()) {
+                "which is marked '@typedb skip'"
+            } else {
+                continue;
+            };
+            self.findings.error(format!(
+                "table '{}': the relation directive binds role '{role}' to column '{column}', {problem}",
+                target.table.name
+            ));
+        }
+    }
+
+    fn check_roles_filled(&mut self) {
+        let target = self.target;
+        let (table, relation) = (&target.table.name, target.object);
+        if self.roles.is_empty() {
+            return self.findings.error(format!(
+                "relation table '{table}' fills no role, so every row would be a relation without players"
+            ));
+        }
+        for relates in &relation.relates {
+            if !self.roles.iter().any(|role| role.relates.role == relates.role) {
+                self.findings.warning(format!(
+                    "relation table '{table}' never fills role '{}:{}'",
+                    relation.label, relates.role
+                ));
+            }
+        }
+    }
+}
+
+fn player_table_reference<'a>(
+    table: &'a Table,
+    column: &Column,
+    directive: &'a Option<ColumnDirective>,
+) -> Result<Option<PlayerTableReference<'a>>, String> {
+    match (table.foreign_key_of(&column.name), directive) {
+        (Some(foreign_key), Some(ColumnDirective::References(named)))
+            if !foreign_key.referenced_table.eq_ignore_ascii_case(named) =>
+        {
+            Err(format!(
+                "table '{}': column '{}' is marked '@typedb references {named}', but its FOREIGN KEY references '{}'",
+                table.name, column.name, foreign_key.referenced_table
+            ))
+        }
+        (Some(foreign_key), _) => Ok(Some(PlayerTableReference::ForeignKey(foreign_key))),
+        (None, Some(ColumnDirective::References(named))) => Ok(Some(PlayerTableReference::Directive(named))),
+        (None, _) => Ok(None),
+    }
+}
+
+fn role_column(
+    relates: &Relates,
+    column: &Column,
+    player_table_index: usize,
+    reference: PlayerTableReference<'_>,
+) -> RoleColumn {
+    RoleColumn {
+        column: column.name.clone(),
+        relates: relates.clone(),
+        player_table_index,
+        is_reference_declared: matches!(reference, PlayerTableReference::ForeignKey(_)),
+    }
+}
+
+// What follows "table 't': column 'c'" in the error, if the column cannot populate the attribute.
+fn element_type_problem(
+    column: &Column,
+    element_type: &ColumnType,
+    value_type: ValueType,
+    attribute: &str,
+) -> Result<(), String> {
+    let duckdb_type = &column.duckdb_type;
+    match element_type {
+        ColumnType::Unsupported { hint } => Err(format!("has unsupported type {duckdb_type}: {hint}")),
+        ColumnType::List(_) => Err("is a nested list, which has no TypeDB mapping".to_owned()),
+        ColumnType::Decimal { scale, .. } if *scale > DECIMAL_FRACTIONAL_DIGITS => Err(format!(
+            "has DECIMAL scale {scale}, beyond TypeDB's {DECIMAL_FRACTIONAL_DIGITS} fractional digits; DuckDB would \
+             round the values when reading them"
+        )),
+        _ if !can_populate(element_type, value_type) => {
+            let reason = match element_type {
+                ColumnType::Varchar | ColumnType::ReadAsVarchar => "the loader never parses text into values",
+                _ => "the types are incompatible",
+            };
+            Err(format!(
+                "({duckdb_type}) cannot populate attribute '{attribute}' (value type '{}'): {reason}; stage the \
+                 column as {}",
+                value_type.name(),
+                column_type_holding(value_type)
+            ))
+        }
+        _ => Ok(()),
+    }
+}
+
+fn can_populate(column_type: &ColumnType, value_type: ValueType) -> bool {
+    use ValueType as V;
+    match column_type {
+        ColumnType::Boolean => value_type == V::Boolean,
+        ColumnType::Integer { .. } => matches!(value_type, V::Integer | V::Double | V::Decimal),
+        ColumnType::Double => value_type == V::Double,
+        ColumnType::Decimal { .. } => matches!(value_type, V::Decimal | V::Double),
+        ColumnType::Varchar | ColumnType::ReadAsVarchar => value_type == V::String,
+        ColumnType::Date => value_type == V::Date,
+        ColumnType::Timestamp { .. } => value_type == V::Datetime,
+        ColumnType::TimestampTz { .. } => value_type == V::DatetimeTz,
+        ColumnType::Interval => value_type == V::Duration,
+        ColumnType::List(_) | ColumnType::Unsupported { .. } => false,
+    }
+}
+
+fn column_type_holding(value_type: ValueType) -> &'static str {
+    match value_type {
+        ValueType::Boolean => duckdb_type::BOOLEAN,
+        ValueType::Integer => duckdb_type::BIGINT,
+        ValueType::Double => duckdb_type::DOUBLE,
+        ValueType::Decimal => duckdb_type::DECIMAL,
+        ValueType::String => duckdb_type::VARCHAR,
+        ValueType::Date => duckdb_type::DATE,
+        ValueType::Datetime => duckdb_type::TIMESTAMP,
+        ValueType::DatetimeTz => duckdb_type::TIMESTAMPTZ,
+        ValueType::Duration => duckdb_type::INTERVAL,
+    }
+}
+
+fn warn_about_types_without_source(plan: &MappingPlan, schema: &Schema, findings: &mut Findings) {
+    for (types, kind) in [(&schema.entities, "entity"), (&schema.relations, "relation")] {
+        for object in types.iter().filter(|object| !object.is_abstract) {
+            if !plan.tables.iter().any(|table| table.type_label == object.label) {
+                findings.warning(format!(
+                    "{kind} type '{}' has no DuckDB source; no instances will be produced",
+                    object.label
+                ));
+            }
+        }
+    }
+    for attribute in schema.attributes.iter().filter(|attribute| !attribute.is_abstract) {
+        let is_sourced = plan
+            .tables
+            .iter()
+            .any(|table| table.ownerships.iter().any(|ownership| ownership.attribute == attribute.label));
+        if !is_sourced {
+            findings.warning(format!(
+                "attribute type '{}' has no DuckDB source; no instances will be produced",
+                attribute.label
+            ));
+        }
+    }
+}
+
+fn find_by_name<'a, T>(types: &'a [T], name: &str, label: impl Fn(&T) -> &str) -> Option<&'a T> {
+    types.iter().find(|t| label(t) == name).or_else(|| {
+        let dashed = name.replace('_', "-");
+        types.iter().find(|t| label(t) == dashed)
+    })
 }
 
 enum TableDirective {
     Skip,
-    Entity(String),
-    Relation(String, Vec<(String, String)>),
+    Entity { label: String },
+    Relation { label: String, role_bindings: Vec<RoleBinding> },
+}
+
+struct RoleBinding {
+    role: String,
+    column: String,
 }
 
 #[derive(PartialEq)]
@@ -175,32 +755,14 @@ enum ColumnDirective {
 
 const DIRECTIVE_PREFIX: &str = "@typedb";
 
-const RELATION_IS_A_TABLE: &str = "relations are tables; stage the relation as its own table, \
-     then '@typedb skip' this column (see the README's modelling section)";
-
-fn strip_directive_prefix(comment: &str) -> Option<&str> {
-    let comment = comment.trim();
-    let prefix = comment.get(..DIRECTIVE_PREFIX.len())?;
-    prefix.eq_ignore_ascii_case(DIRECTIVE_PREFIX).then(|| comment[DIRECTIVE_PREFIX.len()..].trim())
-}
-
-// A directive is `@typedb <keyword> [<argument>]` (the keyword is case-insensitive).
-fn parse_directive(comment: Option<&str>) -> Option<(String, &str)> {
-    let rest = comment.and_then(strip_directive_prefix)?;
-    let (keyword, argument) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
-    Some((keyword.to_ascii_lowercase(), argument.trim()))
-}
-
 fn parse_table_directive(table: &Table) -> Result<Option<TableDirective>, String> {
     let Some((keyword, argument)) = parse_directive(table.comment.as_deref()) else { return Ok(None) };
     match (keyword.as_str(), argument) {
         ("skip", "") => Ok(Some(TableDirective::Skip)),
-        ("entity", label) if !label.is_empty() => Ok(Some(TableDirective::Entity(label.to_owned()))),
-        ("relation", spec) if !spec.is_empty() => {
-            let (label, bindings) = parse_bindings(spec)
-                .map_err(|err| format!("table '{}': malformed @typedb relation directive: {err}", table.name))?;
-            Ok(Some(TableDirective::Relation(label, bindings)))
-        }
+        ("entity", label) if !label.is_empty() => Ok(Some(TableDirective::Entity { label: label.to_owned() })),
+        ("relation", spec) if !spec.is_empty() => parse_relation_directive(spec)
+            .map(Some)
+            .map_err(|err| format!("table '{}': malformed @typedb relation directive: {err}", table.name)),
         _ => Err(format!(
             "table '{}': unrecognised directive '{}' \
              (expected: skip | entity <label> | relation <label> (<role> = <column>, ...))",
@@ -228,601 +790,30 @@ fn parse_column_directive(table: &Table, column: &Column) -> Result<Option<Colum
     }
 }
 
-fn parse_bindings(spec: &str) -> Result<(String, Vec<(String, String)>), String> {
+// `@typedb <keyword> [<argument>]`, the keyword in any case.
+fn parse_directive(comment: Option<&str>) -> Option<(String, &str)> {
+    let rest = comment.and_then(strip_directive_prefix)?;
+    let (keyword, argument) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
+    Some((keyword.to_ascii_lowercase(), argument.trim()))
+}
+
+fn strip_directive_prefix(comment: &str) -> Option<&str> {
+    let comment = comment.trim();
+    let prefix = comment.get(..DIRECTIVE_PREFIX.len())?;
+    prefix.eq_ignore_ascii_case(DIRECTIVE_PREFIX).then(|| comment[DIRECTIVE_PREFIX.len()..].trim())
+}
+
+fn parse_relation_directive(spec: &str) -> Result<TableDirective, String> {
     let spec = spec.trim();
-    let Some(open) = spec.find('(') else { return Ok((spec.to_owned(), Vec::new())) };
+    let Some(open) = spec.find('(') else {
+        return Ok(TableDirective::Relation { label: spec.to_owned(), role_bindings: Vec::new() });
+    };
     let label = spec[..open].trim().to_owned();
     let inner = spec[open + 1..].trim().strip_suffix(')').ok_or("missing closing ')'")?;
-    let mut bindings = Vec::new();
+    let mut role_bindings = Vec::new();
     for part in inner.split(',') {
-        let (key, value) = part.split_once('=').ok_or_else(|| format!("expected '<key> = <value>' in '{part}'"))?;
-        bindings.push((key.trim().to_owned(), value.trim().to_owned()));
+        let (role, column) = part.split_once('=').ok_or_else(|| format!("expected '<role> = <column>' in '{part}'"))?;
+        role_bindings.push(RoleBinding { role: role.trim().to_owned(), column: column.trim().to_owned() });
     }
-    Ok((label, bindings))
-}
-
-fn find_by_name<'a, T>(types: &'a [T], name: &str, label: impl Fn(&T) -> &str) -> Option<&'a T> {
-    types.iter().find(|t| label(t) == name).or_else(|| {
-        let dashed = name.replace('_', "-");
-        types.iter().find(|t| label(t) == dashed)
-    })
-}
-
-struct ResolvedTable<'a> {
-    table: &'a Table,
-    object: &'a ObjectType,
-    is_relation: bool,
-    bound_columns: Vec<(String, String)>,
-    declared_ids: DeclaredIds,
-}
-
-// Where a role column's players are: a declared FOREIGN KEY, which DuckDB enforces, or a `references` directive,
-// which the loader checks.
-#[derive(Clone, Copy)]
-enum Reference<'a> {
-    Declared(&'a ForeignKey),
-    Directive(&'a str),
-}
-
-impl Reference<'_> {
-    fn table(&self) -> &str {
-        match self {
-            Reference::Declared(fk) => &fk.referenced_table,
-            Reference::Directive(table) => table,
-        }
-    }
-}
-
-fn reference_of<'a>(
-    table: &'a Table,
-    column: &Column,
-    directive: &'a Option<ColumnDirective>,
-) -> Result<Option<Reference<'a>>, String> {
-    let declared = table.fk_of_column(&column.name);
-    match (declared, directive) {
-        (Some(fk), Some(ColumnDirective::References(named))) if !fk.referenced_table.eq_ignore_ascii_case(named) => {
-            Err(format!(
-                "table '{}': column '{}' is marked '@typedb references {named}', but its FOREIGN KEY references '{}'",
-                table.name, column.name, fk.referenced_table
-            ))
-        }
-        (Some(fk), _) => Ok(Some(Reference::Declared(fk))),
-        (None, Some(ColumnDirective::References(named))) => Ok(Some(Reference::Directive(named))),
-        (None, _) => Ok(None),
-    }
-}
-
-pub(crate) fn resolve(catalog: &Catalog, schema: &Schema, diagnostics: &mut Diagnostics) -> MappingPlan {
-    for ignored in &catalog.ignored {
-        diagnostics.warning(format!(
-            "{ignored} is not loaded: only tables of the 'main' schema are read (materialise a view as a table)"
-        ));
-    }
-    let mut targets = resolve_tables(catalog, schema, diagnostics);
-    targets.sort_by_key(|target| target.is_relation);
-    let mut plan = MappingPlan::default();
-
-    for target in &targets {
-        let mut owns = Vec::new();
-        let mut roles = Vec::new();
-        let mut skipped = Vec::new();
-        for column in &target.table.columns {
-            if column.name == IID_COLUMN {
-                if column.comment.as_deref().and_then(strip_directive_prefix).is_some() {
-                    diagnostics.error(format!(
-                        "table '{}': {IID_COLUMN} holds the instances' ids and takes no directive",
-                        target.table.name
-                    ));
-                }
-                continue;
-            }
-            let directive = match parse_column_directive(target.table, column) {
-                Ok(directive) => directive,
-                Err(message) => {
-                    diagnostics.error(message);
-                    continue;
-                }
-            };
-            if directive == Some(ColumnDirective::Skip) {
-                skipped.push(column.name.as_str());
-                continue;
-            }
-            let reference = match reference_of(target.table, column, &directive) {
-                Ok(reference) => reference,
-                Err(message) => {
-                    diagnostics.error(message);
-                    continue;
-                }
-            };
-            let explicit_role = target.bound_columns.iter().find(|(_, bound)| *bound == column.name);
-            let holds_players = explicit_role.is_some() || reference.is_some();
-            if matches!(directive, Some(ColumnDirective::Owns(_))) && holds_players {
-                diagnostics.error(format!(
-                    "table '{}': column '{}' holds role players (a FOREIGN KEY or a bound column), so it cannot \
-                     own an attribute",
-                    target.table.name, column.name
-                ));
-            } else if let Some((role, _)) = explicit_role {
-                bind_role(&mut roles, target, column, role, reference, &targets, schema, diagnostics);
-            } else if let Some(reference) = reference {
-                if target.is_relation {
-                    infer_role(&mut roles, target, column, reference, &targets, schema, diagnostics);
-                } else {
-                    diagnostics.error(format!(
-                        "table '{}': column '{}' references table '{}', which on an entity table has no TypeDB \
-                         form: {RELATION_IS_A_TABLE}",
-                        target.table.name,
-                        column.name,
-                        reference.table()
-                    ));
-                }
-            } else {
-                let explicit_attribute = match &directive {
-                    Some(ColumnDirective::Owns(label)) => Some(label.as_str()),
-                    _ => None,
-                };
-                bind_owns(&mut owns, target, column, explicit_attribute, schema, diagnostics);
-            }
-        }
-        check_role_binding_columns(target, &skipped, diagnostics);
-
-        if target.is_relation && roles.is_empty() {
-            diagnostics.error(format!(
-                "relation table '{}' fills no role, so every row would be a relation without players",
-                target.table.name
-            ));
-        }
-        for relates in &target.object.relates {
-            if !roles.is_empty() && !roles.iter().any(|r: &RoleBinding| r.relates.role == relates.role) {
-                diagnostics.warning(format!(
-                    "relation table '{}' never fills role '{}:{}'",
-                    target.table.name, target.object.label, relates.role
-                ));
-            }
-        }
-        let kind = if target.is_relation { TableKind::Relation { roles } } else { TableKind::Entity };
-        plan.tables.push(TableMapping {
-            name: target.table.name.clone(),
-            type_label: target.object.label.clone(),
-            kind,
-            owns,
-            declared_ids: target.declared_ids,
-            declares_keys: target.table.declares_keys(),
-        });
-    }
-
-    // Types the errors leave unmapped would only repeat them.
-    if diagnostics.errors.is_empty() {
-        unmapped_schema_warnings(&plan, schema, diagnostics);
-    }
-    plan
-}
-
-fn check_role_binding_columns(target: &ResolvedTable<'_>, skipped: &[&str], diagnostics: &mut Diagnostics) {
-    let bindings = &target.bound_columns;
-    for (index, (role, column)) in bindings.iter().enumerate() {
-        let problem = if target.table.column(column).is_none() {
-            "which the table does not have"
-        } else if column == IID_COLUMN {
-            "which holds the relations' own ids"
-        } else if bindings[..index].iter().any(|(_, earlier)| earlier == column) {
-            "which the directive already binds; a column holds one role's players"
-        } else if skipped.contains(&column.as_str()) {
-            "which is marked '@typedb skip'"
-        } else {
-            continue;
-        };
-        diagnostics.error(format!(
-            "table '{}': the relation directive binds role '{role}' to column '{column}', {problem}",
-            target.table.name
-        ));
-    }
-}
-
-fn resolve_tables<'a>(
-    catalog: &'a Catalog,
-    schema: &'a Schema,
-    diagnostics: &mut Diagnostics,
-) -> Vec<ResolvedTable<'a>> {
-    let mut targets = Vec::new();
-    for table in &catalog.tables {
-        let directive = match parse_table_directive(table) {
-            Ok(directive) => directive,
-            Err(message) => {
-                diagnostics.error(message);
-                continue;
-            }
-        };
-        let (label, is_relation, bound_columns) = match directive {
-            Some(TableDirective::Skip) => continue,
-            Some(TableDirective::Entity(label)) => (label, false, Vec::new()),
-            Some(TableDirective::Relation(label, bindings)) => (label, true, bindings),
-            None => {
-                let entity = find_by_name(&schema.entities, &table.name, |e| &e.label);
-                let relation = find_by_name(&schema.relations, &table.name, |r| &r.label);
-                match (entity, relation) {
-                    (Some(entity), None) => (entity.label.clone(), false, Vec::new()),
-                    (None, Some(relation)) => (relation.label.clone(), true, Vec::new()),
-                    (Some(_), Some(_)) => {
-                        diagnostics.error(format!(
-                            "table '{}' matches both an entity and a relation type; disambiguate with \
-                             COMMENT ON TABLE ... IS '@typedb entity <label>' or '@typedb relation <label> (...)'",
-                            table.name
-                        ));
-                        continue;
-                    }
-                    (None, None) => {
-                        diagnostics.error(format!(
-                            "table '{}' has no matching entity or relation type in the TypeDB schema \
-                             (add the type, or mark the table '@typedb skip')",
-                            table.name
-                        ));
-                        continue;
-                    }
-                }
-            }
-        };
-
-        let Some(object) = schema.object(&label, is_relation) else {
-            diagnostics.error(format!(
-                "table '{}' is mapped to '{label}', which is not {} in the TypeDB schema",
-                table.name,
-                if is_relation { "a relation type" } else { "an entity type" }
-            ));
-            continue;
-        };
-        if object.abstract_ {
-            diagnostics.error(format!(
-                "table '{}' is mapped to abstract type '{label}', which cannot have instances",
-                table.name
-            ));
-            continue;
-        }
-        let Some(declared_ids) = instance_id_column(table, diagnostics) else { continue };
-        targets.push(ResolvedTable { table, object, is_relation, bound_columns, declared_ids });
-    }
-    targets
-}
-
-// The `_iid` column must exist and be UBIGINT; uniqueness and presence are DuckDB's when declared, otherwise the
-// loader checks every value.
-fn instance_id_column(table: &Table, diagnostics: &mut Diagnostics) -> Option<DeclaredIds> {
-    let contract = format!(
-        "add `{IID_COLUMN} UBIGINT`, unique and not null, holding the row's instance id (unsigned 64-bit; see the \
-         README's modelling section)"
-    );
-    let Some(column) = table.column(IID_COLUMN) else {
-        diagnostics.error(format!("table '{}' has no {IID_COLUMN} column: {contract}", table.name));
-        return None;
-    };
-    if table.fk_of_column(IID_COLUMN).is_some() {
-        diagnostics.error(format!(
-            "table '{}': {IID_COLUMN} is a FOREIGN KEY, which cannot stand for an instance of another table; \
-             an instance belongs to one table (see the README's modelling section)",
-            table.name
-        ));
-        return None;
-    }
-    if column.column_type != ColumnType::INSTANCE_ID {
-        diagnostics.error(format!(
-            "table '{}': {IID_COLUMN} must be UBIGINT (an instance id is unsigned 64-bit), found {}: {contract}",
-            table.name, column.raw_type
-        ));
-        return None;
-    }
-    let is_pk = table.primary_key.as_slice() == [IID_COLUMN];
-    Some(DeclaredIds {
-        unique: is_pk || table.unique_column_sets.iter().any(|set| set.as_slice() == [IID_COLUMN]),
-        not_null: is_pk || table.not_null.contains(IID_COLUMN),
-    })
-}
-
-fn role_binding(relates: &Relates, column: &Column, player: usize, reference: Reference<'_>) -> RoleBinding {
-    let verify_reference = matches!(reference, Reference::Directive(_));
-    RoleBinding { column: column.name.clone(), relates: relates.clone(), player, verify_reference }
-}
-
-fn bind_role(
-    roles: &mut Vec<RoleBinding>,
-    target: &ResolvedTable<'_>,
-    column: &Column,
-    role: &str,
-    reference: Option<Reference<'_>>,
-    targets: &[ResolvedTable<'_>],
-    schema: &Schema,
-    diagnostics: &mut Diagnostics,
-) {
-    let relation = &target.object.label;
-    let Some(relates) = target.object.relates.iter().find(|r| r.role == role) else {
-        diagnostics.error(format!(
-            "table '{}': column '{}' is bound to role '{role}', but relation '{relation}' has no such role",
-            target.table.name, column.name
-        ));
-        return;
-    };
-    let Some(reference) = reference else {
-        diagnostics.error(format!(
-            "table '{}': column '{}' is bound to role '{role}' but names no players' table: declare it a FOREIGN \
-             KEY to that table's {IID_COLUMN}, or mark it '@typedb references <table>'",
-            target.table.name, column.name
-        ));
-        return;
-    };
-    let Some(player_index) = resolve_player(target, column, reference, targets, diagnostics) else { return };
-    let player = &targets[player_index];
-    let ancestry = schema.relation_ancestry(relation);
-    if !player.object.plays.iter().any(|plays| plays.role == role && ancestry.contains(&plays.relation)) {
-        diagnostics.error(format!(
-            "table '{}': column '{}' is bound to role '{relation}:{role}', but its players' type '{}' (table '{}') \
-             does not play that role",
-            target.table.name, column.name, player.object.label, player.table.name
-        ));
-        return;
-    }
-    roles.push(role_binding(relates, column, player_index, reference));
-}
-
-fn infer_role(
-    roles: &mut Vec<RoleBinding>,
-    target: &ResolvedTable<'_>,
-    column: &Column,
-    reference: Reference<'_>,
-    targets: &[ResolvedTable<'_>],
-    schema: &Schema,
-    diagnostics: &mut Diagnostics,
-) {
-    let relation = &target.object.label;
-    let Some(player_index) = resolve_player(target, column, reference, targets, diagnostics) else { return };
-    let player = &targets[player_index];
-    let ancestry = schema.relation_ancestry(relation);
-    let played_roles: Vec<&Relates> = target
-        .object
-        .relates
-        .iter()
-        .filter(|relates| {
-            player.object.plays.iter().any(|plays| plays.role == relates.role && ancestry.contains(&plays.relation))
-        })
-        .collect();
-    // A column the directive does not bind is inferred only when its players play one role: several columns may
-    // bind one role, so a role the directive binds elsewhere settles nothing.
-    match played_roles.as_slice() {
-        [relates] => roles.push(role_binding(relates, column, player_index, reference)),
-        [] => diagnostics.error(format!(
-            "table '{}': column '{}' references '{}', whose type '{}' plays no role of relation '{relation}'",
-            target.table.name, column.name, player.table.name, player.object.label
-        )),
-        _ => diagnostics.error(format!(
-            "table '{}': column '{}' is ambiguous: '{}' plays {} roles of '{relation}'; bind the columns with \
-             COMMENT ON TABLE {} IS '@typedb relation {relation} ({})'",
-            target.table.name,
-            column.name,
-            player.object.label,
-            played_roles.len(),
-            quoted(&target.table.name),
-            played_roles.iter().map(|relates| format!("{} = <column>", relates.role)).collect::<Vec<_>>().join(", ")
-        )),
-    }
-}
-
-fn resolve_player(
-    target: &ResolvedTable<'_>,
-    column: &Column,
-    reference: Reference<'_>,
-    targets: &[ResolvedTable<'_>],
-    diagnostics: &mut Diagnostics,
-) -> Option<usize> {
-    let fk = match reference {
-        Reference::Declared(fk) => fk,
-        Reference::Directive(named) => {
-            if column.column_type != ColumnType::INSTANCE_ID {
-                diagnostics.error(format!(
-                    "table '{}': column '{}' references '{named}' and must hold its {IID_COLUMN} values, so it \
-                     must be UBIGINT; found {}",
-                    target.table.name, column.name, column.raw_type
-                ));
-                return None;
-            }
-            let player = targets.iter().position(|t| t.table.name.eq_ignore_ascii_case(named));
-            if player.is_none() {
-                diagnostics.error(format!(
-                    "table '{}': column '{}' references table '{named}', which is not mapped (is it skipped, \
-                     invalid or misspelt?)",
-                    target.table.name, column.name
-                ));
-            }
-            return player;
-        }
-    };
-    if fk.columns.len() > 1 {
-        diagnostics.error(format!(
-            "table '{}': column '{}' is part of the composite FOREIGN KEY {:?}, which cannot bind a role: \
-             reference the players' table by its {IID_COLUMN} column instead",
-            target.table.name, column.name, fk.columns
-        ));
-        return None;
-    }
-    if target.table.foreign_keys.iter().filter(|other| other.columns.contains(&column.name)).count() > 1 {
-        diagnostics.error(format!(
-            "table '{}': column '{}' is in several FOREIGN KEYs, so its players' table is ambiguous",
-            target.table.name, column.name
-        ));
-        return None;
-    }
-    // DuckDB resolves identifiers case-insensitively but records the reference as written.
-    let Some(player) = targets.iter().position(|t| t.table.name.eq_ignore_ascii_case(&fk.referenced_table)) else {
-        diagnostics.error(format!(
-            "table '{}': FK column '{}' references table '{}', which is not mapped (is it skipped or invalid?)",
-            target.table.name, column.name, fk.referenced_table
-        ));
-        return None;
-    };
-    if !matches!(fk.referenced_columns.as_slice(), [referenced] if referenced.eq_ignore_ascii_case(IID_COLUMN)) {
-        diagnostics.error(format!(
-            "table '{}': FK column '{}' must reference '{}.{IID_COLUMN}' (the instance-id column); found {:?}",
-            target.table.name, column.name, fk.referenced_table, fk.referenced_columns
-        ));
-        return None;
-    }
-    Some(player)
-}
-
-fn bind_owns(
-    owns: &mut Vec<OwnsMapping>,
-    target: &ResolvedTable<'_>,
-    column: &Column,
-    explicit_attribute: Option<&str>,
-    schema: &Schema,
-    diagnostics: &mut Diagnostics,
-) {
-    let attribute_label = match explicit_attribute {
-        Some(label) => label.to_owned(),
-        None => match find_by_name(&schema.attributes, &column.name, |a| &a.label) {
-            Some(attribute) => attribute.label.clone(),
-            None => {
-                diagnostics.error(format!(
-                    "table '{}': column '{}' has no matching attribute in the TypeDB schema \
-                     (add the attribute, or mark the column '@typedb skip' / '@typedb owns <label>')",
-                    target.table.name, column.name
-                ));
-                return;
-            }
-        },
-    };
-
-    let Some(attribute) = schema.attribute(&attribute_label) else {
-        diagnostics.error(format!(
-            "table '{}': column '{}' maps to attribute '{attribute_label}', which does not exist in the schema",
-            target.table.name, column.name
-        ));
-        return;
-    };
-    if !target.object.owns.contains(&attribute_label) {
-        diagnostics.error(format!(
-            "table '{}': column '{}' maps to attribute '{attribute_label}', but type '{}' does not own it",
-            target.table.name, column.name, target.object.label
-        ));
-        return;
-    }
-    if attribute.abstract_ {
-        diagnostics.error(format!(
-            "table '{}': column '{}' maps to attribute '{attribute_label}', which is abstract and cannot \
-             have instances; declare a concrete subtype, let '{}' own it, and map the column to it with \
-             '@typedb owns <label>'",
-            target.table.name, column.name, target.object.label
-        ));
-        return;
-    }
-    let Some(value_type) = attribute.value_type else {
-        diagnostics.error(format!(
-            "table '{}': column '{}' maps to attribute '{attribute_label}', which has no value type in the schema",
-            target.table.name, column.name
-        ));
-        return;
-    };
-
-    let (element_type, multi) = match &column.column_type {
-        ColumnType::List(element) => (element.as_ref(), true),
-        other => (other, false),
-    };
-    if let ColumnType::Unsupported { hint } = element_type {
-        diagnostics.error(format!(
-            "table '{}': column '{}' has unsupported type {}: {hint}",
-            target.table.name, column.name, column.raw_type
-        ));
-        return;
-    }
-    if matches!(element_type, ColumnType::List(_)) {
-        diagnostics.error(format!(
-            "table '{}': column '{}' is a nested list, which has no TypeDB mapping",
-            target.table.name, column.name
-        ));
-        return;
-    }
-    if let ColumnType::Decimal { scale, .. } = element_type
-        && *scale > DECIMAL_FRACTIONAL_DIGITS
-    {
-        diagnostics.error(format!(
-            "table '{}': column '{}' has DECIMAL scale {scale}, beyond TypeDB's {DECIMAL_FRACTIONAL_DIGITS} \
-             fractional digits; DuckDB would round the values when reading them",
-            target.table.name, column.name
-        ));
-        return;
-    }
-    if !is_value_compatible(element_type, value_type) {
-        let reason = match element_type {
-            ColumnType::Varchar | ColumnType::StringLike => "the loader never parses text into values",
-            _ => "the types are incompatible",
-        };
-        diagnostics.error(format!(
-            "table '{}': column '{}' ({}) cannot populate attribute '{attribute_label}' (value type '{}'): {reason}; \
-             stage the column as {}",
-            target.table.name,
-            column.name,
-            column.raw_type,
-            value_type.name(),
-            staged_type(value_type)
-        ));
-        return;
-    }
-
-    owns.push(OwnsMapping {
-        column: column.name.clone(),
-        attribute: attribute_label,
-        value_type,
-        multi,
-        column_type: element_type.clone(),
-    });
-}
-
-fn is_value_compatible(column_type: &ColumnType, value_type: ValueType) -> bool {
-    use ValueType as V;
-    match column_type {
-        ColumnType::Boolean => value_type == V::Boolean,
-        ColumnType::Integer { .. } => matches!(value_type, V::Integer | V::Double | V::Decimal),
-        ColumnType::Double => value_type == V::Double,
-        ColumnType::Decimal { .. } => matches!(value_type, V::Decimal | V::Double),
-        ColumnType::Varchar | ColumnType::StringLike => value_type == V::String,
-        ColumnType::Date => value_type == V::Date,
-        ColumnType::Timestamp { .. } => value_type == V::Datetime,
-        ColumnType::TimestampTz { .. } => value_type == V::DatetimeTz,
-        ColumnType::Interval => value_type == V::Duration,
-        ColumnType::List(_) | ColumnType::Unsupported { .. } => false,
-    }
-}
-
-fn staged_type(value_type: ValueType) -> &'static str {
-    match value_type {
-        ValueType::Boolean => "BOOLEAN",
-        ValueType::Integer => "BIGINT",
-        ValueType::Double => "DOUBLE",
-        ValueType::Decimal => "DECIMAL",
-        ValueType::String => "VARCHAR",
-        ValueType::Date => "DATE",
-        ValueType::Datetime => "TIMESTAMP",
-        ValueType::DatetimeTz => "TIMESTAMPTZ",
-        ValueType::Duration => "INTERVAL",
-    }
-}
-
-fn unmapped_schema_warnings(plan: &MappingPlan, schema: &Schema, diagnostics: &mut Diagnostics) {
-    for (types, kind) in [(&schema.entities, "entity"), (&schema.relations, "relation")] {
-        for object in types.iter().filter(|o| !o.abstract_) {
-            let mapped = plan.tables.iter().any(|t| t.type_label == object.label);
-            if !mapped {
-                diagnostics.warning(format!(
-                    "{kind} type '{}' has no DuckDB source; no instances will be produced",
-                    object.label
-                ));
-            }
-        }
-    }
-    for attribute in schema.attributes.iter().filter(|a| !a.abstract_) {
-        let sourced = plan.tables.iter().any(|table| table.owns.iter().any(|owns| owns.attribute == attribute.label));
-        if !sourced {
-            diagnostics.warning(format!(
-                "attribute type '{}' has no DuckDB source; no instances will be produced",
-                attribute.label
-            ));
-        }
-    }
+    Ok(TableDirective::Relation { label, role_bindings })
 }

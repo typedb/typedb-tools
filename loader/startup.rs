@@ -40,32 +40,24 @@ pub(crate) fn install_shutdown_handler() -> Arc<AtomicBool> {
     shutdown
 }
 
-// SIGINT (Ctrl+C) and SIGTERM (`kill`, systemd, Kubernetes, `timeout`) are treated alike, as command-line tools
-// commonly do. The handlers are registered at once, not when a task first polls them; `recv` resolves to the
-// exit code a shell reports for the signal.
+// SIGINT and SIGTERM alike, registered at once; `recv` resolves to the exit code a shell reports.
 #[cfg(unix)]
 pub(crate) struct Termination {
     interrupt: tokio::signal::unix::Signal,
     terminate: tokio::signal::unix::Signal,
-    hangup: tokio::signal::unix::Signal,
 }
 
 #[cfg(unix)]
 impl Termination {
     pub(crate) fn listen() -> io::Result<Self> {
         use tokio::signal::unix::{SignalKind, signal};
-        Ok(Self {
-            interrupt: signal(SignalKind::interrupt())?,
-            terminate: signal(SignalKind::terminate())?,
-            hangup: signal(SignalKind::hangup())?,
-        })
+        Ok(Self { interrupt: signal(SignalKind::interrupt())?, terminate: signal(SignalKind::terminate())? })
     }
 
     pub(crate) async fn recv(&mut self) -> Option<i32> {
         tokio::select! {
             received = self.interrupt.recv() => received.map(|()| 130),
             received = self.terminate.recv() => received.map(|()| 143),
-            received = self.hangup.recv() => received.map(|()| 129),
         }
     }
 }

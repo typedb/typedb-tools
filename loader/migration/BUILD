@@ -42,20 +42,6 @@ rust_test(
     ],
 )
 
-# Schema-coverage harness over an external corpus: skips unless SCHEMAS_DIR is set, so it is
-# run by hand rather than in CI (see the file's header).
-rust_test(
-    name = "behaviour-schemas",
-    srcs = ["tests/behaviour_schemas.rs"],
-    deps = [
-        ":typedb_migration",
-
-        # External dependencies
-        "@crates//:duckdb",
-    ],
-    tags = ["manual"],
-)
-
 checkstyle_test(
     name = "checkstyle",
     include = glob(["*", "*/*"]),

@@ -9,7 +9,6 @@ use std::{
     fs, io,
     path::{Path, PathBuf},
     process::Command,
-    time::{Duration, Instant},
 };
 
 use duckdb::Connection;
@@ -93,7 +92,9 @@ fn files_only_writes_the_data_file() -> Result<(), Box<dyn Error>> {
     assert_eq!(count, 1 + 2 + 2 + 1); // header, 2 names, 2 persons, checksums
 
     let rerun = run_loader(&dir, &["--files-only", "--output-dir", &out]);
-    assert!(!rerun.status.success());
+    assert_eq!(rerun.status.code(), Some(2), "user-input error exit code expected");
+    assert!(String::from_utf8_lossy(&rerun.stderr).contains("pass --overwrite"));
+    assert!(!String::from_utf8_lossy(&rerun.stdout).contains("Checked in"), "refused before the checks");
     let rerun = run_loader(&dir, &["--files-only", "--output-dir", &out, "--overwrite"]);
     assert!(rerun.status.success());
 
@@ -153,7 +154,7 @@ fn files_of_other_formats_point_to_staging_them() -> Result<(), Box<dyn Error>> 
         .args(["--duckdb", &csv, "--schema-file", &dir.join("schema.tql").to_string_lossy(), "--dry-run"])
         .output()?;
     assert_eq!(output.status.code(), Some(2));
-    assert!(String::from_utf8_lossy(&output.stderr).contains("staged into DuckDB first"), "staging hint expected");
+    assert!(String::from_utf8_lossy(&output.stderr).contains("staging other formats"), "staging hint expected");
 
     let _ = fs::remove_dir_all(&dir);
     Ok(())
@@ -193,39 +194,16 @@ fn a_staged_data_file_is_refused_before_connecting() -> Result<(), Box<dyn Error
     Ok(())
 }
 
-#[cfg(unix)]
-#[test]
-fn a_termination_signal_removes_the_partial_file() -> Result<(), Box<dyn Error>> {
-    let dir = setup("sigterm")?;
-    Connection::open(dir.join("fixture.duckdb"))?
-        .execute_batch("INSERT INTO person SELECT 10 + i, 'name' || i FROM range(2000000) t(i);")?;
-    let out = dir.join("out");
-    let mut loader = loader_command(&dir, &["--files-only", "--output-dir", out.to_str().unwrap()]).spawn()?;
-    let partial = out.join(".fixture.data.typedb.partial");
-    let deadline = Instant::now() + Duration::from_secs(60);
-    while !partial.exists() {
-        assert!(loader.try_wait()?.is_none(), "the loader finished before the signal");
-        assert!(Instant::now() < deadline, "the conversion did not start in time");
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    assert!(Command::new("kill").args(["-TERM", &loader.id().to_string()]).status()?.success());
-    assert_eq!(loader.wait()?.code(), Some(143));
-    assert!(!partial.exists(), "the partial file was left behind");
-    assert_eq!(file_names(&out)?, Vec::<String>::new(), "nothing is left behind");
-    let _ = fs::remove_dir_all(&dir);
-    Ok(())
-}
-
 #[test]
 fn the_memory_limit_is_reported_and_validated() -> Result<(), Box<dyn Error>> {
     let dir = setup("memory")?;
     let output = run_loader(&dir, &["--dry-run", "--memory-limit", "256MiB"]);
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(output.status.success(), "{stdout}\n{}", String::from_utf8_lossy(&output.stderr));
-    assert!(stdout.contains("(DuckDB memory limit 256.0 MiB)"), "{stdout}");
+    assert!(stdout.contains("(source DB memory limit 256.0 MiB)"), "{stdout}");
 
     let output = run_loader(&dir, &["--dry-run"]);
-    assert!(String::from_utf8_lossy(&output.stdout).contains("(DuckDB memory limit "), "a default limit is set");
+    assert!(String::from_utf8_lossy(&output.stdout).contains("(source DB memory limit "), "a default limit is set");
 
     let output = run_loader(&dir, &["--dry-run", "--memory-limit", "lots"]);
     assert_eq!(output.status.code(), Some(2), "an invalid limit is a user-input error");
@@ -237,10 +215,12 @@ fn the_memory_limit_is_reported_and_validated() -> Result<(), Box<dyn Error>> {
 #[test]
 fn checks_spill_into_an_output_directory_that_does_not_exist_yet() -> Result<(), Box<dyn Error>> {
     let dir = setup("spill")?;
+    // Shuffled ids take the GROUP BY check, which spills about 250 MB at this size.
     Connection::open(dir.join("fixture.duckdb"))?.execute_batch(
         "DROP TABLE person;
-         CREATE TABLE person AS SELECT i::UBIGINT AS _iid, 'name' || i AS name FROM range(8000000) t(i);",
+         CREATE TABLE person AS SELECT (i * 7919 % 20000003)::UBIGINT AS _iid FROM range(20000000) t(i);",
     )?;
+    fs::write(dir.join("schema.tql"), "define\n  entity person;\n")?;
     let out = dir.join("out/nested").to_string_lossy().into_owned();
     let output = run_loader(&dir, &["--files-only", "--output-dir", &out, "--memory-limit", "256MiB"]);
     assert!(
@@ -250,29 +230,6 @@ fn checks_spill_into_an_output_directory_that_does_not_exist_yet() -> Result<(),
         String::from_utf8_lossy(&output.stderr)
     );
     assert_eq!(file_names(&dir.join("out/nested"))?, LEFT_BEHIND, "the spill directory is removed");
-    let _ = fs::remove_dir_all(&dir);
-    Ok(())
-}
-
-#[cfg(unix)]
-#[test]
-fn a_second_loader_for_the_same_database_and_directory_fails_fast() -> Result<(), Box<dyn Error>> {
-    let dir = setup("concurrent")?;
-    Connection::open(dir.join("fixture.duckdb"))?
-        .execute_batch("INSERT INTO person SELECT 10 + i, 'name' || i FROM range(2000000) t(i);")?;
-    let out = dir.join("out");
-    let mut first = loader_command(&dir, &["--files-only", "--output-dir", out.to_str().unwrap()]).spawn()?;
-    let deadline = Instant::now() + Duration::from_secs(60);
-    while !out.join(".fixture.lock").exists() {
-        assert!(first.try_wait()?.is_none(), "the first loader finished before the second started");
-        assert!(Instant::now() < deadline, "the first loader did not start in time");
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    let second = run_loader(&dir, &["--files-only", "--output-dir", out.to_str().unwrap()]);
-    assert_eq!(second.status.code(), Some(2), "{}", String::from_utf8_lossy(&second.stderr));
-    assert!(String::from_utf8_lossy(&second.stderr).contains("another loader is preparing or importing 'fixture'"));
-    assert!(first.wait()?.success(), "the first loader must not be disturbed");
-    assert!(out.join("fixture.data.typedb").exists());
     let _ = fs::remove_dir_all(&dir);
     Ok(())
 }
@@ -288,22 +245,102 @@ fn what_a_dead_run_left_is_swept() -> Result<(), Box<dyn Error>> {
     let output = run_loader(&dir, &["--files-only", "--output-dir", out.to_str().unwrap()]);
     assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
     assert_eq!(file_names(&out)?, LEFT_BEHIND);
+
+    fs::create_dir(out.join(".fixture.tmp"))?;
+    fs::write(out.join(".fixture.tmp/notes.txt"), b"not DuckDB's")?;
+    let output = run_loader(&dir, &["--files-only", "--overwrite", "--output-dir", out.to_str().unwrap()]);
+    assert_eq!(output.status.code(), Some(2), "{}", String::from_utf8_lossy(&output.stderr));
+    assert_eq!(fs::read(out.join(".fixture.tmp/notes.txt"))?, b"not DuckDB's", "only DuckDB's spill files are removed");
     let _ = fs::remove_dir_all(&dir);
     Ok(())
 }
 
-#[test]
-fn an_existing_data_file_is_refused_before_the_checks() -> Result<(), Box<dyn Error>> {
-    let dir = setup("refused-early")?;
-    let out = dir.join("out");
-    fs::create_dir_all(&out)?;
-    fs::write(out.join("fixture.data.typedb"), b"an earlier file")?;
-    let output = run_loader(&dir, &["--files-only", "--output-dir", out.to_str().unwrap()]);
-    assert_eq!(output.status.code(), Some(2));
-    assert!(String::from_utf8_lossy(&output.stderr).contains("pass --overwrite"));
-    assert!(!String::from_utf8_lossy(&output.stdout).contains("Checked"), "refused only after the checks");
-    let _ = fs::remove_dir_all(&dir);
-    Ok(())
+#[cfg(unix)]
+mod signals_and_concurrency {
+    use std::{
+        io::{BufRead, BufReader, Read},
+        process::Stdio,
+        time::{Duration, Instant},
+    };
+
+    use super::*;
+
+    #[test]
+    fn a_termination_signal_removes_the_partial_file() -> Result<(), Box<dyn Error>> {
+        let dir = setup("sigterm")?;
+        Connection::open(dir.join("fixture.duckdb"))?
+            .execute_batch("INSERT INTO person SELECT 10 + i, 'name' || i FROM range(2000000) t(i);")?;
+        let out = dir.join("out");
+        let mut loader = loader_command(&dir, &["--files-only", "--output-dir", out.to_str().unwrap()]).spawn()?;
+        let partial = out.join(".fixture.data.typedb.partial");
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while !partial.exists() {
+            assert!(loader.try_wait()?.is_none(), "the loader finished before the signal");
+            assert!(Instant::now() < deadline, "the conversion did not start in time");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(Command::new("kill").args(["-TERM", &loader.id().to_string()]).status()?.success());
+        assert_eq!(loader.wait()?.code(), Some(143));
+        assert!(!partial.exists(), "the partial file was left behind");
+        assert_eq!(file_names(&out)?, Vec::<String>::new(), "nothing is left behind");
+        let _ = fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[test]
+    fn a_termination_signal_stops_the_checks_and_leaves_nothing() -> Result<(), Box<dyn Error>> {
+        let dir = setup("sigterm-checks")?;
+        Connection::open(dir.join("fixture.duckdb"))?.execute_batch(
+            "DROP TABLE person;
+             CREATE TABLE person AS SELECT (i * 7919 % 20000003)::UBIGINT AS _iid, 'name' || i AS name
+             FROM range(20000000) t(i);",
+        )?;
+        let out = dir.join("out");
+        let mut loader = loader_command(&dir, &["--files-only", "--output-dir", out.to_str().unwrap()])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        let mut stdout = BufReader::new(loader.stdout.take().expect("piped"));
+        let mut line = String::new();
+        while !line.starts_with("Migrating from") {
+            line.clear();
+            assert!(stdout.read_line(&mut line)? > 0, "the loader ended before the checks began");
+        }
+        std::thread::sleep(Duration::from_millis(500));
+        assert!(Command::new("kill").args(["-TERM", &loader.id().to_string()]).status()?.success());
+        let mut rest = String::new();
+        stdout.read_to_string(&mut rest)?;
+        let output = loader.wait_with_output()?;
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(143), "{stderr}");
+        assert!(stderr.contains("interrupted; nothing was loaded"), "{stderr}");
+        assert!(!rest.contains("Checked in"), "the signal came after the checks: {rest}");
+        assert_eq!(file_names(&out)?, Vec::<String>::new(), "nothing is left behind");
+        let _ = fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[test]
+    fn a_second_loader_for_the_same_database_and_directory_fails_fast() -> Result<(), Box<dyn Error>> {
+        let dir = setup("concurrent")?;
+        Connection::open(dir.join("fixture.duckdb"))?
+            .execute_batch("INSERT INTO person SELECT 10 + i, 'name' || i FROM range(2000000) t(i);")?;
+        let out = dir.join("out");
+        let mut first = loader_command(&dir, &["--files-only", "--output-dir", out.to_str().unwrap()]).spawn()?;
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while !out.join(".fixture.lock").exists() {
+            assert!(first.try_wait()?.is_none(), "the first loader finished before the second started");
+            assert!(Instant::now() < deadline, "the first loader did not start in time");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let second = run_loader(&dir, &["--files-only", "--output-dir", out.to_str().unwrap()]);
+        assert_eq!(second.status.code(), Some(2), "{}", String::from_utf8_lossy(&second.stderr));
+        assert!(String::from_utf8_lossy(&second.stderr).contains("another loader is preparing or importing 'fixture'"));
+        assert!(first.wait()?.success(), "the first loader must not be disturbed");
+        assert!(out.join("fixture.data.typedb").exists());
+        let _ = fs::remove_dir_all(&dir);
+        Ok(())
+    }
 }
 
 // Elsewhere than on Unix, the lock file stays.

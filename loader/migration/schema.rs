@@ -11,11 +11,284 @@ use typeql::{
     common::token,
     query::{Query, QueryStructure, SchemaQuery},
     schema::definable::{
-        Definable,
+        Definable, Type as TypeDeclaration,
         type_::{Capability, CapabilityBase},
     },
     type_::{NamedType, TypeRef, TypeRefAny},
 };
+
+#[derive(Debug, Default)]
+pub(crate) struct Schema {
+    pub(crate) attributes: Vec<AttributeType>,
+    pub(crate) entities: Vec<ObjectType>,
+    pub(crate) relations: Vec<ObjectType>,
+}
+
+impl Schema {
+    pub(crate) fn parse(schema_text: &str) -> Result<Self, String> {
+        let declarations = type_declarations(schema_text)?;
+        let mut schema = Schema::default();
+        schema.declare_types(&declarations)?;
+        schema.apply_capabilities(declarations)?;
+        schema.inherit_value_types()?;
+        schema.inherit_capabilities()?;
+        schema.refuse_reserved_labels()?;
+        Ok(schema)
+    }
+
+    pub(crate) fn attribute(&self, label: &str) -> Option<&AttributeType> {
+        self.attributes.iter().find(|attribute| attribute.label == label)
+    }
+
+    pub(crate) fn object(&self, label: &str, is_relation: bool) -> Option<&ObjectType> {
+        let types = if is_relation { &self.relations } else { &self.entities };
+        types.iter().find(|object| object.label == label)
+    }
+
+    pub(crate) fn relation_and_supertypes(&self, label: &str) -> Vec<String> {
+        let mut labels = Vec::new();
+        let mut current = Some(label.to_owned());
+        while let Some(label) = current {
+            current = self.object(&label, true).and_then(|relation| relation.supertype.clone());
+            labels.push(label);
+        }
+        labels
+    }
+
+    // Every type is declared before any capability is applied, so declarations can come in any order.
+    fn declare_types(&mut self, declarations: &[TypeDeclaration]) -> Result<(), String> {
+        for declaration in declarations {
+            let label = declaration.label.ident.to_string();
+            match declaration.kind {
+                None => {}
+                Some(token::Kind::Attribute) => {
+                    if self.attribute(&label).is_none() {
+                        self.attributes.push(AttributeType::new(label));
+                    }
+                }
+                Some(kind @ (token::Kind::Entity | token::Kind::Relation)) => {
+                    let types = if kind == token::Kind::Relation { &mut self.relations } else { &mut self.entities };
+                    if !types.iter().any(|object| object.label == label) {
+                        types.push(ObjectType::new(label));
+                    }
+                }
+                Some(token::Kind::Role) => return Err(format!("unexpected top-level role declaration '{label}'")),
+            }
+        }
+        Ok(())
+    }
+
+    fn apply_capabilities(&mut self, declarations: Vec<TypeDeclaration>) -> Result<(), String> {
+        for declaration in declarations {
+            let label = declaration.label.ident.to_string();
+            let is_abstract =
+                declaration.annotations.iter().any(|annotation| matches!(annotation, Annotation::Abstract(_)));
+            if let Some(attribute) = self.attributes.iter_mut().find(|attribute| attribute.label == label) {
+                attribute.is_abstract |= is_abstract;
+                for capability in declaration.capabilities {
+                    attribute.apply(capability)?;
+                }
+                continue;
+            }
+            let object = self
+                .entities
+                .iter_mut()
+                .map(|object| (object, false))
+                .chain(self.relations.iter_mut().map(|object| (object, true)))
+                .find(|(object, _)| object.label == label);
+            let Some((object, is_relation)) = object else {
+                return Err(format!(
+                    "type '{label}' has no kinded declaration (entity/relation/attribute) in this schema"
+                ));
+            };
+            object.is_abstract |= is_abstract;
+            for capability in declaration.capabilities {
+                object.apply(capability, is_relation)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn inherit_value_types(&mut self) -> Result<(), String> {
+        let declared: HashMap<String, AttributeType> =
+            self.attributes.iter().map(|attribute| (attribute.label.clone(), attribute.clone())).collect();
+        for attribute in &mut self.attributes {
+            let mut visited = HashSet::new();
+            let mut supertype = attribute.supertype.clone();
+            while let Some(label) = supertype {
+                if !visited.insert(label.clone()) {
+                    return Err(format!("supertype cycle through '{label}'"));
+                }
+                let Some(parent) = declared.get(&label) else {
+                    return Err(format!("'{}' extends unknown attribute type '{label}'", attribute.label));
+                };
+                attribute.value_type = attribute.value_type.or(parent.value_type);
+                supertype = parent.supertype.clone();
+            }
+        }
+        Ok(())
+    }
+
+    fn inherit_capabilities(&mut self) -> Result<(), String> {
+        for types in [&mut self.entities, &mut self.relations] {
+            let declared: HashMap<String, ObjectType> =
+                types.iter().map(|object| (object.label.clone(), object.clone())).collect();
+            for object in types.iter_mut() {
+                let supertypes = supertypes(object, &declared)?;
+                object.inherit_from(&supertypes);
+            }
+        }
+        Ok(())
+    }
+
+    // The server's TypeQL refuses reserved keywords as labels, though its parser reads them.
+    fn refuse_reserved_labels(&self) -> Result<(), String> {
+        let mut labels = self.attributes.iter().map(|attribute| &attribute.label).chain(
+            self.entities.iter().chain(&self.relations).flat_map(|object| {
+                std::iter::once(&object.label).chain(object.relates.iter().map(|relates| &relates.role))
+            }),
+        );
+        match labels.find(|label| typeql::is_reserved_keyword(label)) {
+            Some(label) => Err(format!("'{label}' is a reserved TypeQL keyword, which TypeDB refuses as a label")),
+            None => Ok(()),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct AttributeType {
+    pub(crate) label: String,
+    pub(crate) is_abstract: bool,
+    pub(crate) supertype: Option<String>,
+    pub(crate) value_type: Option<ValueType>,
+}
+
+impl AttributeType {
+    fn new(label: String) -> Self {
+        AttributeType { label, is_abstract: false, supertype: None, value_type: None }
+    }
+
+    fn apply(&mut self, capability: Capability) -> Result<(), String> {
+        match capability.base {
+            CapabilityBase::Sub(sub) => self.supertype = Some(sub.supertype_label.ident.to_string()),
+            CapabilityBase::ValueType(value_type) => {
+                self.value_type = Some(parse_value_type(&value_type.value_type, &self.label)?)
+            }
+            other => {
+                return Err(format!(
+                    "attribute '{}' declares '{}', which attributes cannot have (only sub and value)",
+                    self.label,
+                    capability_name(&other)
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ObjectType {
+    pub(crate) label: String,
+    pub(crate) is_abstract: bool,
+    pub(crate) supertype: Option<String>,
+    pub(crate) owns: Vec<String>,
+    pub(crate) plays: Vec<Plays>,
+    pub(crate) relates: Vec<Relates>,
+}
+
+impl ObjectType {
+    fn new(label: String) -> Self {
+        ObjectType {
+            label,
+            is_abstract: false,
+            supertype: None,
+            owns: Vec::new(),
+            plays: Vec::new(),
+            relates: Vec::new(),
+        }
+    }
+
+    fn apply(&mut self, capability: Capability, is_relation: bool) -> Result<(), String> {
+        match capability.base {
+            CapabilityBase::Sub(sub) => self.supertype = Some(sub.supertype_label.ident.to_string()),
+            CapabilityBase::Owns(owns) => {
+                let attribute = type_ref_label(&owns.owned).ok_or_else(|| {
+                    format!(
+                        "'{} owns {}': ordered (list) ownership is not implemented in TypeDB 3.x",
+                        self.label, owns.owned
+                    )
+                })?;
+                self.owns.push(attribute);
+            }
+            CapabilityBase::Plays(plays) => self
+                .plays
+                .push(Plays { relation: plays.role.scope.ident.to_string(), role: plays.role.name.ident.to_string() }),
+            CapabilityBase::Relates(relates) if is_relation => {
+                let role = type_ref_label(&relates.related).ok_or_else(|| {
+                    format!(
+                        "'{} relates {}': ordered (list) roles are not implemented in TypeDB 3.x",
+                        self.label, relates.related
+                    )
+                })?;
+                let specialises = relates.specialised.as_ref().and_then(type_ref_label);
+                self.relates.push(Relates { role, declaring_relation: self.label.clone(), specialises });
+            }
+            other => {
+                return Err(format!(
+                    "'{}' declares '{}', which this kind cannot have",
+                    self.label,
+                    capability_name(&other)
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    // A role that this type or a supertype specialises is not related as such.
+    fn inherit_from(&mut self, supertypes: &[&ObjectType]) {
+        let specialised: HashSet<String> = std::iter::once(&*self)
+            .chain(supertypes.iter().copied())
+            .flat_map(|object| object.relates.iter().filter_map(|relates| relates.specialises.clone()))
+            .collect();
+        self.relates.retain(|relates| !specialised.contains(&relates.role));
+        for supertype in supertypes {
+            for owns in &supertype.owns {
+                if !self.owns.contains(owns) {
+                    self.owns.push(owns.clone());
+                }
+            }
+            for plays in &supertype.plays {
+                if !self.plays.iter().any(|own| own.relation == plays.relation && own.role == plays.role) {
+                    self.plays.push(plays.clone());
+                }
+            }
+            for relates in &supertype.relates {
+                if !specialised.contains(&relates.role) && !self.relates.iter().any(|own| own.role == relates.role) {
+                    self.relates.push(relates.clone());
+                }
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct Plays {
+    pub(crate) relation: String,
+    pub(crate) role: String,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct Relates {
+    pub(crate) role: String,
+    pub(crate) declaring_relation: String,
+    pub(crate) specialises: Option<String>,
+}
+
+impl Relates {
+    pub(crate) fn scoped_label(&self) -> String {
+        format!("{}:{}", self.declaring_relation, self.role)
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ValueType {
@@ -46,286 +319,50 @@ impl ValueType {
     }
 }
 
-#[derive(Debug, Clone)]
-pub(crate) struct AttributeType {
-    pub(crate) label: String,
-    pub(crate) abstract_: bool,
-    pub(crate) supertype: Option<String>,
-    pub(crate) value_type: Option<ValueType>,
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct Plays {
-    pub(crate) relation: String,
-    pub(crate) role: String,
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct Relates {
-    pub(crate) role: String,
-    pub(crate) declared_by: String,
-    pub(crate) specialises: Option<String>,
-}
-
-impl Relates {
-    pub(crate) fn scoped_label(&self) -> String {
-        format!("{}:{}", self.declared_by, self.role)
+fn type_declarations(schema_text: &str) -> Result<Vec<TypeDeclaration>, String> {
+    let queries =
+        typeql::parse_queries(schema_text).map_err(|err| format!("failed to parse the TypeDB schema: {err}"))?;
+    let define = match <[Query; 1]>::try_from(queries) {
+        Ok([Query { structure: QueryStructure::Schema(SchemaQuery::Define(define)), .. }]) => define,
+        _ => return Err("the schema file must contain a single `define` query".to_owned()),
+    };
+    let mut declarations = Vec::new();
+    for definable in define.definables {
+        match definable {
+            Definable::TypeDeclaration(declaration) => declarations.push(declaration),
+            Definable::Function(_) => {}
+            Definable::Struct(struct_) => {
+                return Err(format!("struct '{}' is not supported: TypeDB 3.x has no struct values", struct_.ident));
+            }
+            Definable::TypeRename(_) | Definable::RoleTypeRename(_) => {
+                return Err("the schema file must define types, not rename them".to_owned());
+            }
+        }
     }
+    Ok(declarations)
 }
 
-#[derive(Debug, Clone)]
-pub(crate) struct ObjectType {
-    pub(crate) label: String,
-    pub(crate) abstract_: bool,
-    pub(crate) supertype: Option<String>,
-    pub(crate) owns: Vec<String>,
-    pub(crate) plays: Vec<Plays>,
-    pub(crate) relates: Vec<Relates>,
-}
-
-#[derive(Debug, Default)]
-pub(crate) struct Schema {
-    pub(crate) attributes: Vec<AttributeType>,
-    pub(crate) entities: Vec<ObjectType>,
-    pub(crate) relations: Vec<ObjectType>,
-}
-
-impl Schema {
-    pub(crate) fn parse(schema_text: &str) -> Result<Self, String> {
-        let queries =
-            typeql::parse_queries(schema_text).map_err(|err| format!("failed to parse the TypeDB schema: {err}"))?;
-        let define = match <[Query; 1]>::try_from(queries) {
-            Ok([Query { structure: QueryStructure::Schema(SchemaQuery::Define(define)), .. }]) => define,
-            _ => return Err("the schema file must contain a single `define` query".to_owned()),
+// From the nearest supertype up.
+fn supertypes<'a>(
+    object: &ObjectType,
+    declared: &'a HashMap<String, ObjectType>,
+) -> Result<Vec<&'a ObjectType>, String> {
+    let mut supertypes: Vec<&ObjectType> = Vec::new();
+    let mut supertype = object.supertype.clone();
+    while let Some(label) = supertype {
+        if supertypes.iter().any(|known| known.label == label) {
+            return Err(format!("supertype cycle through '{label}'"));
+        }
+        let Some(parent) = declared.get(&label) else {
+            return Err(format!("'{}' extends unknown supertype '{label}'", object.label));
         };
-
-        let mut declarations = Vec::new();
-        for definable in define.definables {
-            match definable {
-                Definable::TypeDeclaration(declaration) => declarations.push(declaration),
-                Definable::Function(_) => {}
-                Definable::Struct(struct_) => {
-                    return Err(format!(
-                        "struct '{}' is not supported: TypeDB 3.x has no struct values",
-                        struct_.ident
-                    ));
-                }
-                Definable::TypeRename(_) | Definable::RoleTypeRename(_) => {
-                    return Err("the schema file must define types, not rename them".to_owned());
-                }
-            }
-        }
-
-        let mut schema = Schema::default();
-        for declaration in &declarations {
-            schema.register(declaration)?;
-        }
-        for declaration in declarations {
-            schema.apply(declaration)?;
-        }
-        schema.resolve_inheritance()?;
-        schema.check_labels()?;
-        Ok(schema)
+        supertype = parent.supertype.clone();
+        supertypes.push(parent);
     }
-
-    fn check_labels(&self) -> Result<(), String> {
-        let mut labels = self.attributes.iter().map(|attribute| &attribute.label).chain(
-            self.entities.iter().chain(&self.relations).flat_map(|object| {
-                std::iter::once(&object.label).chain(object.relates.iter().map(|relates| &relates.role))
-            }),
-        );
-        match labels.find(|label| typeql::is_reserved_keyword(label)) {
-            Some(label) => Err(format!("'{label}' is a reserved TypeQL keyword, which TypeDB refuses as a label")),
-            None => Ok(()),
-        }
-    }
-
-    fn register(&mut self, declaration: &typeql::schema::definable::Type) -> Result<(), String> {
-        let label = declaration.label.ident.to_string();
-        match declaration.kind {
-            None => Ok(()),
-            Some(token::Kind::Attribute) => {
-                if self.attribute(&label).is_none() {
-                    self.attributes.push(AttributeType { label, abstract_: false, supertype: None, value_type: None });
-                }
-                Ok(())
-            }
-            Some(kind @ (token::Kind::Entity | token::Kind::Relation)) => {
-                let types = if kind == token::Kind::Relation { &mut self.relations } else { &mut self.entities };
-                if !types.iter().any(|t| t.label == label) {
-                    types.push(ObjectType {
-                        label,
-                        abstract_: false,
-                        supertype: None,
-                        owns: Vec::new(),
-                        plays: Vec::new(),
-                        relates: Vec::new(),
-                    });
-                }
-                Ok(())
-            }
-            Some(token::Kind::Role) => Err(format!("unexpected top-level role declaration '{label}'")),
-        }
-    }
-
-    fn apply(&mut self, declaration: typeql::schema::definable::Type) -> Result<(), String> {
-        let label = declaration.label.ident.to_string();
-        let abstract_ = declaration.annotations.iter().any(|a| matches!(a, Annotation::Abstract(_)));
-        if let Some(attribute) = self.attributes.iter_mut().find(|a| a.label == label) {
-            attribute.abstract_ |= abstract_;
-            for capability in declaration.capabilities {
-                apply_attribute_capability(attribute, capability)?;
-            }
-            return Ok(());
-        }
-        for (types, is_relation) in [(&mut self.entities, false), (&mut self.relations, true)] {
-            if let Some(object) = types.iter_mut().find(|o| o.label == label) {
-                object.abstract_ |= abstract_;
-                for capability in declaration.capabilities {
-                    apply_object_capability(object, capability, is_relation)?;
-                }
-                return Ok(());
-            }
-        }
-        Err(format!("type '{label}' has no kinded declaration (entity/relation/attribute) in this schema"))
-    }
-
-    fn resolve_inheritance(&mut self) -> Result<(), String> {
-        let declared: HashMap<String, AttributeType> =
-            self.attributes.iter().map(|a| (a.label.clone(), a.clone())).collect();
-        for attribute in &mut self.attributes {
-            let mut visited = HashSet::new();
-            let mut ancestor = attribute.supertype.clone();
-            while let Some(label) = ancestor {
-                if !visited.insert(label.clone()) {
-                    return Err(format!("supertype cycle through '{label}'"));
-                }
-                let Some(parent) = declared.get(&label) else {
-                    return Err(format!("'{}' extends unknown attribute type '{label}'", attribute.label));
-                };
-                attribute.value_type = attribute.value_type.or(parent.value_type);
-                ancestor = parent.supertype.clone();
-            }
-        }
-
-        for types in [&mut self.entities, &mut self.relations] {
-            let by_label: HashMap<String, ObjectType> = types.iter().map(|o| (o.label.clone(), o.clone())).collect();
-            for object in types.iter_mut() {
-                let mut specialised: HashSet<String> =
-                    object.relates.iter().filter_map(|r| r.specialises.clone()).collect();
-                let mut ancestors = Vec::new();
-                let mut ancestor = object.supertype.clone();
-                while let Some(label) = ancestor {
-                    if ancestors.iter().any(|parent: &&ObjectType| parent.label == label) {
-                        return Err(format!("supertype cycle through '{label}'"));
-                    }
-                    let Some(parent) = by_label.get(&label) else {
-                        return Err(format!("'{}' extends unknown supertype '{label}'", object.label));
-                    };
-                    specialised.extend(parent.relates.iter().filter_map(|r| r.specialises.clone()));
-                    ancestor = parent.supertype.clone();
-                    ancestors.push(parent);
-                }
-                object.relates.retain(|r| !specialised.contains(&r.role));
-
-                for parent in ancestors {
-                    for owns in &parent.owns {
-                        if !object.owns.contains(owns) {
-                            object.owns.push(owns.clone());
-                        }
-                    }
-                    for plays in &parent.plays {
-                        if !object.plays.iter().any(|p| p.relation == plays.relation && p.role == plays.role) {
-                            object.plays.push(plays.clone());
-                        }
-                    }
-                    for relates in &parent.relates {
-                        if !specialised.contains(&relates.role)
-                            && !object.relates.iter().any(|r| r.role == relates.role)
-                        {
-                            object.relates.push(relates.clone());
-                        }
-                    }
-                }
-            }
-        }
-        Ok(())
-    }
-
-    pub(crate) fn attribute(&self, label: &str) -> Option<&AttributeType> {
-        self.attributes.iter().find(|a| a.label == label)
-    }
-
-    pub(crate) fn object(&self, label: &str, is_relation: bool) -> Option<&ObjectType> {
-        let types = if is_relation { &self.relations } else { &self.entities };
-        types.iter().find(|o| o.label == label)
-    }
-
-    pub(crate) fn relation_ancestry(&self, label: &str) -> Vec<String> {
-        let mut ancestry = Vec::new();
-        let mut current = Some(label.to_owned());
-        while let Some(label) = current {
-            current = self.object(&label, true).and_then(|relation| relation.supertype.clone());
-            ancestry.push(label);
-        }
-        ancestry
-    }
+    Ok(supertypes)
 }
 
-fn apply_attribute_capability(attribute: &mut AttributeType, capability: Capability) -> Result<(), String> {
-    match capability.base {
-        CapabilityBase::Sub(sub) => attribute.supertype = Some(sub.supertype_label.ident.to_string()),
-        CapabilityBase::ValueType(value_type) => {
-            attribute.value_type = Some(parse_value_type(&value_type.value_type, &attribute.label)?)
-        }
-        other => {
-            return Err(format!(
-                "attribute '{}' declares '{}', which attributes cannot have (only sub and value)",
-                attribute.label,
-                capability_name(&other)
-            ));
-        }
-    }
-    Ok(())
-}
-
-fn apply_object_capability(object: &mut ObjectType, capability: Capability, is_relation: bool) -> Result<(), String> {
-    match capability.base {
-        CapabilityBase::Sub(sub) => object.supertype = Some(sub.supertype_label.ident.to_string()),
-        CapabilityBase::Owns(owns) => {
-            let attribute = type_ref_any_label(&owns.owned).ok_or_else(|| {
-                format!(
-                    "'{} owns {}': ordered (list) ownership is not implemented in TypeDB 3.x",
-                    object.label, owns.owned
-                )
-            })?;
-            object.owns.push(attribute);
-        }
-        CapabilityBase::Plays(plays) => object
-            .plays
-            .push(Plays { relation: plays.role.scope.ident.to_string(), role: plays.role.name.ident.to_string() }),
-        CapabilityBase::Relates(relates) if is_relation => {
-            let role = type_ref_any_label(&relates.related).ok_or_else(|| {
-                format!(
-                    "'{} relates {}': ordered (list) roles are not implemented in TypeDB 3.x",
-                    object.label, relates.related
-                )
-            })?;
-            let specialises = relates.specialised.as_ref().and_then(type_ref_any_label);
-            object.relates.push(Relates { role, declared_by: object.label.clone(), specialises });
-        }
-        other => {
-            return Err(format!(
-                "'{}' declares '{}', which this kind cannot have",
-                object.label,
-                capability_name(&other)
-            ));
-        }
-    }
-    Ok(())
-}
-
-fn type_ref_any_label(type_ref: &TypeRefAny) -> Option<String> {
+fn type_ref_label(type_ref: &TypeRefAny) -> Option<String> {
     match type_ref {
         TypeRefAny::Type(TypeRef::Label(label)) => Some(label.ident.to_string()),
         TypeRefAny::Type(TypeRef::Scoped(scoped)) => Some(scoped.name.ident.to_string()),
