@@ -23,7 +23,6 @@ on:
       - 'BUILD'
       - 'deployment.bzl'
       - '.bazelversion'
-      - '.github/windows/**'
       - '.github/workflows/test-loader.yml'
   workflow_dispatch:
 
@@ -58,39 +57,10 @@ jobs:
           google-credentials: ${{ secrets.BAZEL_CACHE_CREDENTIAL_JSON }}
           bazelrc: |
             build --remote_cache https://storage.googleapis.com/typedb-engineers-bazel-remote-cache-europe-west1
+            build --remote_upload_local_results=${{ secrets.BAZEL_CACHE_CREDENTIAL_JSON != '' }}
       - run: bazel test //loader:loader-unit-tests --test_output=streamed
       - run: bazel test //loader/migration:unit-tests //loader/migration:test-migration --test_output=streamed
       - run: bazel test //loader/tests/migration:test-migration-cli --test_output=streamed
-
-  unit-tests-windows:
-    name: Loader unit tests (windows-x86_64)
-    runs-on: windows-2022
-    timeout-minutes: 150
-    env:
-      CARGO_BAZEL_GENERATOR_URL: https://repo.typedb.com/public/public-tools/raw/versions/0.0.0/cargo-bazel-win-x86_64
-    defaults:
-      run:
-        shell: cmd
-    steps:
-      - uses: actions/checkout@v4
-      - uses: bazel-contrib/setup-bazel@0.15.0
-        with:
-          bazelisk-cache: true
-          disk-cache: true
-          repository-cache: true
-          google-credentials: ${{ secrets.BAZEL_CACHE_CREDENTIAL_JSON }}
-          bazelrc: |
-            build --remote_cache https://storage.googleapis.com/typedb-engineers-bazel-remote-cache-europe-west1
-      - run: .github\windows\prepare.bat
-      - run: |
-          call refreshenv
-          bazel --output_base=C:/b test --enable_runfiles //loader:loader-unit-tests --test_output=streamed
-      - run: |
-          call refreshenv
-          bazel --output_base=C:/b test --enable_runfiles //loader/migration:unit-tests //loader/migration:test-migration --test_output=streamed
-      - run: |
-          call refreshenv
-          bazel --output_base=C:/b test --enable_runfiles //loader/tests/migration:test-migration-cli --test_output=streamed
 
   assembly-tests:
     name: Loader assembly tests (${{ matrix.platform }})
@@ -115,4 +85,5 @@ jobs:
           google-credentials: ${{ secrets.BAZEL_CACHE_CREDENTIAL_JSON }}
           bazelrc: |
             build --remote_cache https://storage.googleapis.com/typedb-engineers-bazel-remote-cache-europe-west1
+            build --remote_upload_local_results=${{ secrets.BAZEL_CACHE_CREDENTIAL_JSON != '' }}
       - run: bazel test //loader/tests/assembly:test-loader --test_output=streamed

@@ -1,20 +1,18 @@
 # TypeDB Loader
 
-The TypeDB Loader bulk-loads rows from a CSV file into a TypeDB database by repeatedly
-executing a user-supplied TypeQL insert pipeline whose `given` stage names the columns to
-bind. Rows are read in batches, each batch is committed in its own write transaction, and
-progress is checkpointed so an interrupted run can be resumed.
+TypeDB Loader puts data into TypeDB in one of two ways:
 
-## Loading from database files
+| | Loading CSV files (`--data`) | Migrating DuckDB databases (`--duckdb`) |
+|---|---|---|
+| Input | one CSV file | a DuckDB database file |
+| How data gets in | a TypeQL `given` insert pipeline runs for every row, in batches of write transactions | the tables are converted to TypeDB's export format, and one `database import` loads the file |
+| Schema | optional. `--schema-file` applies it before loading | required. `--schema-file` is the schema the tables are mapped onto |
+| Database | existing, or created with `--create-db` | created by the import, so it must not exist |
+| Bad data | rejected rows go to `rejects.csv` and the load goes on | any error stops the run before anything is written |
+| Interrupted runs | resume from the checkpoint with `--resume` | run again. A data file whose import failed is kept, to import without converting again |
 
-`typedb loader --duckdb <file>` migrates a DuckDB database into TypeDB: the tables are
-mapped onto `--schema-file`, converted, and imported into `--database` in one run, with
-the schema's constraints enforced by the server. `--dry-run` converts without writing;
-`--files-only` writes the data file (into `--output-dir`, by default next to the DuckDB
-file) for a later `database import` instead of loading; the file is zstd-compressed.
-`--memory-limit` caps DuckDB's memory (default: half of what it detects). See
-[migration/README.md](migration/README.md) for conventions, directives, optional keys, and
-modelling recommendations.
+The rest of this document covers loading CSV files. Migrating a DuckDB database is described in
+[migration/README.md](migration/README.md).
 
 ## Running TypeDB Loader
 
@@ -23,6 +21,7 @@ and run `./typedb loader`:
 ```bash
 cd <your_typedb_loader_dir>/
 ./typedb loader --query=<query.tql> --database=<db> --data=<data.csv> --username=<username> --address=<address>
+./typedb loader --duckdb=<data.duckdb> --schema-file=<schema.tql> --database=<db> --username=<username> --address=<address>
 ```
 
 To build and run from Cargo, use:
@@ -38,7 +37,9 @@ bazel run //loader:loader-native -- --query=<query.tql> --database=<db> --data=<
 TypeDB Loader binaries are platform-specific, so cannot be moved across platforms - please use
 the correct platform-specific distribution.
 
-## How it works
+## Loading CSV files
+
+### How it works
 
 1. Parse the query file. The pipeline must contain a `given` stage that declares the input
    variables and their value types. These names are matched against the CSV header row (or
@@ -54,7 +55,7 @@ the correct platform-specific distribution.
 5. After each batch finishes, a checkpoint file is updated. If the run is interrupted,
    resuming from the checkpoint will pick up at the next un-committed batch.
 
-## Command line arguments
+### Command line arguments
 
 The typically-used arguments are:
 
@@ -95,7 +96,7 @@ Alternatively, you may securely connect by managing your own certificates and pr
 root CA to the loader with:
 `--tls-root-ca=<path>`
 
-## Query template
+### Query template
 
 The query file must be a TypeQL pipeline whose first stage is `given`, declaring one
 variable per CSV column that the pipeline consumes. For each row, the loader binds the
@@ -127,7 +128,7 @@ Date / datetime parsing:
   `1987-12-22T17:29 Asia/Kolkata`.
 - `duration`: ISO-8601 duration (e.g. `P1Y2M3DT4H5M6S`).
 
-## CSV data file
+### CSV data file
 
 By default the loader treats the CSV as headerless and binds columns positionally to the
 `given` variables in declaration order. With `--header`, the first row is read as a header
@@ -145,7 +146,7 @@ an empty binding (the corresponding `try { ... }` clause becomes a no-op).
 
 Use `--max-rows=<n>` to process at most `n` data rows (handy for dry runs).
 
-## Batching and parallelism
+### Batching and parallelism
 
 `--batch-rows` (default 1000) controls how many rows are bundled into a single
 `query_with_inputs` invocation and committed together. Larger batches reduce commit
@@ -160,21 +161,21 @@ each completion in the checkpoint regardless of order, so resume still works cor
 See [CONCURRENCY.md](CONCURRENCY.md) for a deeper description of the worker / rejects /
 shutdown model.
 
-## Schema and database setup
+### Schema and database setup
 
 `--schema-file=<path>` runs the file's contents in a schema transaction before any data is
 loaded; `--create-db` creates the database first if it doesn't already exist. Both flags
 are ignored (with a warning) when `--resume` is used, since the prior run is assumed to
 have already done this work.
 
-## Output directory
+### Output directory
 
 All of the loader's output — `rejects.csv`, `rejects.log`, and `checkpoint.json` — is written
 to a single output directory, which is created if it does not already exist. By default the
 directory is `loader_<data-stem>_progress`, alongside the data file. Override the location
 with `--output-dir=<path>`.
 
-## Errors and rejects
+### Errors and rejects
 
 When a row fails to parse, or a batch's commit fails, the loader writes:
 - the offending CSV rows to `rejects.csv` in the output directory (with the original header
@@ -190,7 +191,7 @@ Note: with `--parallel-batches > 1`, a triggered stop may over-shoot the thresho
 to `parallel_batches × batch_rows` rows, because batches already in flight are allowed to
 finish so they are fully recorded.
 
-## Checkpointing and resume
+### Checkpointing and resume
 
 A `checkpoint.json` file inside the output directory is written after each batch finishes,
 recording the resolved parameters, content hashes of the data / query / live schema, and
@@ -215,7 +216,7 @@ For in-flight batches, the loader prints the first CSV row of each batch and ask
 to reprocess all of them, skip all of them (treat as already committed), or decide one by
 one — so you can manually verify against the database before choosing.
 
-## A complete example
+### A complete example
 
 Given this schema:
 ```typeql

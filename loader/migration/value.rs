@@ -4,7 +4,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 
-use std::{fmt, ops::Range};
+use std::fmt;
 
 use duckdb::arrow::{
     array::{
@@ -87,15 +87,78 @@ impl fmt::Display for TypeDBValue {
     }
 }
 
-// A column of a record batch, downcast once, so that its rows are read without a type check each.
-pub(crate) struct Cells<'a> {
+// Downcast once, so that its rows are read without a type check each.
+pub(crate) struct ProjectedColumn<'a> {
     array: &'a dyn Array,
-    pub(crate) typed: Typed<'a>,
+    projected: ProjectedArray<'a>,
 }
 
-// What the loader's projections produce: integers cast to BIGINT, doubles to DOUBLE, decimals to TypeDB's
-// scale, intervals and string-like types to VARCHAR; ids and players are UBIGINT.
-pub(crate) enum Typed<'a> {
+impl<'a> ProjectedColumn<'a> {
+    pub(crate) fn of(array: &'a dyn Array) -> Result<ProjectedColumn<'a>, String> {
+        Ok(ProjectedColumn { array, projected: ProjectedArray::of(array)? })
+    }
+
+    pub(crate) fn values(&self, value_type: ValueType) -> impl Iterator<Item = Result<Option<TypeDBValue>, String>> {
+        (0..self.array.len()).map(move |row| self.value(row, value_type))
+    }
+
+    pub(crate) fn value(&self, row: usize, value_type: ValueType) -> Result<Option<TypeDBValue>, String> {
+        if self.array.is_null(row) {
+            return Ok(None);
+        }
+        let converted = match (&self.projected, value_type) {
+            (ProjectedArray::Boolean(array), ValueType::Boolean) => TypeDBValue::Boolean(array.value(row)),
+            (ProjectedArray::Int64(array), ValueType::Integer) => TypeDBValue::Integer(array.value(row)),
+            (ProjectedArray::Float64(array), ValueType::Double) => double(array.value(row))?,
+            (ProjectedArray::Decimal(array), ValueType::Decimal) => decimal(array.value(row), array.scale() as u32)?,
+            (ProjectedArray::Utf8(array), ValueType::String) => TypeDBValue::String(array.value(row).to_owned()),
+            (ProjectedArray::Utf8(array), ValueType::Duration) => duration(array.value(row))?,
+            (ProjectedArray::Date32(array), ValueType::Date) => date(array.value(row))?,
+            (ProjectedArray::Timestamp { unit, values }, ValueType::Datetime) => {
+                let (seconds, nanos) = timestamp_parts(*unit, values[row])?;
+                TypeDBValue::Datetime { seconds, nanos }
+            }
+            (ProjectedArray::Timestamp { unit, values }, ValueType::DatetimeTz) => {
+                let (seconds, nanos) = timestamp_parts(*unit, values[row])?;
+                TypeDBValue::DatetimeTz { seconds, nanos }
+            }
+            (_, value_type) => {
+                let (cell, value_type) = (self.array.data_type(), value_type.name());
+                return Err(format!("cannot convert a {cell} cell to TypeDB value type '{value_type}'"));
+            }
+        };
+        Ok(Some(converted))
+    }
+
+    // The elements of a list cell; none for a NULL list.
+    pub(crate) fn list_values(
+        &self,
+        row: usize,
+        value_type: ValueType,
+    ) -> Result<impl Iterator<Item = Result<Option<TypeDBValue>, String>>, String> {
+        let ProjectedArray::List { elements } = &self.projected else {
+            return Err(format!("cannot read list elements from a {} column", self.array.data_type()));
+        };
+        let range = match self.array.is_null(row) {
+            true => 0..0,
+            false => {
+                let offsets = self.array.as_list::<i32>().value_offsets();
+                offsets[row] as usize..offsets[row + 1] as usize
+            }
+        };
+        Ok(range.map(move |element| elements.value(element, value_type)))
+    }
+
+    pub(crate) fn instance_ids(&self) -> Option<&'a UInt64Array> {
+        match self.projected {
+            ProjectedArray::UInt64(array) => Some(array),
+            _ => None,
+        }
+    }
+}
+
+// The Arrow arrays of the scans' projections: BIGINT, DOUBLE, decimals at TypeDB's scale, VARCHAR and UBIGINT.
+enum ProjectedArray<'a> {
     Boolean(&'a BooleanArray),
     Int64(&'a Int64Array),
     UInt64(&'a UInt64Array),
@@ -104,79 +167,36 @@ pub(crate) enum Typed<'a> {
     Utf8(&'a StringArray),
     Date32(&'a Date32Array),
     Timestamp { unit: TimeUnit, values: &'a [i64] },
-    List { elements: Box<Cells<'a>> },
+    List { elements: Box<ProjectedColumn<'a>> },
 }
 
-impl<'a> Cells<'a> {
-    pub(crate) fn of(array: &'a dyn Array) -> Result<Cells<'a>, String> {
-        fn timestamp<'a, T: ArrowTimestampType>(array: &'a dyn Array) -> Typed<'a> {
+impl<'a> ProjectedArray<'a> {
+    fn of(array: &'a dyn Array) -> Result<ProjectedArray<'a>, String> {
+        fn timestamp<'a, T: ArrowTimestampType>(array: &'a dyn Array) -> ProjectedArray<'a> {
             let primitive: &PrimitiveArray<T> = array.as_primitive();
-            Typed::Timestamp { unit: T::UNIT, values: primitive.values() }
+            ProjectedArray::Timestamp { unit: T::UNIT, values: primitive.values() }
         }
 
         use duckdb::arrow::datatypes as types;
-        let typed = match array.data_type() {
-            DataType::Boolean => Typed::Boolean(array.as_boolean()),
-            DataType::Int64 => Typed::Int64(array.as_primitive()),
-            DataType::UInt64 => Typed::UInt64(array.as_primitive()),
-            DataType::Float64 => Typed::Float64(array.as_primitive()),
-            DataType::Decimal128(_, _) => Typed::Decimal(array.as_primitive()),
-            DataType::Utf8 => Typed::Utf8(array.as_string()),
-            DataType::Date32 => Typed::Date32(array.as_primitive()),
+        Ok(match array.data_type() {
+            DataType::Boolean => ProjectedArray::Boolean(array.as_boolean()),
+            DataType::Int64 => ProjectedArray::Int64(array.as_primitive()),
+            DataType::UInt64 => ProjectedArray::UInt64(array.as_primitive()),
+            DataType::Float64 => ProjectedArray::Float64(array.as_primitive()),
+            DataType::Decimal128(_, _) => ProjectedArray::Decimal(array.as_primitive()),
+            DataType::Utf8 => ProjectedArray::Utf8(array.as_string()),
+            DataType::Date32 => ProjectedArray::Date32(array.as_primitive()),
             DataType::Timestamp(TimeUnit::Second, _) => timestamp::<types::TimestampSecondType>(array),
             DataType::Timestamp(TimeUnit::Millisecond, _) => timestamp::<types::TimestampMillisecondType>(array),
             DataType::Timestamp(TimeUnit::Microsecond, _) => timestamp::<types::TimestampMicrosecondType>(array),
             DataType::Timestamp(TimeUnit::Nanosecond, _) => timestamp::<types::TimestampNanosecondType>(array),
-            DataType::List(_) => {
-                Typed::List { elements: Box::new(Cells::of(array.as_list::<i32>().values().as_ref())?) }
-            }
+            DataType::List(_) => ProjectedArray::List {
+                elements: Box::new(ProjectedColumn::of(array.as_list::<i32>().values().as_ref())?),
+            },
             other => {
                 return Err(format!("DuckDB returned a column of Arrow type {other}, which the loader does not read"));
             }
-        };
-        Ok(Cells { array, typed })
-    }
-
-    // The elements of a list cell, or None for a NULL list.
-    pub(crate) fn list_range(&self, row: usize) -> Result<Option<(&Cells<'a>, Range<usize>)>, String> {
-        let Typed::List { elements } = &self.typed else {
-            return Err(format!("cannot read list elements from a {} column", self.array.data_type()));
-        };
-        if self.array.is_null(row) {
-            return Ok(None);
-        }
-        let offsets = self.array.as_list::<i32>().value_offsets();
-        let range = offsets[row] as usize..offsets[row + 1] as usize;
-        Ok(Some((elements, range)))
-    }
-
-    pub(crate) fn value(&self, row: usize, target: ValueType) -> Result<Option<TypeDBValue>, String> {
-        if self.array.is_null(row) {
-            return Ok(None);
-        }
-        let converted = match (&self.typed, target) {
-            (Typed::Boolean(cells), ValueType::Boolean) => TypeDBValue::Boolean(cells.value(row)),
-            (Typed::Int64(cells), ValueType::Integer) => TypeDBValue::Integer(cells.value(row)),
-            (Typed::Float64(cells), ValueType::Double) => double(cells.value(row))?,
-            (Typed::Decimal(cells), ValueType::Decimal) => decimal(cells.value(row), cells.scale() as u32)?,
-            (Typed::Utf8(cells), ValueType::String) => TypeDBValue::String(cells.value(row).to_owned()),
-            (Typed::Utf8(cells), ValueType::Duration) => duration(cells.value(row))?,
-            (Typed::Date32(cells), ValueType::Date) => date(cells.value(row))?,
-            (Typed::Timestamp { unit, values }, ValueType::Datetime) => {
-                let (seconds, nanos) = timestamp_parts(*unit, values[row])?;
-                TypeDBValue::Datetime { seconds, nanos }
-            }
-            (Typed::Timestamp { unit, values }, ValueType::DatetimeTz) => {
-                let (seconds, nanos) = timestamp_parts(*unit, values[row])?;
-                TypeDBValue::DatetimeTz { seconds, nanos }
-            }
-
-            (_, target) => {
-                let (cell, target) = (self.array.data_type(), target.name());
-                return Err(format!("cannot convert a {cell} cell to TypeDB value type '{target}'"));
-            }
-        };
-        Ok(Some(converted))
+        })
     }
 }
 
@@ -273,7 +293,7 @@ mod test {
     use super::*;
 
     fn single(array: &dyn Array, target: ValueType) -> Result<Option<TypeDBValue>, String> {
-        Cells::of(array)?.value(0, target)
+        ProjectedColumn::of(array)?.value(0, target)
     }
 
     #[test]
@@ -354,10 +374,9 @@ mod test {
             Some(vec![Some(1), None, Some(3)]),
             None,
         ]);
-        let cells = Cells::of(&list).unwrap();
-        let (elements, range) = cells.list_range(0).unwrap().expect("a list");
-        let values: Vec<_> = range.map(|index| elements.value(index, ValueType::Integer).unwrap()).collect();
+        let column = ProjectedColumn::of(&list).unwrap();
+        let values: Vec<_> = column.list_values(0, ValueType::Integer).unwrap().map(Result::unwrap).collect();
         assert_eq!(values, [Some(TypeDBValue::Integer(1)), None, Some(TypeDBValue::Integer(3))]);
-        assert!(cells.list_range(1).unwrap().is_none());
+        assert_eq!(column.list_values(1, ValueType::Integer).unwrap().count(), 0);
     }
 }

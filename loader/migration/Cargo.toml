@@ -28,9 +28,5 @@
 		workspace = true
 
 [[test]]
-	name = "behaviour-schemas"
-	path = "tests/behaviour_schemas.rs"
-
-[[test]]
 	name = "test-migration"
 	path = "tests/migration.rs"

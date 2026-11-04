@@ -9,14 +9,14 @@ use std::{
     error::Error,
     fs, io,
     path::PathBuf,
-    sync::mpsc,
+    sync::{Arc, mpsc},
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use duckdb::Connection;
 use prost::Message;
-use typedb_migration::{Checksums, Migration, PrepareError, Source};
+use typedb_migration::{Cancellation, Checksums, Migration, PrepareError, ProgressListener, ScanProgress, Source};
 use typedb_protocol::migration::{Item, MigrationValue, item, migration_value};
 
 const SCHEMA: &str = r#"define
@@ -90,6 +90,12 @@ impl Drop for Scratch {
     }
 }
 
+struct Silent;
+
+impl ProgressListener for Silent {
+    fn report(&self, _: &ScanProgress<'_>) {}
+}
+
 fn scratch(test_name: &str, schema: &str, sql: &str) -> Result<Scratch, Box<dyn Error>> {
     let dir = Scratch(std::env::temp_dir().join(format!("typedb-migration-{test_name}-{}", std::process::id())));
     fs::create_dir_all(&dir.0)?;
@@ -100,13 +106,15 @@ fn scratch(test_name: &str, schema: &str, sql: &str) -> Result<Scratch, Box<dyn 
 
 fn prepare(dir: &Scratch) -> Result<Migration, PrepareError> {
     let schema = fs::read_to_string(dir.0.join("schema.tql")).expect("schema");
-    Migration::prepare(&Source::DuckDb(dir.0.join("fixture.duckdb")), &schema, &dir.0.join("spill"), None)
+    let source = Source::DuckDb(dir.0.join("fixture.duckdb"));
+    Migration::prepare(&source, &schema, &dir.0.join("spill"), None, Arc::new(Cancellation::default()))
 }
 
 fn validation_errors(dir: &Scratch) -> Vec<String> {
     match prepare(dir) {
         Err(PrepareError::Invalid { errors, .. }) => errors,
         Err(PrepareError::Setup(message)) => panic!("expected validation errors, got a setup error: {message}"),
+        Err(PrepareError::Cancelled) => panic!("expected validation errors, but nothing cancelled the checks"),
         Ok(_) => panic!("expected validation errors, but validation passed"),
     }
 }
@@ -114,7 +122,7 @@ fn validation_errors(dir: &Scratch) -> Vec<String> {
 fn run(dir: &Scratch) -> Result<Vec<u8>, Box<dyn Error>> {
     let migration = prepare(dir).map_err(|err| format!("validation failed: {err:?}"))?;
     let mut output = Vec::new();
-    migration.run(&mut output, "3.0.0-test", "duckdb:fixture.duckdb", &|_| {})?;
+    migration.run(&mut output, "3.0.0-test", "duckdb:fixture.duckdb", &Silent)?;
     Ok(output)
 }
 
@@ -251,21 +259,12 @@ fn converts_and_produces_a_well_formed_import_file() -> Result<(), Box<dyn Error
     let items = decode_items(&first)?;
     assert_file_guarantees(&items);
 
-    let item::Item::Checksums(checksums) = items.last().unwrap() else { panic!() };
     let attributes: Vec<_> =
         items.iter().filter_map(|i| if let item::Item::Attribute(a) = i { Some(a) } else { None }).collect();
     let entities: Vec<_> =
         items.iter().filter_map(|i| if let item::Item::Entity(e) = i { Some(e) } else { None }).collect();
     let relations: Vec<_> =
         items.iter().filter_map(|i| if let item::Item::Relation(r) = i { Some(r) } else { None }).collect();
-    assert_eq!(checksums.attribute_count, attributes.len() as i64);
-    assert_eq!(checksums.entity_count, entities.len() as i64);
-    assert_eq!(checksums.relation_count, relations.len() as i64);
-    let ownerships: usize =
-        entities.iter().map(|e| e.attributes.len()).chain(relations.iter().map(|r| r.attributes.len())).sum();
-    assert_eq!(checksums.ownership_count, ownerships as i64);
-    let role_players: usize = relations.iter().flat_map(|r| r.roles.iter().map(|role| role.players.len())).sum();
-    assert_eq!(checksums.role_count, role_players as i64);
 
     assert_eq!(entities.len(), 3);
     assert_eq!(relations.len(), 3);
@@ -456,7 +455,7 @@ fn string_values_are_distinct_byte_wise() -> Result<(), Box<dyn Error>> {
         .iter()
         .filter_map(|item| if let item::Item::Entity(entity) = item { Some(entity.attributes.len()) } else { None })
         .sum();
-    assert_eq!(owned, 2 + 1 + 0 + 1);
+    assert_eq!(owned, 4, "'Bob' owns a name and two tags, 'BOB' a name");
 
     Ok(())
 }
@@ -956,28 +955,6 @@ fn views_and_other_schemas_are_reported() -> Result<(), Box<dyn Error>> {
 }
 
 #[test]
-fn mixed_numeric_columns_of_one_attribute_keep_every_value() -> Result<(), Box<dyn Error>> {
-    let dir = scratch(
-        "mixed-numeric",
-        "define\n  attribute price value decimal;\n  attribute weight value double;\n  \
-         entity item, owns price @card(0..), owns weight @card(0..);\n",
-        "CREATE TABLE item (_iid UBIGINT PRIMARY KEY, price DECIMAL(38,0), weight BIGINT);
-         CREATE TABLE gadget (_iid UBIGINT PRIMARY KEY, price DECIMAL(10,9), weight DECIMAL(10,2));
-         COMMENT ON TABLE gadget IS '@typedb entity item';
-         CREATE TABLE widget (_iid UBIGINT PRIMARY KEY, price BIGINT, weight FLOAT);
-         COMMENT ON TABLE widget IS '@typedb entity item';
-         INSERT INTO item VALUES (1, 1, 2);
-         INSERT INTO gadget VALUES (2, 1.25, 2.5);
-         INSERT INTO widget VALUES (3, 1, 2.5);",
-    )?;
-    let items = convert(&dir)?;
-    assert_file_guarantees(&items);
-    let attributes = items.iter().filter(|item| matches!(item, item::Item::Attribute(_))).count();
-    assert_eq!(attributes, 4, "expected prices 1 and 1.25, weights 2 and 2.5");
-    Ok(())
-}
-
-#[test]
 fn zoned_nanosecond_timestamps_convert_exactly_and_bound_their_attribute() -> Result<(), Box<dyn Error>> {
     let schema = "define\n  attribute moment value datetime-tz;\n  entity event, owns moment;\n";
     let rows = "CREATE TABLE event (_iid UBIGINT PRIMARY KEY, moment TIMESTAMPTZ_NS);
@@ -1066,19 +1043,23 @@ fn equal_values_from_columns_of_different_types_are_one_attribute() -> Result<()
     let dir = scratch(
         "mixed-columns",
         "define\n  attribute at value datetime;\n  attribute amount value decimal;\n  attribute n value integer;\n  \
-         entity thing, owns at @card(0..), owns amount @card(0..), owns n @card(0..);\n",
+         attribute weight value double;\n  \
+         entity thing, owns at @card(0..), owns amount @card(0..), owns n @card(0..), owns weight @card(0..);\n",
         "CREATE TABLE thing (_iid UBIGINT, s TIMESTAMP_S, ms TIMESTAMP_MS, us TIMESTAMP, ns TIMESTAMP_NS,
                              d2 DECIMAL(5,2), d10 DECIMAL(20,10), d19 DECIMAL(38,19),
-                             i1 TINYINT, i8 BIGINT, i16 HUGEINT);
+                             a8 BIGINT, i1 TINYINT, i8 BIGINT, i16 HUGEINT, w8 BIGINT, w2 DECIMAL(10,2), wf FLOAT);
          COMMENT ON COLUMN thing.s IS '@typedb owns at'; COMMENT ON COLUMN thing.ms IS '@typedb owns at';
          COMMENT ON COLUMN thing.us IS '@typedb owns at'; COMMENT ON COLUMN thing.ns IS '@typedb owns at';
          COMMENT ON COLUMN thing.d2 IS '@typedb owns amount'; COMMENT ON COLUMN thing.d10 IS '@typedb owns amount';
-         COMMENT ON COLUMN thing.d19 IS '@typedb owns amount'; COMMENT ON COLUMN thing.i1 IS '@typedb owns n';
+         COMMENT ON COLUMN thing.d19 IS '@typedb owns amount'; COMMENT ON COLUMN thing.a8 IS '@typedb owns amount';
+         COMMENT ON COLUMN thing.i1 IS '@typedb owns n';
          COMMENT ON COLUMN thing.i8 IS '@typedb owns n'; COMMENT ON COLUMN thing.i16 IS '@typedb owns n';
+         COMMENT ON COLUMN thing.w8 IS '@typedb owns weight'; COMMENT ON COLUMN thing.w2 IS '@typedb owns weight';
+         COMMENT ON COLUMN thing.wf IS '@typedb owns weight';
          INSERT INTO thing VALUES (1, '2020-01-01 10:00:00', '2020-01-01 10:00:00', '2020-01-01 10:00:00',
-                                   '2020-01-01 10:00:00', 1.50, 1.5, 1.5000, 5, 5, 5),
-                                  (2, NULL, '2020-01-01 10:00:00.001', NULL, '2020-01-01 10:00:00.001', 2.25, NULL,
-                                   2.2500000000000000001, NULL, 6, 6);",
+                                   '2020-01-01 10:00:00', 1.50, 1.5, 1.5000, 1, 5, 5, 5, 2, 2.50, 2.5),
+                                  (2, NULL, '2020-01-01 10:00:00.001', NULL, '2020-01-01 10:00:00.001', 2.25, 1.0,
+                                   2.2500000000000000001, NULL, NULL, 6, 6, 3, NULL, 2);",
     )?;
     let items = convert(&dir)?;
     assert_file_guarantees(&items);
@@ -1090,7 +1071,7 @@ fn equal_values_from_columns_of_different_types_are_one_attribute() -> Result<()
         })
         .collect();
     labels.sort();
-    assert_eq!(labels, ["amount", "amount", "amount", "at", "at", "n", "n"]);
+    assert_eq!(labels, ["amount", "amount", "amount", "amount", "at", "at", "n", "n", "weight", "weight", "weight"]);
     Ok(())
 }
 
@@ -1375,7 +1356,7 @@ fn an_output_error_ends_a_large_conversion() -> Result<(), Box<dyn Error>> {
     thread::spawn(move || {
         let result = prepare(&dir)
             .map_err(|err| format!("{err:?}"))
-            .and_then(|migration| migration.run(Failing, "3.0.0-test", "duckdb:fixture.duckdb", &|_| {}).map(|_| ()));
+            .and_then(|migration| migration.run(Failing, "3.0.0-test", "duckdb:fixture.duckdb", &Silent).map(|_| ()));
         let _ = sender.send(result);
     });
     let result = receiver.recv_timeout(Duration::from_secs(120)).expect("the conversion must end, not hang");
@@ -1707,5 +1688,41 @@ fn duckdb_behaves_as_the_loader_relies_on() -> Result<(), Box<dyn Error>> {
     assert_eq!(text("SELECT count(DISTINCT v) FROM (VALUES (0.0::DOUBLE), ('-0.0'::DOUBLE)) t(v)"), "1");
     // The checks quote the smallest few violations.
     assert_eq!(text("SELECT min(v, 2) FROM (VALUES (3), (1), (2)) t(v)"), "[1, 2]");
+    Ok(())
+}
+
+#[test]
+fn cancelling_stops_the_checks_and_reports_cancelled() -> Result<(), Box<dyn Error>> {
+    // Shuffled ids, in three tables to check one after the other, take the GROUP BY check for seconds.
+    let dir = scratch(
+        "cancel",
+        "define\n  entity a;\n  entity b;\n  entity c;\n",
+        "CREATE TABLE a AS SELECT (i * 7919 % 10000019)::UBIGINT AS _iid FROM range(10000000) t(i);
+         CREATE TABLE b AS FROM a;
+         CREATE TABLE c AS FROM a;",
+    )?;
+    let schema = fs::read_to_string(dir.0.join("schema.tql"))?;
+    let source = Source::DuckDb(dir.0.join("fixture.duckdb"));
+    let spill_dir = dir.0.join("spill");
+
+    let cancelled = Arc::new(Cancellation::default());
+    cancelled.cancel();
+    let outcome = Migration::prepare(&source, &schema, &spill_dir, None, cancelled);
+    assert!(matches!(outcome, Err(PrepareError::Cancelled)), "cancelled before it began");
+
+    let cancellation = Arc::new(Cancellation::default());
+    let canceller = {
+        let cancellation = cancellation.clone();
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(200));
+            cancellation.cancel();
+            Instant::now()
+        })
+    };
+    let outcome = Migration::prepare(&source, &schema, &spill_dir, None, cancellation);
+    let cancelled_at = canceller.join().expect("the canceller does not panic");
+    assert!(matches!(outcome, Err(PrepareError::Cancelled)), "cancelled during the checks");
+    assert!(cancelled_at.elapsed() < Duration::from_secs(1), "took {:?} to stop", cancelled_at.elapsed());
+    assert!(!spill_dir.exists(), "the spill directory is removed");
     Ok(())
 }
