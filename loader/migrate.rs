@@ -23,7 +23,7 @@ use crate::{
     cli::Args,
     fatal_with,
     progress::format_duration,
-    startup::{FORCE_EXIT_MESSAGE, Termination, prompt_password_if_missing},
+    startup::{Termination, prompt_password_if_missing},
 };
 
 const INTERRUPT_REPEAT: Duration = Duration::from_millis(100);
@@ -378,7 +378,7 @@ async fn cancel_on_termination<T: Send + 'static>(
             outcome = &mut task => return Err(Interrupted { exit_code, outcome: joined(outcome) }),
             _ = repeat.tick() => cancellation.cancel(),
             second_exit_code = termination.next_exit_code() => {
-                eprintln!("{FORCE_EXIT_MESSAGE}");
+                eprintln!("Forcing exiting...");
                 process::exit(second_exit_code)
             }
         }
