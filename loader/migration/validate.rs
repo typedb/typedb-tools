@@ -13,11 +13,23 @@ use crate::{
     catalog::ColumnType,
     mapping::{MappingPlan, OwnershipColumn, RoleColumn, TableKind, TableMapping},
     schema::ValueType,
-    sql::{self, IID_COLUMN, value_condition},
-    value::{MAX_EPOCH_DAYS, MAX_EPOCH_SECONDS, MIN_EPOCH_DAYS, MIN_EPOCH_SECONDS},
+    sql::{self, IID_COLUMN, ROWID_COLUMN, value_condition},
+    value::{MAX_EPOCH_DAYS, MAX_EPOCH_SECONDS, MICROS_PER_SECOND, MIN_EPOCH_DAYS, MIN_EPOCH_SECONDS, NANOS_PER_MICRO},
 };
 
-// Looks for what would make the data file invalid; the schema's constraints are the server's to enforce.
+const EXAMPLES: usize = 3;
+const INSTANCE_ID_BOUND: u64 = 1 << 63;
+// Every integer part of up to 18 digits fits 64 bits; some of 19 do not.
+const I64_SAFE_DIGITS: u8 = 18;
+// A double holds every integer of up to 53 bits, and every decimal of up to 15 significant digits.
+const DOUBLE_EXACT_INTEGER_BITS: u8 = 53;
+const DOUBLE_EXACT_DIGITS: u8 = 15;
+const MIN_NANOSECOND_EPOCH_MICROS: i64 = i64::MIN / NANOS_PER_MICRO as i64;
+const MAX_NANOSECOND_EPOCH_MICROS: i64 = i64::MAX / NANOS_PER_MICRO as i64;
+// The time part of a TypeDB duration is an unsigned count of nanoseconds.
+const MAX_DURATION_TIME_MICROS: u64 = u64::MAX / NANOS_PER_MICRO;
+
+// The schema's constraints are the server's to enforce at import.
 pub(crate) fn check_data(
     connection: &Connection,
     plan: &MappingPlan,
@@ -54,7 +66,6 @@ struct DataChecker<'a> {
 }
 
 impl DataChecker<'_> {
-    // For the tables whose ids the loader checks, or that undeclared references point into.
     fn read_id_orders(&mut self, plan: &MappingPlan) -> Vec<IdOrder> {
         let referenced: HashSet<usize> = plan
             .tables
@@ -66,9 +77,10 @@ impl DataChecker<'_> {
         let mut id_orders = Vec::new();
         for (index, table) in plan.tables.iter().enumerate() {
             let is_needed = !table.id_guarantees.is_unique || referenced.contains(&index);
-            let id_order = match is_needed && !table.has_rowid_column && !self.cancellation.is_cancelled() {
-                true => self.read_id_order(table),
-                false => IdOrder::Unread,
+            let id_order = if is_needed && !table.has_rowid_column && !self.cancellation.is_cancelled() {
+                self.read_id_order(table)
+            } else {
+                IdOrder::Unknown
             };
             id_orders.push(id_order);
         }
@@ -76,19 +88,21 @@ impl DataChecker<'_> {
     }
 
     fn read_id_order(&mut self, table: &TableMapping) -> IdOrder {
-        let read = self.connection.query_row(&sql::check::id_order(&table.name), [], |row| {
+        let extent = self.connection.query_row(&sql::check::id_order(&table.name), [], |row| {
             Ok((row.get::<_, u64>(0)?, row.get::<_, u64>(1)?, row.get(2)?, row.get(3)?, row.get(4)?))
         });
-        match read {
-            Ok((0, ..)) => IdOrder::EMPTY,
-            Ok((rows, ids, Some(first), Some(last), Some(true))) if ids == rows && last - first == rows - 1 => {
+        match extent {
+            Ok((0, ..)) => IdOrder::Empty,
+            Ok((rows, non_null_ids, Some(first), Some(last), Some(is_in_row_order)))
+                if is_in_row_order && non_null_ids == rows && last - first == rows - 1 =>
+            {
                 IdOrder::Dense { first, last }
             }
             Ok(_) => IdOrder::NotDense,
-            Err(_) if self.cancellation.is_cancelled() => IdOrder::Unread,
+            Err(_) if self.cancellation.is_cancelled() => IdOrder::Unknown,
             Err(err) => {
                 self.findings.error(format!("table '{}': its {IID_COLUMN}s could not be read: {err}", table.name));
-                IdOrder::Unread
+                IdOrder::Unknown
             }
         }
     }
@@ -105,13 +119,16 @@ impl DataChecker<'_> {
         for TablesOfType { label, indices } in tables_by_type {
             let tables: Vec<&TableMapping> = indices.iter().map(|&index| &plan.tables[index]).collect();
             let subject = match indices.as_slice() {
-                &[index] if tables[0].id_guarantees.is_unique || matches!(id_orders[index], IdOrder::Dense { .. }) => {
+                &[index]
+                    if tables[0].id_guarantees.is_unique
+                        || matches!(id_orders[index], IdOrder::Dense { .. } | IdOrder::Empty) =>
+                {
                     continue;
                 }
                 [_] => format!("table '{}'", tables[0].name),
                 _ => {
-                    let names: Vec<String> = tables.iter().map(|table| format!("'{}'", table.name)).collect();
-                    format!("tables {} mapped to '{label}'", names.join(", "))
+                    let quoted_names: Vec<String> = tables.iter().map(|table| format!("'{}'", table.name)).collect();
+                    format!("tables {} mapped to '{label}'", quoted_names.join(", "))
                 }
             };
             let names: Vec<&str> = tables.iter().map(|table| table.name.as_str()).collect();
@@ -119,28 +136,27 @@ impl DataChecker<'_> {
                 subject,
                 unit: "_iid value(s)",
                 predicate: "appear in more than one row; an _iid is the instance's id within its type",
-                example: "_iid",
+                example_label: "_iid",
                 violations: sql::check::repeated_ids(&names),
             });
         }
     }
 
-    // TypeDB numbers a type's instances below 2^63.
     fn check_instance_ids(&mut self, table: &TableMapping) {
         self.run(Check {
             subject: format!("table '{}'", table.name),
             unit: "row(s)",
             predicate: "have an _iid of 2^63 or more, beyond TypeDB's instance ids; number the rows, and the columns \
                         referencing them, below that",
-            example: "_iid",
-            violations: sql::check::ids_from(&table.name, 1 << 63),
+            example_label: "_iid",
+            violations: sql::check::ids_at_or_above(&table.name, INSTANCE_ID_BOUND),
         });
         if !table.id_guarantees.is_not_null {
             self.run(Check {
                 subject: format!("table '{}'", table.name),
                 unit: "row(s)",
                 predicate: "have no _iid, which every row needs as its instance id",
-                example: "rowid",
+                example_label: ROWID_COLUMN,
                 violations: sql::check::rows_without_id(&table.name),
             });
         }
@@ -152,7 +168,7 @@ impl DataChecker<'_> {
             subject: format!("relation table '{}'", table.name),
             unit: "row(s)",
             predicate: "fill no role (every role column is NULL), and a relation cannot exist without players",
-            example: "_iid",
+            example_label: "_iid",
             violations: sql::check::rows_without_players(&table.name, &role_columns),
         });
     }
@@ -165,9 +181,10 @@ impl DataChecker<'_> {
         player_id_order: IdOrder,
     ) {
         let subject = format!("table '{}': column '{}' (references '{}')", table.name, role.column, player_table.name);
-        let (first, last) = match player_id_order {
-            IdOrder::Dense { first, last } => (first, last),
-            IdOrder::Unread => return,
+        let violations = match player_id_order {
+            IdOrder::Dense { first, last } => sql::check::references_outside(&table.name, &role.column, first, last),
+            IdOrder::Empty => sql::check::references(&table.name, &role.column),
+            IdOrder::Unknown => return,
             IdOrder::NotDense => return self.findings.error(format!(
                 "{subject}: the {IID_COLUMN}s of '{}' are not dense in row order, so the references cannot be checked; \
                  declare the column a FOREIGN KEY to '{}'({IID_COLUMN}), or number the rows of '{}' in order, as \
@@ -179,29 +196,30 @@ impl DataChecker<'_> {
             subject,
             unit: "row(s)",
             predicate: "hold a value that is no _iid of the referenced table",
-            example: "value",
-            violations: sql::check::references_outside(&table.name, &role.column, first, last),
+            example_label: "value",
+            violations,
         });
     }
 
-    // Mirrors the limits of the conversion, so that no value fails it after hours.
     fn check_values_fit_typedb(&mut self, table: &TableMapping, ownership: &OwnershipColumn) {
         let is_read_as_double = ownership.value_type == ValueType::Double;
+        let is_beyond_i64 = matches!(ownership.element_type, ColumnType::Integer { bits, is_signed }
+            if bits > 64 || bits == 64 && !is_signed);
         let is_widened_to_nanoseconds = self.nanosecond_attributes.contains(ownership.attribute.as_str())
             && !ownership.element_type.has_nanoseconds();
         let (predicate, condition) = match &ownership.element_type {
-            ColumnType::Integer { .. } if !ownership.element_type.fits_i64() && !is_read_as_double => {
+            ColumnType::Integer { .. } if is_beyond_i64 && !is_read_as_double => {
                 ("hold an integer that does not fit TypeDB's 64-bit integer", value_condition::beyond_i64())
             }
-            ColumnType::Decimal { precision, scale } if !is_read_as_double && precision - scale > 18 => (
+            ColumnType::Decimal { precision, scale } if !is_read_as_double && precision - scale > I64_SAFE_DIGITS => (
                 "hold a decimal whose integer part is beyond TypeDB's 64-bit range",
                 value_condition::integer_part_beyond_i64(),
             ),
             // Rounding would merge distinct values into one attribute; at one scale, exact round-trips stay apart.
-            ColumnType::Integer { bits, .. } if is_read_as_double && *bits > 32 => {
+            ColumnType::Integer { bits, .. } if is_read_as_double && *bits > DOUBLE_EXACT_INTEGER_BITS => {
                 ("hold a value that a double cannot represent exactly", value_condition::inexact_as_double(0))
             }
-            ColumnType::Decimal { precision, scale } if is_read_as_double && *precision > 15 => {
+            ColumnType::Decimal { precision, scale } if is_read_as_double && *precision > DOUBLE_EXACT_DIGITS => {
                 ("hold a value that a double cannot represent exactly", value_condition::inexact_as_double(*scale))
             }
             ColumnType::Double => {
@@ -213,7 +231,7 @@ impl DataChecker<'_> {
             ),
             ColumnType::Timestamp { .. } | ColumnType::TimestampTz { .. } if is_widened_to_nanoseconds => (
                 "hold a timestamp outside the nanosecond range that the attribute's nanosecond columns impose",
-                value_condition::timestamp_outside(i64::MIN / 1000, i64::MAX / 1000),
+                value_condition::timestamp_outside(MIN_NANOSECOND_EPOCH_MICROS, MAX_NANOSECOND_EPOCH_MICROS),
             ),
             // Nanoseconds since 1970 in 64 bits are within TypeDB's range.
             ColumnType::TimestampTz { has_nanoseconds: true } => {
@@ -222,14 +240,13 @@ impl DataChecker<'_> {
             ColumnType::Timestamp { .. } | ColumnType::TimestampTz { has_nanoseconds: false } => (
                 "hold a timestamp that is infinite or outside TypeDB's datetime range",
                 value_condition::timestamp_outside(
-                    MIN_EPOCH_SECONDS * 1_000_000,
-                    MAX_EPOCH_SECONDS * 1_000_000 + 999_999,
+                    MIN_EPOCH_SECONDS * MICROS_PER_SECOND,
+                    (MAX_EPOCH_SECONDS + 1) * MICROS_PER_SECOND - 1,
                 ),
             ),
-            // The time part of a TypeDB duration is an unsigned count of nanoseconds.
             ColumnType::Interval => (
                 "hold an interval with a negative part or a time part beyond TypeDB's duration range",
-                value_condition::interval_negative_or_beyond(u64::MAX / 1000),
+                value_condition::interval_negative_or_beyond(MAX_DURATION_TIME_MICROS),
             ),
             ColumnType::Boolean
             | ColumnType::Integer { .. }
@@ -243,7 +260,7 @@ impl DataChecker<'_> {
             subject: format!("table '{}': column '{}'", table.name, ownership.column),
             unit: "row(s)",
             predicate,
-            example: "_iid",
+            example_label: "_iid",
             violations: sql::check::rows_with_values_where(&table.name, &ownership.unnested_values(), &condition),
         });
     }
@@ -251,7 +268,7 @@ impl DataChecker<'_> {
     // Decimals of different scales can each round-trip and still make one double: 0.1 and 0.10000000000000001.
     fn check_decimals_stay_distinct_as_doubles(&mut self, attribute: &str, sources: &[DecimalSource<'_>]) {
         let scales: HashSet<u8> = sources.iter().map(|source| source.scale).collect();
-        if scales.len() < 2 || sources.iter().all(|source| source.precision <= 15) {
+        if scales.len() < 2 || sources.iter().all(|source| source.precision <= DOUBLE_EXACT_DIGITS) {
             return;
         }
         let columns: Vec<(&str, String)> =
@@ -260,7 +277,7 @@ impl DataChecker<'_> {
             subject: format!("attribute '{attribute}'"),
             unit: "double(s)",
             predicate: "are made from distinct decimals of different scales, which would merge into one attribute",
-            example: "decimals",
+            example_label: "decimals",
             violations: sql::check::distinct_decimals_making_one_double(&columns),
         });
     }
@@ -269,21 +286,13 @@ impl DataChecker<'_> {
         if self.cancellation.is_cancelled() {
             return;
         }
-        let summary = sql::check::summary(&check.violations, EXAMPLES);
-        let read = self.connection.query_row(&summary, [], |row| {
-            Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, String>(2)?))
-        });
-        match read {
+        let query = sql::check::count_and_examples(&check.violations, EXAMPLES);
+        let counted = self
+            .connection
+            .query_row(&query, [], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, String>(2)?)));
+        match counted {
             Err(_) if self.cancellation.is_cancelled() => {}
-            Err(err) => {
-                let err = err.to_string();
-                let hint = if err.contains("Extension") {
-                    " (the loader loads no DuckDB extensions: materialise the columns that need one when staging)"
-                } else {
-                    ""
-                };
-                self.findings.error(format!("{}: could not be checked: {err}{hint}", check.subject))
-            }
+            Err(err) => self.findings.error(format!("{}: could not be checked: {err}", check.subject)),
             Ok((count, nulls, examples)) if count > 0 => {
                 let examples = match (examples.is_empty(), nulls > 0) {
                     (true, _) => "NULL".to_owned(),
@@ -292,15 +301,13 @@ impl DataChecker<'_> {
                 };
                 self.findings.error(format!(
                     "{}: {count} {} {}, e.g. {} {examples}",
-                    check.subject, check.unit, check.predicate, check.example
+                    check.subject, check.unit, check.predicate, check.example_label
                 ))
             }
             Ok(_) => {}
         }
     }
 }
-
-const EXAMPLES: usize = 3;
 
 struct TablesOfType<'a> {
     label: &'a str,
@@ -311,7 +318,7 @@ struct Check {
     subject: String,
     unit: &'static str,
     predicate: &'static str,
-    example: &'static str,
+    example_label: &'static str,
     violations: String,
 }
 
@@ -319,13 +326,9 @@ struct Check {
 #[derive(Clone, Copy)]
 enum IdOrder {
     Dense { first: u64, last: u64 },
+    Empty,
     NotDense,
-    Unread,
-}
-
-impl IdOrder {
-    // An empty table's range holds nothing.
-    const EMPTY: IdOrder = IdOrder::Dense { first: 1, last: 0 };
+    Unknown,
 }
 
 struct DecimalSource<'a> {

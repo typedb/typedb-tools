@@ -26,6 +26,13 @@ use crate::{
     startup::{Termination, prompt_password_if_missing},
 };
 
+const INTERRUPT_REPEAT: Duration = Duration::from_millis(100);
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+
+const ALREADY_EXISTS: &str = "DBC6";
+const IS_BEING_IMPORTED: &str = "DBC8";
+const DUCKDB_SPILL_FILE_PREFIX: &str = "duckdb_temp_";
+
 pub(crate) async fn run_migration(args: &Args) -> ! {
     let input = MigrationInput::read(args);
     let exit_code = match migrate(args, &input).await {
@@ -38,61 +45,50 @@ pub(crate) async fn run_migration(args: &Args) -> ! {
 async fn migrate(args: &Args, input: &MigrationInput) -> Result<(), Failure> {
     let output = Output::prepare(args, input)?;
     let server = match &output {
-        Output::DataFile(_) if !args.files_only => Some(connect(args, &input.database).await?),
+        Output::DataFile(_) if !args.files_only => Some(connect_to_new_database(args, &input.database).await?),
         Output::DataFile(_) | Output::DryRun { .. } => None,
     };
     let mut termination = Termination::listen();
-    say(format_args!("Migrating from DuckDB file '{}'", input.db_path.display()));
+    print(format_args!("Migrating from DuckDB file '{}'", input.duckdb_path.display()));
     let progress = Progress::new();
     let heartbeat = progress.keep_reporting();
     let cancellation = Arc::new(Cancellation::default());
     let migration = prepare(args, input, output.spill_dir(), &cancellation, &mut termination).await?;
-    let (checksums, elapsed) = convert(migration, input, &output, &progress, &cancellation, &mut termination).await?;
-    drop(heartbeat);
-    print_summary(&checksums, elapsed);
-
-    let data_file = match output {
-        Output::DryRun { .. } => {
-            say(format_args!("Nothing was written or loaded (--dry-run)."));
-            return Ok(());
+    let import_command = match &output {
+        Output::DryRun { .. } => None,
+        Output::DataFile(data_file) => {
+            Some(console_import_command(args, &input.database, &input.schema_path, &data_file.path))
         }
-        Output::DataFile(data_file) => data_file,
     };
-    let import_command = console_import_command(args, &input.database, &input.schema_path, &data_file.path);
-    let Some((connection, driver)) = server else {
-        say(format_args!("  Data file:      {}", data_file.path.display()));
-        say(format_args!("Import with: {import_command}"));
+    let (checksums, elapsed) =
+        convert(migration, input, &output, import_command.as_deref(), &progress, &cancellation, &mut termination)
+            .await?;
+    drop(heartbeat);
+    print_conversion_counts(&checksums, elapsed);
+
+    let (Output::DataFile(data_file), Some(import_command)) = (output, import_command) else {
+        print(format_args!("Nothing was written or loaded (--dry-run)."));
         return Ok(());
     };
-    let kept_hint = format!(
-        "The prepared data file is kept: {}\nImport it without converting again with:\n  {import_command}",
-        data_file.path.display()
-    );
-    let kept = |failure: Failure| Failure { kept_hint: Some(kept_hint.clone()), ..failure };
+    let Some(settings) = server else {
+        print(format_args!("  Data file:      {}", data_file.path.display()));
+        print(format_args!("Import with: {import_command}"));
+        return Ok(());
+    };
+    let kept = |failure: Failure| Failure { kept_hint: Some(kept_hint(&data_file.path, &import_command)), ..failure };
     let database = &input.database;
-    say(format_args!("Importing into '{database}' from {} (kept if the import fails)...", data_file.path.display()));
+    print(format_args!("Importing into '{database}' from {} (kept if the import fails)...", data_file.path.display()));
     let started = Instant::now();
-    let imported = guard(&mut termination, import(&connection, driver, database, &input.schema_text, &data_file.path))
-        .await
-        .map_err(|signal| kept(Failure::interrupted_import(signal)))?;
-    match imported.map_err(kept)? {
-        Imported::Confirmed => {
-            remove_file_if_exists(&data_file.path);
-            say(format_args!("Imported in {}.", format_duration(started.elapsed())));
-            Ok(())
-        }
-        Imported::Unconfirmed => Err(kept(Failure::new(
-            ExitCode::ConnectionError,
-            format!(
-                "'{database}' exists, possibly imported by an attempt of this run that lost its connection; the data \
-                 file is kept until you have checked the database"
-            ),
-        ))),
-    }
+    let import = tokio::spawn(import(settings, database.clone(), input.schema_text.clone(), data_file.path.clone()));
+    let imported = until_terminated(&mut termination, import).await;
+    joined(imported.map_err(|exit_code| kept(Failure::interrupted_import(exit_code)))?).map_err(kept)?;
+    remove_file_if_exists(&data_file.path);
+    print(format_args!("Imported in {}.", format_duration(started.elapsed())));
+    Ok(())
 }
 
 struct MigrationInput {
-    db_path: PathBuf,
+    duckdb_path: PathBuf,
     schema_path: String,
     schema_text: String,
     database: String,
@@ -101,30 +97,30 @@ struct MigrationInput {
 
 impl MigrationInput {
     fn read(args: &Args) -> MigrationInput {
-        let db_path = PathBuf::from(args.duckdb.as_deref().expect("dispatched on --duckdb"));
-        check_source_file(&db_path);
+        let duckdb_path = PathBuf::from(args.duckdb.as_deref().expect("dispatched on --duckdb"));
+        check_source_file(&duckdb_path);
         let Some(schema_path) = args.schema_file.clone() else {
             fatal_with(ExitCode::UserInputError, "--schema-file is required with --duckdb");
         };
         let schema_text = fs::read_to_string(&schema_path).unwrap_or_else(|err| {
             fatal_with(ExitCode::UserInputError, format!("failed to read schema file '{schema_path}': {err}"))
         });
-        let database = database_name(args, &db_path);
-        let original_database = format!("duckdb:{}", db_path.file_name().unwrap_or_default().to_string_lossy());
-        MigrationInput { db_path, schema_path, schema_text, database, original_database }
+        let database = database_name(args, &duckdb_path);
+        let original_database = format!("duckdb:{}", duckdb_path.file_name().unwrap_or_default().to_string_lossy());
+        MigrationInput { duckdb_path, schema_path, schema_text, database, original_database }
     }
 }
 
-fn check_source_file(db_path: &Path) {
-    if !db_path.is_file() {
-        let problem = if db_path.exists() { "is not a file" } else { "does not exist" };
-        fatal_with(ExitCode::UserInputError, format!("DuckDB file '{}' {problem}", db_path.display()));
+fn check_source_file(duckdb_path: &Path) {
+    if !duckdb_path.is_file() {
+        let problem = if duckdb_path.exists() { "is not a file" } else { "does not exist" };
+        fatal_with(ExitCode::UserInputError, format!("DuckDB file '{}' {problem}", duckdb_path.display()));
     }
 }
 
-fn database_name(args: &Args, db_path: &Path) -> String {
+fn database_name(args: &Args, duckdb_path: &Path) -> String {
     let name = args.database.clone().unwrap_or_else(|| {
-        let stem = db_path.file_stem().expect("the source was checked to be a file, which has a name");
+        let stem = duckdb_path.file_stem().expect("the source was checked to be a file, which has a name");
         stem.to_string_lossy().into_owned()
     });
     if !args.dry_run && !typeql::common::identifier::is_valid_label(&name) {
@@ -149,19 +145,20 @@ impl Output {
     fn prepare(args: &Args, input: &MigrationInput) -> Result<Output, Failure> {
         if args.dry_run {
             let spill_dir = std::env::temp_dir().join(format!(".typedb-loader.{}.tmp", process::id()));
+            remove_spill_left_behind(&spill_dir)?;
             return Ok(Output::DryRun { spill_dir });
         }
-        let work_dir = match args.output_dir.as_deref() {
+        let output_dir = match args.output_dir.as_deref() {
             Some(dir) => PathBuf::from(if dir.is_empty() { "." } else { dir }),
-            None => staging_dir(&input.db_path),
+            None => default_output_dir(&input.duckdb_path),
         };
-        fs::create_dir_all(&work_dir).map_err(|err| {
-            let message = format!("failed to create output directory '{}': {err}", work_dir.display());
+        fs::create_dir_all(&output_dir).map_err(|err| {
+            let message = format!("failed to create output directory '{}': {err}", output_dir.display());
             Failure::new(ExitCode::MigrationError, message)
         })?;
-        let lock = OutputLock::take(&work_dir, &input.database)?;
-        let path = output_data_path(&work_dir, &input.database, args.overwrite)?;
-        let spill_dir = work_dir.join(format!(".{}.tmp", input.database));
+        let lock = OutputLock::take(&output_dir, &input.database)?;
+        let path = output_data_path(&output_dir, &input.database, &input.duckdb_path, args.overwrite)?;
+        let spill_dir = output_dir.join(format!(".{}.tmp", input.database));
         remove_spill_left_behind(&spill_dir)?;
         remove_file_if_exists(&partial_path(&path));
         Ok(Output::DataFile(DataFileOutput { path, spill_dir, _lock: lock }))
@@ -174,16 +171,16 @@ impl Output {
     }
 }
 
-fn staging_dir(db_path: &Path) -> PathBuf {
-    match db_path.parent() {
+fn default_output_dir(duckdb_path: &Path) -> PathBuf {
+    match duckdb_path.parent() {
         Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
         _ => PathBuf::from("."),
     }
 }
 
 // One run per database and directory owns the data file, partial file and spill directory; a dead run's are stale.
+// The lock file stays, as removing it would let a run that opened it just before take a lock nobody else sees.
 struct OutputLock {
-    path: PathBuf,
     _file: fs::File,
 }
 
@@ -197,65 +194,50 @@ impl OutputLock {
             );
             Failure::new(ExitCode::UserInputError, message)
         };
-        loop {
-            let file = fs::OpenOptions::new().create(true).truncate(false).write(true).open(&path).map_err(failed)?;
-            match file.try_lock() {
-                Ok(()) => {}
-                Err(fs::TryLockError::WouldBlock) => {
-                    let message =
-                        format!("another loader is preparing or importing '{database}' in '{}'", dir.display());
-                    return Err(Failure::new(ExitCode::UserInputError, message));
-                }
-                Err(fs::TryLockError::Error(err)) => return Err(failed(err)),
+        let file = fs::OpenOptions::new().create(true).truncate(false).write(true).open(&path).map_err(failed)?;
+        match file.try_lock() {
+            Ok(()) => Ok(OutputLock { _file: file }),
+            Err(fs::TryLockError::WouldBlock) => {
+                let message = format!("another loader is preparing or importing '{database}' in '{}'", dir.display());
+                Err(Failure::new(ExitCode::UserInputError, message))
             }
-            // A run removes its lock file as it ends, and a file opened before the removal is no lock any more.
-            if is_at(&file, &path) {
-                return Ok(OutputLock { path, _file: file });
-            }
+            Err(fs::TryLockError::Error(err)) => Err(failed(err)),
         }
     }
 }
 
-// Where a removed file cannot be told from the file at its path, the lock file stays.
-impl Drop for OutputLock {
-    fn drop(&mut self) {
-        if cfg!(unix) {
-            remove_file_if_exists(&self.path);
-        }
-    }
-}
-
-#[cfg(unix)]
-fn is_at(file: &fs::File, path: &Path) -> bool {
-    use std::os::unix::fs::MetadataExt;
-    match (file.metadata(), fs::metadata(path)) {
-        (Ok(opened), Ok(current)) => (opened.dev(), opened.ino()) == (current.dev(), current.ino()),
-        _ => false,
-    }
-}
-
-#[cfg(not(unix))]
-fn is_at(_: &fs::File, _: &Path) -> bool {
-    true
-}
-
-fn output_data_path(dir: &Path, database: &str, overwrite: bool) -> Result<PathBuf, Failure> {
+fn output_data_path(
+    dir: &Path,
+    database: &str,
+    duckdb_path: &Path,
+    is_overwrite_allowed: bool,
+) -> Result<PathBuf, Failure> {
     let path = dir.join(format!("{database}.data.typedb"));
-    if !overwrite && path.exists() {
-        let message = format!("'{}' already exists; pass --overwrite to replace it", path.display());
-        return Err(Failure::new(ExitCode::UserInputError, message));
+    let input_error = |problem: &str| Failure::new(ExitCode::UserInputError, format!("'{}' {problem}", path.display()));
+    let source = fs::canonicalize(duckdb_path).ok();
+    let is_source = |output: &Path| fs::canonicalize(output).is_ok_and(|output| Some(output) == source);
+    if is_source(&path) || is_source(&partial_path(&path)) {
+        return Err(input_error(
+            "would overwrite the DuckDB file being converted; choose another --database or --output-dir",
+        ));
+    }
+    if path.is_dir() {
+        return Err(input_error("is a directory, which the data file cannot replace"));
+    }
+    // A link counts as existing even when what it points to does not.
+    if !is_overwrite_allowed && fs::symlink_metadata(&path).is_ok() {
+        return Err(input_error("already exists; pass --overwrite to replace it"));
     }
     Ok(path)
 }
 
-// DuckDB names its spill files `duckdb_temp_*`; anything else in the directory is not the loader's to remove.
 fn remove_spill_left_behind(spill_dir: &Path) -> Result<(), Failure> {
     let Ok(metadata) = fs::symlink_metadata(spill_dir) else { return Ok(()) };
     if metadata.is_dir()
         && let Ok(entries) = fs::read_dir(spill_dir)
     {
         for entry in entries.flatten() {
-            if entry.file_name().to_string_lossy().starts_with("duckdb_temp_") {
+            if entry.file_name().to_string_lossy().starts_with(DUCKDB_SPILL_FILE_PREFIX) {
                 remove_file_if_exists(&entry.path());
             }
         }
@@ -289,7 +271,7 @@ impl ConnectionSettings {
     }
 }
 
-async fn connect(args: &Args, database: &str) -> Result<(ConnectionSettings, TypeDBDriver), Failure> {
+async fn connect_to_new_database(args: &Args, database: &str) -> Result<ConnectionSettings, Failure> {
     let input_error = |message: String| Failure::new(ExitCode::UserInputError, message);
     let Some(addresses) = args.addresses.as_deref() else {
         return Err(input_error(
@@ -303,22 +285,34 @@ async fn connect(args: &Args, database: &str) -> Result<(ConnectionSettings, Typ
     let addresses = parse_addresses(addresses).map_err(input_error)?;
     let tls_config = build_tls_config(args.tls_disabled.unwrap_or(false), args.tls_root_ca.as_deref().map(Path::new))
         .map_err(input_error)?;
-    let connection = ConnectionSettings {
+    let settings = ConnectionSettings {
         addresses,
         credentials: Credentials::new(username, &password),
         options: DriverOptions::new(tls_config),
     };
-    let driver = connection
+    let timed_out = |_| {
+        let message = format!("TypeDB did not answer within {} s", CONNECT_TIMEOUT.as_secs());
+        Failure::new(ExitCode::ConnectionError, message)
+    };
+    let is_new =
+        tokio::time::timeout(CONNECT_TIMEOUT, is_new_database(&settings, database)).await.map_err(timed_out)?;
+    match is_new? {
+        true => Ok(settings),
+        false => Err(input_error(format!(
+            "database '{database}' already exists; the import creates it, so choose another --database"
+        ))),
+    }
+}
+
+async fn is_new_database(settings: &ConnectionSettings, database: &str) -> Result<bool, Failure> {
+    let driver = settings
         .connect()
         .await
         .map_err(|err| Failure::new(ExitCode::ConnectionError, format!("failed to connect to TypeDB: {err}")))?;
-    match driver.databases().contains(database).await {
-        Ok(false) => Ok((connection, driver)),
-        Ok(true) => Err(input_error(format!(
-            "database '{database}' already exists; the import creates it, so choose another --database"
-        ))),
-        Err(err) => Err(Failure::new(ExitCode::ConnectionError, format!("failed to list databases: {err}"))),
-    }
+    let contains = driver.databases().contains(database).await;
+    contains
+        .map(|is_present| !is_present)
+        .map_err(|err| Failure::new(ExitCode::ConnectionError, format!("failed to list databases: {err}")))
 }
 
 struct Failure {
@@ -332,62 +326,59 @@ impl Failure {
         Failure { exit_code: code as i32, message: message.into(), kept_hint: None }
     }
 
-    fn interrupted(signal: i32) -> Failure {
-        Failure { exit_code: signal, message: "interrupted; nothing was loaded".to_owned(), kept_hint: None }
+    fn interrupted(exit_code: i32) -> Failure {
+        Failure { exit_code, message: "interrupted; nothing was loaded".to_owned(), kept_hint: None }
     }
 
-    fn interrupted_after_conversion(signal: i32, data_path: &Path) -> Failure {
-        let message = format!(
-            "interrupted after the conversion, before anything was loaded: the data file is complete at {}",
-            data_path.display()
-        );
-        Failure { exit_code: signal, message, kept_hint: None }
+    fn interrupted_after_conversion(exit_code: i32, data_path: &Path, import_command: &str) -> Failure {
+        let message = "interrupted after the conversion; nothing was loaded".to_owned();
+        Failure { exit_code, message, kept_hint: Some(kept_hint(data_path, import_command)) }
     }
 
-    fn interrupted_import(signal: i32) -> Failure {
+    fn interrupted_import(exit_code: i32) -> Failure {
         let message = "interrupted before the import completed; the server discards a partial import".to_owned();
-        Failure { exit_code: signal, message, kept_hint: None }
+        Failure { exit_code, message, kept_hint: None }
     }
 
     fn report(self) -> i32 {
         let _ = writeln!(io::stderr(), "{} {}", format_error!("error:"), self.message);
         if let Some(kept_hint) = self.kept_hint {
-            say(format_args!("{kept_hint}"));
+            print(format_args!("{kept_hint}"));
         }
         self.exit_code
     }
 }
 
-async fn guard<T>(termination: &mut Termination, work: impl Future<Output = T>) -> Result<T, i32> {
+async fn until_terminated<T>(termination: &mut Termination, work: impl Future<Output = T>) -> Result<T, i32> {
     tokio::select! {
         result = work => Ok(result),
-        signal = termination.next() => Err(signal),
+        exit_code = termination.next_exit_code() => Err(exit_code),
     }
 }
 
 struct Interrupted<T> {
-    signal: i32,
+    exit_code: i32,
     outcome: T,
 }
 
-async fn guard_blocking<T: Send + 'static>(
+async fn cancel_on_termination<T: Send + 'static>(
     termination: &mut Termination,
     cancellation: &Cancellation,
     work: impl FnOnce() -> T + Send + 'static,
 ) -> Result<T, Interrupted<T>> {
     let mut task = tokio::task::spawn_blocking(work);
-    let signal = tokio::select! {
+    let exit_code = tokio::select! {
         outcome = &mut task => return Ok(joined(outcome)),
-        signal = termination.next() => signal,
+        exit_code = termination.next_exit_code() => exit_code,
     };
-    let mut repeat = tokio::time::interval(Duration::from_millis(100));
+    let mut repeat = tokio::time::interval(INTERRUPT_REPEAT);
     loop {
         tokio::select! {
-            outcome = &mut task => return Err(Interrupted { signal, outcome: joined(outcome) }),
+            outcome = &mut task => return Err(Interrupted { exit_code, outcome: joined(outcome) }),
             _ = repeat.tick() => cancellation.cancel(),
-            second = termination.next() => {
+            second_exit_code = termination.next_exit_code() => {
                 let _ = writeln!(io::stderr(), "Force-exiting.");
-                process::exit(second)
+                process::exit(second_exit_code)
             }
         }
     }
@@ -404,20 +395,20 @@ async fn prepare(
     cancellation: &Arc<Cancellation>,
     termination: &mut Termination,
 ) -> Result<Migration, Failure> {
-    let (source, schema_text) = (input.db_path.clone(), input.schema_text.clone());
+    let (source, schema_text) = (input.duckdb_path.clone(), input.schema_text.clone());
     let (spill_dir, memory_limit, task_cancellation) =
         (spill_dir.to_path_buf(), args.memory_limit.clone(), cancellation.clone());
     let started = Instant::now();
-    let prepared = guard_blocking(termination, cancellation, move || {
+    let prepared = cancel_on_termination(termination, cancellation, move || {
         Migration::prepare(&source, &schema_text, &spill_dir, memory_limit.as_deref(), task_cancellation)
     })
     .await
-    .map_err(|interrupted| Failure::interrupted(interrupted.signal))?;
+    .map_err(|interrupted| Failure::interrupted(interrupted.exit_code))?;
     match prepared {
         Ok(migration) => {
-            print_mapping(&migration.mapping_summary());
+            print_mapping(&migration.describe_mapping());
             print_warnings(migration.warnings());
-            say(format_args!(
+            print(format_args!(
                 "Checked in {} (source DB memory limit {}).",
                 format_duration(started.elapsed()),
                 migration.memory_limit()
@@ -425,8 +416,8 @@ async fn prepare(
             Ok(migration)
         }
         Err(PrepareError::Setup(message)) => Err(Failure::new(ExitCode::UserInputError, message)),
-        Err(PrepareError::Invalid { errors, warnings, mapping_summary }) => {
-            print_mapping(&mapping_summary);
+        Err(PrepareError::Invalid { errors, warnings, mapping_description }) => {
+            print_mapping(&mapping_description);
             print_warnings(&warnings);
             for error in &errors {
                 println_error!("{error}");
@@ -443,6 +434,7 @@ async fn convert(
     migration: Migration,
     input: &MigrationInput,
     output: &Output,
+    import_command: Option<&str>,
     progress: &Progress,
     cancellation: &Cancellation,
     termination: &mut Termination,
@@ -453,7 +445,7 @@ async fn convert(
     };
     let (original_database, progress) = (input.original_database.clone(), progress.clone());
     let data_file = data_path.clone();
-    let converted = guard_blocking(termination, cancellation, move || {
+    let converted = cancel_on_termination(termination, cancellation, move || {
         let started = Instant::now();
         let checksums = match &data_file {
             None => migration.run(io::sink(), VERSION.trim(), &original_database, &progress),
@@ -463,12 +455,12 @@ async fn convert(
         checksums.map(|checksums| (checksums, started.elapsed()))
     })
     .await;
-    match (converted, data_path) {
+    match (converted, data_path.zip(import_command)) {
         (Ok(converted), _) => converted.map_err(|message| Failure::new(ExitCode::MigrationError, message)),
-        (Err(Interrupted { signal, outcome: Ok(_) }), Some(path)) => {
-            Err(Failure::interrupted_after_conversion(signal, &path))
+        (Err(Interrupted { exit_code, outcome: Ok(_) }), Some((path, import_command))) => {
+            Err(Failure::interrupted_after_conversion(exit_code, &path, import_command))
         }
-        (Err(Interrupted { signal, .. }), _) => Err(Failure::interrupted(signal)),
+        (Err(Interrupted { exit_code, .. }), _) => Err(Failure::interrupted(exit_code)),
     }
 }
 
@@ -533,7 +525,7 @@ impl Progress {
             loop {
                 ticks.tick().await;
                 let latest = progress.latest_scan().take().unwrap_or_else(|| "working".to_owned());
-                say(format_args!("  {latest} ({} elapsed)", format_duration(progress.started.elapsed())));
+                print(format_args!("  {latest} ({} elapsed)", format_duration(progress.started.elapsed())));
             }
         }))
     }
@@ -557,75 +549,35 @@ impl Drop for Heartbeat {
     }
 }
 
-// Writes that fail are ignored: the terminal or the pipe may be gone.
-fn say(line: std::fmt::Arguments<'_>) {
-    let _ = writeln!(io::stdout(), "{line}");
-}
-
-const RECONNECT_ATTEMPTS: u32 = 12;
-const RECONNECT_DELAY: Duration = Duration::from_secs(10);
-
-const ALREADY_EXISTS: &str = "DBC6";
-const IS_BEING_IMPORTED: &str = "DBC8";
-
-enum Imported {
-    Confirmed,
-    // The database exists after an attempt of this run lost its connection: imported by it, or by another run.
-    Unconfirmed,
-}
-
 async fn import(
-    connection: &ConnectionSettings,
-    driver: TypeDBDriver,
-    database: &str,
-    schema: &str,
-    data_path: &Path,
-) -> Result<Imported, Failure> {
-    let mut driver = Ok(driver);
-    let mut retries = 0;
-    let mut has_broken_off = false;
-    loop {
-        let (result, is_attempted) = match driver {
-            Ok(driver) => (driver.databases().import_from_file(database, schema, data_path).await, true),
-            Err(err) => (Err(err), false),
+    settings: ConnectionSettings,
+    database: String,
+    schema: String,
+    data_path: PathBuf,
+) -> Result<(), Failure> {
+    let imported = match settings.connect().await {
+        Ok(driver) => driver.databases().import_from_file(&database, &schema, &data_path).await,
+        Err(err) => Err(err),
+    };
+    imported.map_err(|err| {
+        let code = match err {
+            typedb_driver::Error::Connection(_) => ExitCode::ConnectionError,
+            _ => ExitCode::GeneralError,
         };
-        match result {
-            Ok(()) => return Ok(Imported::Confirmed),
-            Err(err) if has_broken_off && err.code() == ALREADY_EXISTS => return Ok(Imported::Unconfirmed),
-            Err(err) if retries < RECONNECT_ATTEMPTS && is_transient(&err, has_broken_off) => {
-                has_broken_off |= is_attempted && matches!(err, typedb_driver::Error::Connection(_));
-                retries += 1;
-                let delay = RECONNECT_DELAY.as_secs();
-                println_warning!("{err}; retrying in {delay}s (attempt {retries} of {RECONNECT_ATTEMPTS})");
-                tokio::time::sleep(RECONNECT_DELAY).await;
-                driver = connection.connect().await;
-            }
-            Err(err) => {
-                let code = match err {
-                    typedb_driver::Error::Connection(_) => ExitCode::ConnectionError,
-                    _ => ExitCode::GeneralError,
-                };
-                let cause = match err.code().as_str() {
-                    IS_BEING_IMPORTED if has_broken_off => {
-                        format!("an import of '{database}', possibly this run's broken-off one, is still in progress")
-                    }
-                    IS_BEING_IMPORTED => format!("another import of '{database}' is in progress"),
-                    ALREADY_EXISTS => format!("'{database}' was created by another import meanwhile"),
-                    _ => err.to_string(),
-                };
-                return Err(Failure::new(code, format!("import into '{database}' failed: {cause}")));
-            }
-        }
-    }
+        let cause = match err.code().as_str() {
+            IS_BEING_IMPORTED => format!("another import of '{database}' is in progress"),
+            ALREADY_EXISTS => format!("'{database}' was created by another import meanwhile"),
+            _ => err.to_string(),
+        };
+        Failure::new(code, format!("import into '{database}' failed: {cause}"))
+    })
 }
 
-fn is_transient(err: &typedb_driver::Error, has_broken_off: bool) -> bool {
-    match err {
-        typedb_driver::Error::Connection(_) => true,
-        // The server refuses the name while it completes or discards this run's broken-off import.
-        typedb_driver::Error::Server(_) => has_broken_off && err.code() == IS_BEING_IMPORTED,
-        _ => false,
-    }
+fn kept_hint(data_path: &Path, import_command: &str) -> String {
+    format!(
+        "The prepared data file is kept: {}\nImport it without converting again with:\n  {import_command}",
+        data_path.display()
+    )
 }
 
 // Paths are made absolute so that the command can be run from anywhere.
@@ -648,10 +600,14 @@ fn console_import_command(args: &Args, database: &str, schema_path: &str, data_p
     format!("{command} --command=\"database import {database} {} {}\"", schema_path.display(), data_path.display())
 }
 
+fn print(line: std::fmt::Arguments<'_>) {
+    let _ = writeln!(io::stdout(), "{line}");
+}
+
 fn print_mapping(lines: &[String]) {
-    say(format_args!("Mapping:"));
+    print(format_args!("Mapping:"));
     for line in lines {
-        say(format_args!("  {line}"));
+        print(format_args!("  {line}"));
     }
 }
 
@@ -661,11 +617,11 @@ fn print_warnings(warnings: &[String]) {
     }
 }
 
-fn print_summary(checksums: &Checksums, elapsed: Duration) {
-    say(format_args!("Converted in {}.", format_duration(elapsed)));
-    say(format_args!("  Attributes:     {:>8}", checksums.attribute_count));
-    say(format_args!("  Entities:       {:>8}", checksums.entity_count));
-    say(format_args!("  Relations:      {:>8}", checksums.relation_count));
-    say(format_args!("  Ownerships:     {:>8}", checksums.ownership_count));
-    say(format_args!("  Role players:   {:>8}", checksums.role_count));
+fn print_conversion_counts(checksums: &Checksums, elapsed: Duration) {
+    print(format_args!("Converted in {}.", format_duration(elapsed)));
+    print(format_args!("  Attributes:     {:>8}", checksums.attribute_count));
+    print(format_args!("  Entities:       {:>8}", checksums.entity_count));
+    print(format_args!("  Relations:      {:>8}", checksums.relation_count));
+    print(format_args!("  Ownerships:     {:>8}", checksums.ownership_count));
+    print(format_args!("  Role players:   {:>8}", checksums.role_count));
 }

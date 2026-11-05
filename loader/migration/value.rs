@@ -11,21 +11,29 @@ use duckdb::arrow::{
     datatypes::{DataType, TimeUnit},
 };
 use typedb_protocol::{
-    migration::{MigrationValue, migration_value},
+    migration::{MigrationValue, migration_value::Value as ProtoValue},
     value as proto_value,
 };
 
 use crate::schema::ValueType;
 
-// Days from 0001-01-01 to 1970-01-01.
 const EPOCH_DAYS_FROM_CE: i32 = 719_163;
 pub(crate) const DECIMAL_FRACTIONAL_DIGITS: u8 = 19;
+const DECIMAL_FRACTIONAL_UNITS: u64 = 10u64.pow(DECIMAL_FRACTIONAL_DIGITS as u32);
 
 // chrono's `NaiveDate::MIN..=MAX` and `NaiveDateTime::MIN..=MAX`, from the epoch.
 pub(crate) const MIN_EPOCH_DAYS: i64 = -95_746_129 - EPOCH_DAYS_FROM_CE as i64;
 pub(crate) const MAX_EPOCH_DAYS: i64 = 95_745_399 - EPOCH_DAYS_FROM_CE as i64;
 pub(crate) const MIN_EPOCH_SECONDS: i64 = -8_334_601_228_800;
 pub(crate) const MAX_EPOCH_SECONDS: i64 = 8_210_266_876_799;
+pub(crate) const MICROS_PER_SECOND: i64 = 1_000_000;
+const MILLIS_PER_SECOND: i64 = 1_000;
+const NANOS_PER_SECOND: i64 = 1_000_000_000;
+pub(crate) const NANOS_PER_MICRO: u64 = 1_000;
+pub(crate) const SECONDS_PER_MINUTE: i64 = 60;
+pub(crate) const MINUTES_PER_HOUR: i64 = 60;
+const MONTHS_PER_YEAR: i64 = 12;
+const MICROSECOND_DIGITS: usize = 6;
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum TypeDBValue {
@@ -42,21 +50,26 @@ pub(crate) enum TypeDBValue {
 
 impl TypeDBValue {
     pub(crate) fn into_proto(self) -> MigrationValue {
-        use migration_value::Value as V;
         let value = match self {
-            TypeDBValue::Boolean(value) => V::Boolean(value),
-            TypeDBValue::Integer(value) => V::Integer(value),
-            TypeDBValue::Double(value) => V::Double(value),
-            TypeDBValue::Decimal { integer, fractional } => V::Decimal(proto_value::Decimal { integer, fractional }),
-            TypeDBValue::String(value) => V::String(value),
-            TypeDBValue::Date { days_since_ce } => V::Date(proto_value::Date { num_days_since_ce: days_since_ce }),
-            TypeDBValue::Datetime { seconds, nanos } => V::Datetime(proto_value::Datetime { seconds, nanos }),
-            TypeDBValue::DatetimeTz { seconds, nanos } => V::DatetimeTz(proto_value::DatetimeTz {
+            TypeDBValue::Boolean(value) => ProtoValue::Boolean(value),
+            TypeDBValue::Integer(value) => ProtoValue::Integer(value),
+            TypeDBValue::Double(value) => ProtoValue::Double(value),
+            TypeDBValue::Decimal { integer, fractional } => {
+                ProtoValue::Decimal(proto_value::Decimal { integer, fractional })
+            }
+            TypeDBValue::String(value) => ProtoValue::String(value),
+            TypeDBValue::Date { days_since_ce } => {
+                ProtoValue::Date(proto_value::Date { num_days_since_ce: days_since_ce })
+            }
+            TypeDBValue::Datetime { seconds, nanos } => ProtoValue::Datetime(proto_value::Datetime { seconds, nanos }),
+            TypeDBValue::DatetimeTz { seconds, nanos } => ProtoValue::DatetimeTz(proto_value::DatetimeTz {
                 datetime: Some(proto_value::Datetime { seconds, nanos }),
                 // DuckDB stores TIMESTAMPTZ as a UTC instant.
                 timezone: Some(proto_value::datetime_tz::Timezone::Named("UTC".to_owned())),
             }),
-            TypeDBValue::Duration { months, days, nanos } => V::Duration(proto_value::Duration { months, days, nanos }),
+            TypeDBValue::Duration { months, days, nanos } => {
+                ProtoValue::Duration(proto_value::Duration { months, days, nanos })
+            }
         };
         MigrationValue { value: Some(value) }
     }
@@ -71,9 +84,12 @@ impl fmt::Display for TypeDBValue {
             TypeDBValue::Double(value) => write!(f, "{value:?}"),
             // Stored as a floor integer and a non-negative fraction: -0.5 is (-1, 0.5).
             TypeDBValue::Decimal { integer, fractional } if *integer < 0 && *fractional > 0 => {
-                write!(f, "-{}.{:019}", -(integer + 1), 10u64.pow(DECIMAL_FRACTIONAL_DIGITS.into()) - fractional)
+                let (integer, fractional) = (-(integer + 1), DECIMAL_FRACTIONAL_UNITS - fractional);
+                write!(f, "-{integer}.{fractional:0width$}", width = DECIMAL_FRACTIONAL_DIGITS as usize)
             }
-            TypeDBValue::Decimal { integer, fractional } => write!(f, "{integer}.{fractional:019}"),
+            TypeDBValue::Decimal { integer, fractional } => {
+                write!(f, "{integer}.{fractional:0width$}", width = DECIMAL_FRACTIONAL_DIGITS as usize)
+            }
             TypeDBValue::String(value) => f.write_str(value),
             TypeDBValue::Date { days_since_ce } => write!(f, "{days_since_ce}"),
             TypeDBValue::Datetime { seconds, nanos } | TypeDBValue::DatetimeTz { seconds, nanos } => {
@@ -84,7 +100,7 @@ impl fmt::Display for TypeDBValue {
     }
 }
 
-// A scanned column read as one TypeDB value type, downcast once rather than per row.
+// Downcast once per batch, not per row.
 pub(crate) struct ProjectedColumn<'a> {
     array: &'a dyn Array,
     values: ProjectedValues<'a>,
@@ -99,7 +115,6 @@ impl<'a> ProjectedColumn<'a> {
         (0..self.array.len()).flat_map(move |row| self.values_at(row))
     }
 
-    // A list's elements, or the column's value; NULLs are none.
     pub(crate) fn values_at(&self, row: usize) -> impl Iterator<Item = Result<TypeDBValue, String>> {
         let (column, cells) = match &self.values {
             ProjectedValues::List { elements } if self.array.is_null(row) => (&**elements, 0..0),
@@ -196,9 +211,9 @@ fn double(value: f64) -> Result<TypeDBValue, String> {
 }
 
 fn decimal(unscaled: i128, scale: u32) -> Result<TypeDBValue, String> {
-    let pow = 10i128.pow(scale);
-    let integer = unscaled.div_euclid(pow);
-    let fractional_units = unscaled.rem_euclid(pow) as u64;
+    let scale_factor = 10i128.pow(scale);
+    let integer = unscaled.div_euclid(scale_factor);
+    let fractional_units = unscaled.rem_euclid(scale_factor) as u64;
     let integer = i64::try_from(integer)
         .map_err(|_| format!("DECIMAL integer part {integer} does not fit TypeDB's decimal range"))?;
     Ok(TypeDBValue::Decimal {
@@ -220,13 +235,15 @@ fn duration(text: &str) -> Result<TypeDBValue, String> {
             };
             let [hours, minutes, seconds] = time.split(':').collect::<Vec<_>>()[..] else { return Err(invalid()) };
             let (seconds, fraction) = seconds.split_once('.').unwrap_or((seconds, ""));
-            let fraction: i128 = format!("{fraction:0<6}").parse().map_err(|_| invalid())?;
+            let fraction: i128 = format!("{fraction:0<MICROSECOND_DIGITS$}").parse().map_err(|_| invalid())?;
             let whole = |part: &str| part.parse::<i128>().map_err(|_| invalid());
-            micros = sign * (((whole(hours)? * 60 + whole(minutes)?) * 60 + whole(seconds)?) * 1_000_000 + fraction);
+            let minutes = whole(hours)? * MINUTES_PER_HOUR as i128 + whole(minutes)?;
+            let seconds = minutes * SECONDS_PER_MINUTE as i128 + whole(seconds)?;
+            micros = sign * (seconds * MICROS_PER_SECOND as i128 + fraction);
         } else {
             let count: i64 = token.parse().map_err(|_| invalid())?;
             match tokens.next().map(|unit| unit.trim_end_matches('s')) {
-                Some("year") => months += 12 * count,
+                Some("year") => months += MONTHS_PER_YEAR * count,
                 Some("month") => months += count,
                 Some("day") => days += count,
                 _ => return Err(invalid()),
@@ -238,7 +255,7 @@ fn duration(text: &str) -> Result<TypeDBValue, String> {
     }
     let nanos = u64::try_from(micros)
         .ok()
-        .and_then(|micros| micros.checked_mul(1000))
+        .and_then(|micros| micros.checked_mul(NANOS_PER_MICRO))
         .ok_or_else(|| format!("INTERVAL '{text}' has a time part beyond TypeDB's duration range"))?;
     Ok(TypeDBValue::Duration { months: months as u32, days: days as u32, nanos })
 }
@@ -261,15 +278,15 @@ fn timestamp_parts(unit: TimeUnit, raw: i64) -> Result<(i64, u32), String> {
     }
     let units_per_second: i64 = match unit {
         TimeUnit::Second => 1,
-        TimeUnit::Millisecond => 1_000,
-        TimeUnit::Microsecond => 1_000_000,
-        TimeUnit::Nanosecond => 1_000_000_000,
+        TimeUnit::Millisecond => MILLIS_PER_SECOND,
+        TimeUnit::Microsecond => MICROS_PER_SECOND,
+        TimeUnit::Nanosecond => NANOS_PER_SECOND,
     };
     let seconds = raw.div_euclid(units_per_second);
     if !(MIN_EPOCH_SECONDS..=MAX_EPOCH_SECONDS).contains(&seconds) {
         return Err(format!("timestamp {seconds} seconds from 1970-01-01 is outside TypeDB's datetime range"));
     }
-    let nanos = raw.rem_euclid(units_per_second) * (1_000_000_000 / units_per_second);
+    let nanos = raw.rem_euclid(units_per_second) * (NANOS_PER_SECOND / units_per_second);
     Ok((seconds, nanos as u32))
 }
 

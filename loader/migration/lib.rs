@@ -18,15 +18,28 @@ use std::{
     io::Write,
     path::{Path, PathBuf},
     sync::{
-        Arc, Mutex,
+        Arc, OnceLock,
         atomic::{AtomicBool, Ordering},
     },
 };
 
-use duckdb::{AccessMode, Config, Connection, InterruptHandle};
+use duckdb::{AccessMode, Config, Connection};
 pub use typedb_protocol::migration::item::Checksums;
 
 use crate::mapping::MappingPlan;
+
+const KB: u64 = 1024;
+pub(crate) const MB: u64 = 1024 * KB;
+const GB: u64 = 1024 * MB;
+const TB: u64 = 1024 * GB;
+const BYTES_PER_GB: f64 = 1e9;
+
+const DUCKDB_DEFAULT_MEMORY_PERCENT: u64 = 80;
+// Half of the machine, leaving room for the conversion's buffers and for a server running alongside.
+const DEFAULT_MEMORY_PERCENT: u64 = 50;
+const MEMORY_FLOOR: u64 = 512 * MB;
+// A hash aggregate or join fails instead of spilling below a few tens of MB per thread.
+const MEMORY_PER_THREAD: u64 = 64 * MB;
 
 pub struct Migration {
     connection: Connection,
@@ -59,8 +72,8 @@ impl Migration {
         &self.warnings
     }
 
-    pub fn mapping_summary(&self) -> Vec<String> {
-        self.plan.summary()
+    pub fn describe_mapping(&self) -> Vec<String> {
+        self.plan.describe()
     }
 
     // The loader stands in for the server in the header: they release in lockstep.
@@ -87,7 +100,8 @@ impl Migration {
         })?;
         let spill_dir_guard = SpillDir(spill_dir.to_path_buf());
         let connection = open_duckdb(source, spill_dir)?;
-        cancellation.interrupt_on_cancel(&connection);
+        let interrupt = connection.interrupt_handle();
+        cancellation.set_cancel_action(move || interrupt.interrupt());
         let memory_limit = set_memory_limit(&connection, memory_limit)?;
         let threads = fit_threads(&connection, &memory_limit)?;
         let catalog = catalog::Catalog::read(&connection).map_err(PrepareError::Setup)?;
@@ -99,7 +113,7 @@ impl Migration {
         }
         let Findings { errors, warnings } = findings;
         if !errors.is_empty() {
-            return Err(PrepareError::Invalid { errors, warnings, mapping_summary: plan.summary() });
+            return Err(PrepareError::Invalid { errors, warnings, mapping_description: plan.describe() });
         }
         Ok(Migration { connection, plan, warnings, memory_limit, threads, cancellation, _spill_dir: spill_dir_guard })
     }
@@ -108,7 +122,7 @@ impl Migration {
 #[derive(Debug)]
 pub enum PrepareError {
     Setup(String),
-    Invalid { errors: Vec<String>, warnings: Vec<String>, mapping_summary: Vec<String> },
+    Invalid { errors: Vec<String>, warnings: Vec<String>, mapping_description: Vec<String> },
     Cancelled,
 }
 
@@ -126,21 +140,22 @@ pub struct ScanProgress<'a> {
 impl fmt::Display for ScanProgress<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let total = self.total_rows.map(|total| format!(" of {total}")).unwrap_or_default();
-        write!(f, "{}: {}{total} rows, {:.1} GB encoded", self.scan, self.rows, self.encoded_bytes as f64 / 1e9)
+        let encoded = self.encoded_bytes as f64 / BYTES_PER_GB;
+        write!(f, "{}: {}{total} rows, {encoded:.1} GB encoded", self.scan, self.rows)
     }
 }
 
 #[derive(Default)]
 pub struct Cancellation {
     is_cancelled: AtomicBool,
-    interrupt: Mutex<Option<Arc<InterruptHandle>>>,
+    cancel_action: OnceLock<Box<dyn Fn() + Send + Sync>>,
 }
 
 impl Cancellation {
     pub fn cancel(&self) {
         self.is_cancelled.store(true, Ordering::SeqCst);
-        if let Some(interrupt) = self.interrupt_handle().as_ref() {
-            interrupt.interrupt();
+        if let Some(action) = self.cancel_action.get() {
+            action();
         }
     }
 
@@ -148,17 +163,11 @@ impl Cancellation {
         self.is_cancelled.load(Ordering::SeqCst)
     }
 
-    // The handle is in place before the flag is read, so that a concurrent `cancel` sees one or the other.
-    fn interrupt_on_cancel(&self, connection: &Connection) {
-        let interrupt = connection.interrupt_handle();
-        *self.interrupt_handle() = Some(interrupt.clone());
+    fn set_cancel_action(&self, action: impl Fn() + Send + Sync + 'static) {
+        assert!(self.cancel_action.set(Box::new(action)).is_ok(), "a cancellation serves one migration");
         if self.is_cancelled() {
-            interrupt.interrupt();
+            self.cancel_action.get().expect("just set")();
         }
-    }
-
-    fn interrupt_handle(&self) -> std::sync::MutexGuard<'_, Option<Arc<InterruptHandle>>> {
-        self.interrupt.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 }
 
@@ -201,7 +210,7 @@ fn create_private_dir(path: &Path) -> std::io::Result<()> {
 fn open_duckdb(path: &Path, spill_dir: &Path) -> Result<Connection, PrepareError> {
     Config::default()
         .access_mode(AccessMode::ReadOnly)
-        // An extension loaded mid-run would change what the generated columns read after the checks.
+        // Nothing is fetched from the network, and a file reads the same on every machine.
         .and_then(|config| config.with("autoinstall_known_extensions", "false"))
         .and_then(|config| config.with("autoload_known_extensions", "false"))
         .and_then(|config| config.with("temp_directory", spill_dir.to_string_lossy()))
@@ -217,7 +226,6 @@ fn open_duckdb(path: &Path, spill_dir: &Path) -> Result<Connection, PrepareError
         })
 }
 
-// Five eighths of DuckDB's default 80%: half the machine, leaving room for the conversion and for a server.
 fn set_memory_limit(connection: &Connection, requested: Option<&str>) -> Result<String, PrepareError> {
     let limit = match requested {
         Some(limit) => limit.to_owned(),
@@ -225,7 +233,8 @@ fn set_memory_limit(connection: &Connection, requested: Option<&str>) -> Result<
             let default = current_setting(connection, "memory_limit")?;
             // DuckDB reports an unlimited size when it cannot tell the machine's memory; that default is kept.
             let Some(bytes) = size_in_bytes(&default) else { return Ok(default) };
-            format!("{}MiB", (bytes / 8 * 5) >> 20)
+            let half_of_the_machine = bytes / DUCKDB_DEFAULT_MEMORY_PERCENT * DEFAULT_MEMORY_PERCENT;
+            format!("{}MiB", half_of_the_machine.max(MEMORY_FLOOR) / MB)
         }
     };
     connection
@@ -235,13 +244,12 @@ fn set_memory_limit(connection: &Connection, requested: Option<&str>) -> Result<
     if size_in_bytes(&limit).is_some_and(|bytes| bytes < MEMORY_FLOOR) {
         return Err(PrepareError::Setup(format!(
             "the memory limit {limit} is too small: the conversion needs at least {} MiB",
-            MEMORY_FLOOR >> 20
+            MEMORY_FLOOR / MB
         )));
     }
     Ok(limit)
 }
 
-// A hash aggregate or join fails below a few tens of MB per thread, so a small limit runs fewer threads.
 fn fit_threads(connection: &Connection, memory_limit: &str) -> Result<usize, PrepareError> {
     let threads: usize = current_setting(connection, "threads")?.parse().unwrap_or(1);
     let Some(bytes) = size_in_bytes(memory_limit) else { return Ok(threads) };
@@ -260,18 +268,15 @@ fn current_setting(connection: &Connection, name: &str) -> Result<String, Prepar
         .map_err(|err| PrepareError::Setup(format!("failed to read DuckDB's {name}: {err}")))
 }
 
-const MEMORY_PER_THREAD: u64 = 64 << 20;
-const MEMORY_FLOOR: u64 = 256 << 20;
-
 // DuckDB prints sizes as `19.3 GiB` or `512.0 MiB`.
 fn size_in_bytes(size: &str) -> Option<u64> {
     let (number, unit) = size.trim().split_once(' ')?;
     let unit: u64 = match unit {
         "bytes" => 1,
-        "KiB" => 1 << 10,
-        "MiB" => 1 << 20,
-        "GiB" => 1 << 30,
-        "TiB" => 1 << 40,
+        "KiB" => KB,
+        "MiB" => MB,
+        "GiB" => GB,
+        "TiB" => TB,
         _ => return None,
     };
     let number: f64 = number.parse().ok()?;
@@ -284,8 +289,8 @@ mod test {
 
     #[test]
     fn duckdb_sizes_are_read_in_bytes() {
-        assert_eq!(size_in_bytes("19.3 GiB"), Some((19.3 * (1u64 << 30) as f64) as u64));
-        assert_eq!(size_in_bytes("512.0 MiB"), Some(512 << 20));
+        assert_eq!(size_in_bytes("19.3 GiB"), Some((19.3 * GB as f64) as u64));
+        assert_eq!(size_in_bytes("512.0 MiB"), Some(512 * MB));
         assert_eq!(size_in_bytes("16383.9 PiB"), None);
         assert_eq!(size_in_bytes("lots"), None);
         assert_eq!(size_in_bytes("3 parsecs"), None);
@@ -297,9 +302,9 @@ mod test {
         let default: String =
             connection.query_row("SELECT current_setting('memory_limit')", [], |row| row.get(0)).unwrap();
         let halved = size_in_bytes(&set_memory_limit(&connection, None).unwrap()).unwrap();
-        let expected = size_in_bytes(&default).unwrap() / 8 * 5;
-        assert!(halved.abs_diff(expected) < 64 << 20, "{halved} vs {expected}");
-        assert_eq!(set_memory_limit(&connection, Some("256MiB")).unwrap(), "256.0 MiB");
+        let expected = size_in_bytes(&default).unwrap() / DUCKDB_DEFAULT_MEMORY_PERCENT * DEFAULT_MEMORY_PERCENT;
+        assert!(halved.abs_diff(expected) < 64 * MB, "{halved} vs {expected}");
+        assert_eq!(set_memory_limit(&connection, Some("512MiB")).unwrap(), "512.0 MiB");
         assert!(matches!(set_memory_limit(&connection, Some("lots")), Err(PrepareError::Setup(_))));
     }
 
@@ -324,7 +329,7 @@ mod test {
         assert_eq!(fit_threads(&connection, "256.0 MiB").unwrap(), 4);
         let threads: i64 = connection.query_row("SELECT current_setting('threads')", [], |row| row.get(0)).unwrap();
         assert_eq!(threads, 4);
-        assert!(matches!(set_memory_limit(&connection, Some("128MiB")), Err(PrepareError::Setup(message))
-            if message.contains("at least 256 MiB")));
+        assert!(matches!(set_memory_limit(&connection, Some("256MiB")), Err(PrepareError::Setup(message))
+            if message.contains("at least 512 MiB")));
     }
 }

@@ -90,6 +90,8 @@ jobs:
           bazelrc: |
             build --remote_cache https://storage.googleapis.com/typedb-engineers-bazel-remote-cache-europe-west1
             build --remote_upload_local_results=${{ secrets.BAZEL_CACHE_CREDENTIAL_JSON != '' }}
+            # The runfiles tree copies its files on Windows, so the distributions must be downloaded before it is built.
+            build --remote_download_all
       - run: .github\windows\prepare.bat
       - run: git apply .github\windows\package_binary_as_exe.patch
       - run: |

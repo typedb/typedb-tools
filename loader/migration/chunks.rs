@@ -5,77 +5,75 @@
  */
 
 use std::{
-    collections::BTreeMap,
-    panic::{self, AssertUnwindSafe},
     sync::{Arc, Mutex, mpsc},
     thread,
 };
 
 use duckdb::{Statement, arrow::record_batch::RecordBatch};
 
-use crate::Cancellation;
+use crate::{Cancellation, MB};
 
 // A chunk is cut by rows or by bytes, whichever comes first, so that wide rows do not inflate what is in flight.
 const CHUNK_ROWS: usize = 32_768;
-const CHUNK_BYTES: usize = 32 << 20;
-const CHUNKS_IN_FLIGHT_PER_WORKER: usize = 4;
+const CHUNK_BYTES: usize = 32 * MB as usize;
+const CHUNKS_IN_FLIGHT_PER_WORKER: usize = 2;
+// About a GiB of chunks, whatever the core count.
+const MAX_CHUNKS_IN_FLIGHT: usize = 32;
+const CANCELLED: &str = "cancelled";
 
-// Streamed, as a whole result would exceed the memory limit: this thread reads, `encode` runs on every worker, and
-// `write` receives the chunks in the order they were read. Each chunk read takes a permit, returned once written,
-// which bounds the chunks waiting for an earlier one.
+// Each chunk's result channel is queued as the chunk is read, so `write` takes the results in read order.
 pub(crate) fn encode_in_order<Encoded: Send>(
     chunks: ChunkReader<'_>,
     encode: &(impl Fn(&[RecordBatch]) -> Result<Encoded, String> + Sync),
     workers: usize,
     mut write: impl FnMut(Encoded) -> Result<(), String> + Send,
 ) -> Result<(), String> {
-    let (work_sender, work_receiver) = mpsc::sync_channel::<(u64, Vec<RecordBatch>)>(workers);
-    let (encoded_sender, encoded_receiver) = mpsc::sync_channel::<(u64, Result<Encoded, String>)>(workers);
-    let (permit_sender, permits) = mpsc::sync_channel::<()>(CHUNKS_IN_FLIGHT_PER_WORKER * workers);
-    for _ in 0..CHUNKS_IN_FLIGHT_PER_WORKER * workers {
-        permit_sender.send(()).expect("the permit channel has room for every permit");
-    }
+    let (work_sender, work) =
+        mpsc::sync_channel::<(Vec<RecordBatch>, mpsc::SyncSender<Result<Encoded, String>>)>(workers);
+    // Only the workers hold the work queue, so that once they have all stopped, sending to it fails.
+    let work = Arc::new(Mutex::new(work));
+    let (results_sender, results) =
+        mpsc::sync_channel::<mpsc::Receiver<Result<Encoded, String>>>(chunks_in_flight(workers));
     thread::scope(|scope| {
-        // Only the workers hold the receiver, so sending fails rather than blocks once they have all left.
-        let work_receiver = Arc::new(Mutex::new(work_receiver));
         for _ in 0..workers {
-            let (work_receiver, encoded_sender) = (work_receiver.clone(), encoded_sender.clone());
-            scope.spawn(move || encode_received(&work_receiver, &encoded_sender, encode));
-        }
-        drop((work_receiver, encoded_sender));
-        let writer = scope.spawn(move || -> Result<(), String> {
-            let (mut pending, mut next_sequence) = (BTreeMap::new(), 0);
-            for (sequence, chunk) in encoded_receiver {
-                pending.insert(sequence, chunk?);
-                while let Some(chunk) = pending.remove(&next_sequence) {
-                    write(chunk)?;
-                    next_sequence += 1;
-                    let _ = permit_sender.send(());
+            let work = work.clone();
+            scope.spawn(move || {
+                loop {
+                    let received = work.lock().expect("no worker panics while it takes work").recv();
+                    let Ok((batches, result_sender)) = received else { return };
+                    let _ = result_sender.send(encode(&batches));
                 }
+            });
+        }
+        drop(work);
+        let writer = scope.spawn(move || -> Result<(), String> {
+            for result_receiver in results {
+                write(result_receiver.recv().map_err(|_| "an encoder panicked".to_owned())??)?;
             }
             Ok(())
         });
         let mut read_error = None;
-        for (sequence, chunk) in (0..).zip(chunks) {
-            let chunk = match chunk {
-                Ok(chunk) => chunk,
+        for chunk in chunks {
+            let batches = match chunk {
+                Ok(batches) => batches,
                 Err(err) => {
                     read_error = Some(err);
                     break;
                 }
             };
-            let is_sent = permits.recv().is_ok() && work_sender.send((sequence, chunk)).is_ok();
-            if !is_sent {
+            let (result_sender, result_receiver) = mpsc::sync_channel(1);
+            if results_sender.send(result_receiver).is_err() || work_sender.send((batches, result_sender)).is_err() {
                 break;
             }
         }
-        drop(work_sender);
+        drop((work_sender, results_sender));
         let written = writer.join().unwrap_or_else(|_| Err("the output writer panicked".to_owned()));
-        match read_error {
-            Some(err) => Err(err),
-            None => written,
-        }
+        read_error.map_or(written, Err)
     })
+}
+
+fn chunks_in_flight(workers: usize) -> usize {
+    (CHUNKS_IN_FLIGHT_PER_WORKER * workers).min(MAX_CHUNKS_IN_FLIGHT)
 }
 
 pub(crate) struct ChunkReader<'connection> {
@@ -89,7 +87,7 @@ impl<'connection> ChunkReader<'connection> {
         cancellation: &'connection Cancellation,
     ) -> Result<Self, String> {
         if cancellation.is_cancelled() {
-            return Err("cancelled".to_owned());
+            return Err(CANCELLED.to_owned());
         }
         // Stepping the statement, rather than iterating its stream, reports a fetch error on every duckdb-rs version.
         let _ = statement.stream_arrow([]).map_err(|err| err.to_string())?;
@@ -105,7 +103,7 @@ impl Iterator for ChunkReader<'_> {
         let (mut rows, mut bytes) = (0, 0);
         while rows < CHUNK_ROWS && bytes < CHUNK_BYTES {
             if self.cancellation.is_cancelled() {
-                return Some(Err("cancelled".to_owned()));
+                return Some(Err(CANCELLED.to_owned()));
             }
             match self.statement.step() {
                 Ok(Some(array)) => {
@@ -122,19 +120,25 @@ impl Iterator for ChunkReader<'_> {
     }
 }
 
-// A chunk lost to a panic would hold its permit forever; it fails the scan instead.
-fn encode_received<Encoded>(
-    work: &Mutex<mpsc::Receiver<(u64, Vec<RecordBatch>)>>,
-    encoded: &mpsc::SyncSender<(u64, Result<Encoded, String>)>,
-    encode: &(impl Fn(&[RecordBatch]) -> Result<Encoded, String> + Sync),
-) {
-    loop {
-        let received = work.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).recv();
-        let Ok((sequence, batches)) = received else { return };
-        let chunk = panic::catch_unwind(AssertUnwindSafe(|| encode(&batches)))
-            .unwrap_or_else(|_| Err("the encoder panicked".to_owned()));
-        if encoded.send((sequence, chunk)).is_err() {
-            return;
+#[cfg(test)]
+mod test {
+    use std::panic;
+
+    use duckdb::Connection;
+
+    use super::*;
+
+    #[test]
+    fn an_encoder_panic_propagates_rather_than_hangs() {
+        let connection = Connection::open_in_memory().unwrap();
+        let cancellation = Cancellation::default();
+        for workers in [1, 2].into_iter().cycle().take(20) {
+            let statement = connection.prepare("SELECT range FROM range(200000)").unwrap();
+            let chunks = ChunkReader::start(statement, &cancellation).unwrap();
+            let encode = |_: &[RecordBatch]| -> Result<(), String> { panic!("encoder bug") };
+            let outcome =
+                panic::catch_unwind(panic::AssertUnwindSafe(|| encode_in_order(chunks, &encode, workers, |()| Ok(()))));
+            assert!(outcome.is_err(), "the panic did not propagate");
         }
     }
 }
