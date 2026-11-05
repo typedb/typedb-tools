@@ -30,7 +30,7 @@ pub(crate) fn install_shutdown_handler() -> Arc<AtomicBool> {
         shutdown_signal.store(true, Ordering::SeqCst);
         eprintln!("\nInterrupt received; finishing in-flight batches. Interrupt again to force exit.");
         let exit_code = termination.next_exit_code().await;
-        eprintln!("Force-exiting.");
+        eprintln!("Forcing exiting...");
         std::process::exit(exit_code);
     });
     shutdown
