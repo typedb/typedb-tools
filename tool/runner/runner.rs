@@ -39,7 +39,10 @@ impl TypeDBBinaryRunner {
         command.stdout(std::process::Stdio::inherit()).stderr(std::process::Stdio::inherit()).spawn()
     }
 
-    // Windows runs the distribution's batch file through cmd.exe.
+    pub fn distribution_path(&self) -> &PathBuf {
+        &self.distribution
+    }
+
     fn typedb_command(&self) -> Command {
         if cfg!(windows) {
             let mut command = Command::new("cmd.exe");
@@ -48,9 +51,5 @@ impl TypeDBBinaryRunner {
         } else {
             Command::new(self.distribution.join("typedb"))
         }
-    }
-
-    pub fn distribution_path(&self) -> &PathBuf {
-        &self.distribution
     }
 }

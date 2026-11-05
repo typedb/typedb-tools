@@ -45,8 +45,8 @@ ATTACH 'for-loader.duckdb' AS dst (STORAGE_VERSION 'v2.0.0');
 COPY FROM DATABASE src TO dst;
 ```
 
-The loader loads no DuckDB extension, so generated columns are computed without one: time zone conversions happen
-in UTC, and a column that needs an extension fails to read. Materialise such columns when staging.
+The loader loads no DuckDB extension. Generated columns are refused, as DuckDB computes them anew on every read.
+Materialise them when staging.
 
 ## Mapping
 
@@ -171,11 +171,12 @@ referencing them.
 ## Memory and disk
 
 DuckDB gets half of the memory it detects (the machine's, or the container's limit) unless `--memory-limit` sets
-another limit (`8GB`, `512MiB`, at least 256 MiB). It runs a thread per 64 MB of the limit, up to one per core, and
+another limit (`8GB`, `512MiB`, at least 512 MiB). It runs a thread per 64 MB of the limit, up to one per core, and
 spills what does not fit. The conversion needs one to two GB more for its own buffers.
 
 The output directory needs room for the data file and for DuckDB's spill. `--dry-run` spills into the system's
-temporary directory (`TMPDIR`). With `--overwrite` the old file stays until the new one replaces it.
+temporary directory (`TMPDIR`), as `.typedb-loader.<process id>.tmp`, which a killed dry run leaves behind. With
+`--overwrite` the old file stays until the new one replaces it.
 
 ## The data file and the import
 
@@ -187,14 +188,11 @@ The schema is not copied. Import the file with the schema file it was prepared w
 The file is `<database>.data.typedb` next to the DuckDB file, or in `--output-dir`. It is written under a
 temporary name and renamed when complete. An existing file is refused unless `--overwrite` is given. That, an
 unreachable server and an existing database are all found before the checks start. One loader at a time prepares a
-database in a directory: `.<database>.lock` makes a second one fail at once, and the next run removes what a run
-that died left behind.
+database in a directory: `.<database>.lock`, which stays, makes a second one fail at once, and the next run removes
+what a run that died left behind.
 
-The import starts once the file is complete. If the connection was lost during the conversion, the loader reconnects
-(12 attempts, 10 s apart). If an import attempt loses its connection, the server may still complete it, so a
-database that is being imported is waited for, and an existing database ends the run with exit code 3 and the file
-kept, as the loader cannot confirm that the import was its own. A successful import removes the file. A failed import
-keeps it, and the loader prints the `typedb console` command that imports it.
+The import starts once the file is complete, over a fresh connection. A successful import removes the file. A failed
+import keeps it, and the loader prints the `typedb console` command that imports it.
 
 Ctrl+C or SIGTERM stops the run. An interrupted conversion removes what it wrote. An interrupted import keeps the
 data file, and the server discards the partial import. A second interrupt exits at once, and the next run removes

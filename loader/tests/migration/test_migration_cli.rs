@@ -20,6 +20,9 @@ const SCHEMA: &str = r#"define
   entity person, owns name @card(1..1);
 "#;
 
+const LOCK_FILE: &str = ".fixture.lock";
+const LEFT_BEHIND: &[&str] = &[LOCK_FILE, "fixture.data.typedb"];
+
 // Cargo builds the binary alongside the test; Bazel passes it in as a data dependency.
 fn loader_binary() -> PathBuf {
     std::env::var_os("TYPEDB_LOADER_BIN")
@@ -77,7 +80,7 @@ fn files_only_writes_the_data_file() -> Result<(), Box<dyn Error>> {
     assert_eq!(
         file_names(&dir.join("out"))?,
         LEFT_BEHIND,
-        "only the data file is left: the schema is referenced, not copied"
+        "only the data file and the lock are left: the schema is referenced, not copied"
     );
     let data = zstd::stream::decode_all(fs::File::open(dir.join("out/fixture.data.typedb"))?)?;
     let mut buf: &[u8] = &data;
@@ -195,12 +198,33 @@ fn a_staged_data_file_is_refused_before_connecting() -> Result<(), Box<dyn Error
 }
 
 #[test]
+fn the_source_is_never_the_output() -> Result<(), Box<dyn Error>> {
+    let dir = setup("source-as-output")?;
+    for name in ["fixture.data.typedb", ".fixture.data.typedb.partial"] {
+        let source = dir.join(name);
+        fs::copy(dir.join("fixture.duckdb"), &source)?;
+        let output = Command::new(loader_binary())
+            .arg("--duckdb")
+            .arg(&source)
+            .arg("--schema-file")
+            .arg(dir.join("schema.tql"))
+            .args(["--database", "fixture", "--files-only", "--overwrite"])
+            .output()?;
+        assert_eq!(output.status.code(), Some(2), "user-input error exit code expected");
+        assert!(String::from_utf8_lossy(&output.stderr).contains("would overwrite the DuckDB file being converted"));
+        assert_eq!(fs::read(&source)?, fs::read(dir.join("fixture.duckdb"))?, "the source is untouched");
+    }
+    let _ = fs::remove_dir_all(&dir);
+    Ok(())
+}
+
+#[test]
 fn the_memory_limit_is_reported_and_validated() -> Result<(), Box<dyn Error>> {
     let dir = setup("memory")?;
-    let output = run_loader(&dir, &["--dry-run", "--memory-limit", "256MiB"]);
+    let output = run_loader(&dir, &["--dry-run", "--memory-limit", "512MiB"]);
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(output.status.success(), "{stdout}\n{}", String::from_utf8_lossy(&output.stderr));
-    assert!(stdout.contains("(source DB memory limit 256.0 MiB)"), "{stdout}");
+    assert!(stdout.contains("(source DB memory limit 512.0 MiB)"), "{stdout}");
 
     let output = run_loader(&dir, &["--dry-run"]);
     assert!(String::from_utf8_lossy(&output.stdout).contains("(source DB memory limit "), "a default limit is set");
@@ -222,7 +246,7 @@ fn checks_spill_into_an_output_directory_that_does_not_exist_yet() -> Result<(),
     )?;
     fs::write(dir.join("schema.tql"), "define\n  entity person;\n")?;
     let out = dir.join("out/nested").to_string_lossy().into_owned();
-    let output = run_loader(&dir, &["--files-only", "--output-dir", &out, "--memory-limit", "256MiB"]);
+    let output = run_loader(&dir, &["--files-only", "--output-dir", &out, "--memory-limit", "512MiB"]);
     assert!(
         output.status.success(),
         "loader failed:\n{}\n{}",
@@ -282,7 +306,7 @@ mod signals_and_concurrency {
         assert!(Command::new("kill").args(["-TERM", &loader.id().to_string()]).status()?.success());
         assert_eq!(loader.wait()?.code(), Some(143));
         assert!(!partial.exists(), "the partial file was left behind");
-        assert_eq!(file_names(&out)?, Vec::<String>::new(), "nothing is left behind");
+        assert_eq!(file_names(&out)?, [LOCK_FILE], "nothing but the lock file is left behind");
         let _ = fs::remove_dir_all(&dir);
         Ok(())
     }
@@ -315,7 +339,7 @@ mod signals_and_concurrency {
         assert_eq!(output.status.code(), Some(143), "{stderr}");
         assert!(stderr.contains("interrupted; nothing was loaded"), "{stderr}");
         assert!(!rest.contains("Checked in"), "the signal came after the checks: {rest}");
-        assert_eq!(file_names(&out)?, Vec::<String>::new(), "nothing is left behind");
+        assert_eq!(file_names(&out)?, [LOCK_FILE], "nothing but the lock file is left behind");
         let _ = fs::remove_dir_all(&dir);
         Ok(())
     }
@@ -342,10 +366,6 @@ mod signals_and_concurrency {
         Ok(())
     }
 }
-
-// Elsewhere than on Unix, the lock file stays.
-const LEFT_BEHIND: &[&str] =
-    if cfg!(unix) { &["fixture.data.typedb"] } else { &[".fixture.lock", "fixture.data.typedb"] };
 
 fn file_names(dir: &Path) -> io::Result<Vec<String>> {
     let mut names: Vec<String> = fs::read_dir(dir)?

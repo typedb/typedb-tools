@@ -317,20 +317,68 @@ fn converts_and_produces_a_well_formed_import_file() -> Result<(), Box<dyn Error
 }
 
 #[test]
-fn fk_column_on_entity_table_is_rejected() -> Result<(), Box<dyn Error>> {
+fn foreign_key_column_on_entity_table_is_rejected() -> Result<(), Box<dyn Error>> {
     let dir = scratch(
         "entity-fk",
-        "define\n  entity person;\n  entity pet;\n  entity employee sub person;\n",
+        "define\n  entity person;\n  entity pet;\n  entity toy;\n  entity employee sub person;\n",
         "CREATE TABLE person (_iid UBIGINT PRIMARY KEY);
          CREATE TABLE pet (_iid UBIGINT PRIMARY KEY, owner_id UBIGINT REFERENCES person(_iid));
-         CREATE TABLE employee (_iid UBIGINT PRIMARY KEY REFERENCES person(_iid));",
+         CREATE TABLE employee (_iid UBIGINT PRIMARY KEY REFERENCES person(_iid));
+         CREATE TABLE toy (_iid UBIGINT PRIMARY KEY, holder_id UBIGINT, FOREIGN KEY (Holder_Id) REFERENCES person(_iid));",
     )?;
     let errors = validation_errors(&dir);
+    assert_error(&errors, &["table 'toy': column 'holder_id' references table 'person'"]);
     assert_error(
         &errors,
         &["table 'pet': column 'owner_id' references table 'person', which on an entity table", "relations are tables"],
     );
     assert_error(&errors, &["table 'employee': _iid is a FOREIGN KEY"]);
+    Ok(())
+}
+
+#[test]
+fn restated_roles_are_one_role_and_abstract_roles_are_refused() -> Result<(), Box<dyn Error>> {
+    let dir = scratch(
+        "restated-relates",
+        "define\n  entity person, plays friendship:friend;\n  relation friendship, relates friend;\n  \
+         friendship relates friend @card(0..2);\n",
+        "CREATE TABLE person (_iid UBIGINT PRIMARY KEY);
+         CREATE TABLE friendship (_iid UBIGINT PRIMARY KEY, a UBIGINT REFERENCES person(_iid),
+             b UBIGINT REFERENCES person(_iid));
+         INSERT INTO person VALUES (1), (2);
+         INSERT INTO friendship VALUES (1, 1, 2);",
+    )?;
+    let items = convert(&dir)?;
+    let is_one_role_of_two_players = |item: &item::Item| match item {
+        item::Item::Relation(relation) => relation.roles.len() == 1 && relation.roles[0].players.len() == 2,
+        _ => false,
+    };
+    assert!(items.iter().any(is_one_role_of_two_players), "{items:#?}");
+
+    let dir = scratch(
+        "abstract-role",
+        "define\n  entity person, plays membership:member;\n  relation membership, relates member @abstract;\n",
+        "CREATE TABLE person (_iid UBIGINT PRIMARY KEY);
+         CREATE TABLE membership (_iid UBIGINT PRIMARY KEY, m UBIGINT REFERENCES person(_iid));
+         COMMENT ON TABLE membership IS '@typedb relation membership (member = m)';",
+    )?;
+    assert_error(&validation_errors(&dir), &["bound to role 'membership:member', which is abstract"]);
+    Ok(())
+}
+
+#[test]
+fn decimals_of_any_scale_feed_one_double_attribute() -> Result<(), Box<dyn Error>> {
+    let dir = scratch(
+        "decimals-to-double",
+        "define\n  attribute v, value double;\n  entity t, owns v @card(0..);\n",
+        "CREATE TABLE t (_iid UBIGINT PRIMARY KEY, v DECIMAL(18,18), w DECIMAL(16,1), x DECIMAL(16,0));
+         COMMENT ON COLUMN t.w IS '@typedb owns v';
+         COMMENT ON COLUMN t.x IS '@typedb owns v';
+         INSERT INTO t VALUES (1, 0.5, 0.5, 10), (2, -0.25, 10.0, 0), (3, 0, NULL, NULL);",
+    )?;
+    let items = convert(&dir)?;
+    let attributes = items.iter().filter(|item| matches!(item, item::Item::Attribute(_))).count();
+    assert_eq!(attributes, 4, "0.5, -0.25, 10 and 0");
     Ok(())
 }
 
@@ -483,22 +531,76 @@ fn string_values_are_distinct_byte_wise() -> Result<(), Box<dyn Error>> {
 }
 
 #[test]
+fn generated_columns_are_refused_unless_skipped() -> Result<(), Box<dyn Error>> {
+    let schema = "define\n  attribute token, value string;\n  entity p, owns token;\n";
+    let dir = scratch(
+        "generated",
+        schema,
+        "CREATE TABLE p (_iid UBIGINT AS (seq + 1), seq UBIGINT, token VARCHAR AS (uuid()::VARCHAR));
+         COMMENT ON COLUMN p.seq IS '@typedb skip'; INSERT INTO p (seq) VALUES (0), (1);",
+    )?;
+    let errors = validation_errors(&dir);
+    assert_error(&errors, &["table 'p': _iid is generated, and DuckDB computes it anew on every read"]);
+    assert_error(&errors, &["table 'p': column 'token' is generated", "materialise it when staging"]);
+    let dir = scratch(
+        "generated-skipped",
+        schema,
+        "CREATE TABLE p (_iid UBIGINT, token VARCHAR, shout VARCHAR AS (upper(token)));
+         COMMENT ON COLUMN p.shout IS '@typedb skip'; INSERT INTO p (_iid, token) VALUES (1, 'a');",
+    )?;
+    convert(&dir)?;
+    Ok(())
+}
+
+#[test]
+fn subtypes_inherit_ownerships_and_roles() -> Result<(), Box<dyn Error>> {
+    let dir = scratch(
+        "inherited",
+        "define\n  attribute name, value string;\n  attribute code, value string;\n  attribute badge sub code;\n  \
+         entity person @abstract, owns name, owns badge, plays employment:employee;\n  entity employee sub person;\n  \
+         entity company, plays employment:employer;\n  relation employment, relates employee, relates employer;\n",
+        "CREATE TABLE employee (_iid UBIGINT PRIMARY KEY, name VARCHAR, badge VARCHAR);
+         CREATE TABLE company (_iid UBIGINT PRIMARY KEY);
+         CREATE TABLE employment (_iid UBIGINT PRIMARY KEY, employee_id UBIGINT REFERENCES employee(_iid),
+                                  employer_id UBIGINT REFERENCES company(_iid));
+         INSERT INTO employee VALUES (1, 'Ann', 'A1');
+         INSERT INTO company VALUES (2);
+         INSERT INTO employment VALUES (3, 1, 2);",
+    )?;
+    let items = convert(&dir)?;
+    assert_file_guarantees(&items);
+    let relation = items
+        .iter()
+        .find_map(|item| if let item::Item::Relation(relation) = item { Some(relation) } else { None })
+        .expect("one relation emitted");
+    let mut labels: Vec<&str> = relation.roles.iter().map(|role| role.label.as_str()).collect();
+    labels.sort();
+    assert_eq!(labels, ["employment:employee", "employment:employer"]);
+    Ok(())
+}
+
+#[test]
 fn inherited_roles_are_scoped_to_their_declaring_relation() -> Result<(), Box<dyn Error>> {
+    // `posting` specialises `subject` as `author`, so the person, who plays both, plays `author` in a posting.
     let dir = scratch(
         "scoping",
-        "define\n  entity person, plays interaction:author;\n  entity post, plays posting:post;\n  \
-         relation interaction @abstract, relates subject @card(1), relates author as subject;\n  \
-         relation posting, sub interaction, relates post @card(1);\n",
+        "define\n  entity person, plays interaction:subject, plays posting:author;\n  \
+         entity observer, plays interaction:witness;\n  entity post, plays posting:post;\n  \
+         relation interaction @abstract, relates subject, relates witness;\n  \
+         relation posting, sub interaction, relates author as subject, relates post;\n",
         "CREATE TABLE person (_iid UBIGINT PRIMARY KEY);
+         CREATE TABLE observer (_iid UBIGINT PRIMARY KEY);
          CREATE TABLE post (_iid UBIGINT PRIMARY KEY);
          CREATE TABLE posting (
              _iid UBIGINT PRIMARY KEY,
              author_id UBIGINT NOT NULL REFERENCES person(_iid),
+             witness_id UBIGINT NOT NULL REFERENCES observer(_iid),
              post_id UBIGINT NOT NULL REFERENCES post(_iid)
          );
          INSERT INTO person VALUES (1);
+         INSERT INTO observer VALUES (4);
          INSERT INTO post VALUES (2);
-         INSERT INTO posting VALUES (3, 1, 2);",
+         INSERT INTO posting VALUES (3, 1, 4, 2);",
     )?;
     let items = convert(&dir)?;
     let relation = items
@@ -507,8 +609,7 @@ fn inherited_roles_are_scoped_to_their_declaring_relation() -> Result<(), Box<dy
         .expect("one relation emitted");
     let mut labels: Vec<&str> = relation.roles.iter().map(|role| role.label.as_str()).collect();
     labels.sort();
-    assert_eq!(labels, ["interaction:author", "posting:post"], "roles must carry the declaring relation's scope");
-
+    assert_eq!(labels, ["interaction:witness", "posting:author", "posting:post"], "roles carry their declaring scope");
     Ok(())
 }
 
@@ -1451,14 +1552,14 @@ fn tables_without_declared_keys_convert_as_the_keyed_ones() -> Result<(), Box<dy
     let keyed = convert(&scratch("keyed", SCHEMA, FIXTURE)?)?;
     let dir = scratch("key-free", SCHEMA, KEY_FREE_FIXTURE)?;
     assert_eq!(canonical(&convert(&dir)?), canonical(&keyed));
-    let summary = prepare(&dir).map_err(|err| format!("{err:?}"))?.mapping_summary();
+    let summary = prepare(&dir).map_err(|err| format!("{err:?}"))?.describe_mapping();
     assert!(
         summary.iter().any(|line| line.contains("table 'employment'")
             && line.ends_with("; ids checked by the loader, references checked by the loader)")),
         "{summary:#?}"
     );
     let summary =
-        prepare(&scratch("keyed-summary", SCHEMA, FIXTURE)?).map_err(|err| format!("{err:?}"))?.mapping_summary();
+        prepare(&scratch("keyed-summary", SCHEMA, FIXTURE)?).map_err(|err| format!("{err:?}"))?.describe_mapping();
     assert!(
         summary
             .iter()

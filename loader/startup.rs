@@ -5,7 +5,6 @@
  */
 
 use std::{
-    io,
     path::Path,
     sync::{
         Arc,
@@ -13,9 +12,12 @@ use std::{
     },
 };
 
-use typedb_cli_common::println_warning;
-
 use crate::{ExitCode, checkpoint::Checkpoint, cli::Args, fatal, fatal_with, output::CHECKPOINT_FILENAME};
+
+// What a shell reports for a process ended by the signal: 128 and the signal's number.
+const SIGINT_EXIT_CODE: i32 = 130;
+#[cfg(unix)]
+const SIGTERM_EXIT_CODE: i32 = 143;
 
 /// Installs the interrupt handler. The first interrupt flips the returned flag so the main loop can
 /// drain in-flight batches and write a final checkpoint; a second interrupt force-exits.
@@ -24,74 +26,54 @@ pub(crate) fn install_shutdown_handler() -> Arc<AtomicBool> {
     let mut termination = Termination::listen();
     let shutdown_signal = shutdown.clone();
     tokio::spawn(async move {
-        termination.next().await;
+        termination.next_exit_code().await;
         shutdown_signal.store(true, Ordering::SeqCst);
         eprintln!("\nInterrupt received; finishing in-flight batches. Interrupt again to force exit.");
-        let exit_code = termination.next().await;
+        let exit_code = termination.next_exit_code().await;
         eprintln!("Force-exiting.");
         std::process::exit(exit_code);
     });
     shutdown
 }
 
-// SIGINT and SIGTERM alike, as the exit code a shell reports for each. Never one when they cannot be handled.
-pub(crate) struct Termination(Option<Signals>);
-
-impl Termination {
-    pub(crate) fn listen() -> Self {
-        match Signals::register() {
-            Ok(signals) => Termination(Some(signals)),
-            Err(err) => {
-                println_warning!("interrupts will not be handled: {err}");
-                Termination(None)
-            }
-        }
-    }
-
-    pub(crate) async fn next(&mut self) -> i32 {
-        match &mut self.0 {
-            Some(signals) => signals.next().await,
-            None => std::future::pending().await,
-        }
-    }
-}
-
+// SIGINT and SIGTERM alike, as the exit code a shell reports for each. Once listening, none is missed.
 #[cfg(unix)]
-struct Signals {
+pub(crate) struct Termination {
     interrupt: tokio::signal::unix::Signal,
     terminate: tokio::signal::unix::Signal,
 }
 
 #[cfg(unix)]
-impl Signals {
-    fn register() -> io::Result<Self> {
+impl Termination {
+    pub(crate) fn listen() -> Self {
         use tokio::signal::unix::{SignalKind, signal};
-        Ok(Self { interrupt: signal(SignalKind::interrupt())?, terminate: signal(SignalKind::terminate())? })
+        Self {
+            interrupt: signal(SignalKind::interrupt()).expect("failed to install the SIGINT handler"),
+            terminate: signal(SignalKind::terminate()).expect("failed to install the SIGTERM handler"),
+        }
     }
 
-    async fn next(&mut self) -> i32 {
+    pub(crate) async fn next_exit_code(&mut self) -> i32 {
         tokio::select! {
-            Some(()) = self.interrupt.recv() => 130,
-            Some(()) = self.terminate.recv() => 143,
+            Some(()) = self.interrupt.recv() => SIGINT_EXIT_CODE,
+            Some(()) = self.terminate.recv() => SIGTERM_EXIT_CODE,
             else => std::future::pending().await,
         }
     }
 }
 
 #[cfg(not(unix))]
-struct Signals;
+pub(crate) struct Termination;
 
 #[cfg(not(unix))]
-impl Signals {
-    fn register() -> io::Result<Self> {
-        Ok(Self)
+impl Termination {
+    pub(crate) fn listen() -> Self {
+        Self
     }
 
-    async fn next(&mut self) -> i32 {
-        match tokio::signal::ctrl_c().await {
-            Ok(()) => 130,
-            Err(_) => std::future::pending().await,
-        }
+    pub(crate) async fn next_exit_code(&mut self) -> i32 {
+        tokio::signal::ctrl_c().await.expect("failed to listen for Ctrl+C");
+        SIGINT_EXIT_CODE
     }
 }
 

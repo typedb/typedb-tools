@@ -13,10 +13,13 @@ use duckdb::{
 
 use crate::sql;
 
+const DUCKDB_DEFAULT_DECIMAL_PRECISION: u8 = 18;
+const DUCKDB_DEFAULT_DECIMAL_SCALE: u8 = 3;
+
 #[derive(Debug)]
 pub(crate) struct Catalog {
     pub(crate) tables: Vec<Table>,
-    pub(crate) unread_tables_and_views: Vec<String>,
+    pub(crate) ignored_tables_and_views: Vec<String>,
 }
 
 impl Catalog {
@@ -27,9 +30,9 @@ impl Catalog {
                 .and_then(|()| read_constraints(connection, table))
                 .map_err(|err| format!("failed to read table '{}': {err}", table.name))?;
         }
-        let unread_tables_and_views = read_unread_tables_and_views(connection)
+        let ignored_tables_and_views = read_ignored_tables_and_views(connection)
             .map_err(|err| format!("failed to list schemas and views: {err}"))?;
-        Ok(Catalog { tables, unread_tables_and_views })
+        Ok(Catalog { tables, ignored_tables_and_views })
     }
 }
 
@@ -57,6 +60,12 @@ impl Table {
         self.foreign_keys.iter().find(|foreign_key| foreign_key.columns.iter().any(|name| name == column))
     }
 
+    // Constraints keep a column's name as the constraint spelled it, and DuckDB resolves names case-insensitively.
+    fn declared_column_name(&self, name: String) -> String {
+        let declared = self.columns.iter().find(|column| column.name.eq_ignore_ascii_case(&name));
+        declared.map_or(name, |column| column.name.clone())
+    }
+
     fn without_columns(name: String, comment: Option<String>) -> Table {
         Table {
             name,
@@ -76,6 +85,7 @@ pub(crate) struct Column {
     pub(crate) column_type: ColumnType,
     pub(crate) duckdb_type: String,
     pub(crate) comment: Option<String>,
+    pub(crate) is_generated: bool,
 }
 
 #[derive(Debug)]
@@ -103,23 +113,6 @@ pub(crate) enum ColumnType {
 
 impl ColumnType {
     pub(crate) const INSTANCE_ID: ColumnType = ColumnType::Integer { bits: 64, is_signed: false };
-
-    pub(crate) fn fits_i64(&self) -> bool {
-        match self {
-            ColumnType::Integer { bits, is_signed } => *bits < 64 || (*bits == 64 && *is_signed),
-            ColumnType::Boolean
-            | ColumnType::Double
-            | ColumnType::Decimal { .. }
-            | ColumnType::Varchar
-            | ColumnType::ReadAsVarchar
-            | ColumnType::Date
-            | ColumnType::Timestamp { .. }
-            | ColumnType::TimestampTz { .. }
-            | ColumnType::Interval
-            | ColumnType::List(_)
-            | ColumnType::Unsupported { .. } => false,
-        }
-    }
 
     pub(crate) fn has_nanoseconds(&self) -> bool {
         matches!(
@@ -182,23 +175,17 @@ impl ColumnType {
     }
 }
 
-// DuckDB's default is DECIMAL(18,3).
 fn decimal_precision_and_scale(upper: &str) -> (u8, u8) {
     let arguments = upper.trim_end_matches(')').split_once('(').map(|(_, arguments)| arguments).unwrap_or("");
     let mut parts = arguments.split(',');
     let mut next = || parts.next().and_then(|part| part.trim().parse().ok());
-    (next().unwrap_or(18), next().unwrap_or(3))
+    (next().unwrap_or(DUCKDB_DEFAULT_DECIMAL_PRECISION), next().unwrap_or(DUCKDB_DEFAULT_DECIMAL_SCALE))
 }
 
 fn read_main_tables(connection: &Connection) -> duckdb::Result<Vec<Table>> {
     let mut statement = connection.prepare(sql::catalog::MAIN_TABLES)?;
     let tables = statement.query_map([], |row| Ok(Table::without_columns(row.get(0)?, row.get(1)?)))?;
     tables.collect()
-}
-
-fn read_unread_tables_and_views(connection: &Connection) -> duckdb::Result<Vec<String>> {
-    let mut statement = connection.prepare(sql::catalog::UNREAD_TABLES_AND_VIEWS)?;
-    statement.query_map([], |row| row.get(0))?.collect()
 }
 
 fn read_columns(connection: &Connection, table: &mut Table) -> duckdb::Result<()> {
@@ -211,6 +198,7 @@ fn read_columns(connection: &Connection, table: &mut Table) -> duckdb::Result<()
             column_type: ColumnType::parse(&duckdb_type),
             duckdb_type,
             comment: row.get(2)?,
+            is_generated: row.get(3)?,
         });
     }
     Ok(())
@@ -221,7 +209,7 @@ fn read_constraints(connection: &Connection, table: &mut Table) -> duckdb::Resul
     let mut rows = statement.query([&table.name])?;
     while let Some(row) = rows.next()? {
         let constraint_type: String = row.get(0)?;
-        let columns = text_list(row.get_ref(1)?);
+        let columns = text_list(row.get_ref(1)?).into_iter().map(|name| table.declared_column_name(name)).collect();
         match constraint_type.as_str() {
             "PRIMARY KEY" => table.primary_key = columns,
             "UNIQUE" => table.unique_column_sets.push(columns),
@@ -235,6 +223,11 @@ fn read_constraints(connection: &Connection, table: &mut Table) -> duckdb::Resul
         }
     }
     Ok(())
+}
+
+fn read_ignored_tables_and_views(connection: &Connection) -> duckdb::Result<Vec<String>> {
+    let mut statement = connection.prepare(sql::catalog::IGNORED_TABLES_AND_VIEWS)?;
+    statement.query_map([], |row| row.get(0))?.collect()
 }
 
 fn text_list(cell: ValueRef<'_>) -> Vec<String> {
@@ -363,11 +356,5 @@ mod test {
         for duckdb_type in ["INTEGER[2]", "DECIMAL(10,2)[2]", "ENUM('sad', 'ok')[2]"] {
             assert!(matches!(ColumnType::parse(duckdb_type), ColumnType::Unsupported { .. }), "{duckdb_type}");
         }
-    }
-
-    #[test]
-    fn integers_fit_i64_up_to_bigint_and_uinteger() {
-        assert!(ColumnType::parse("BIGINT").fits_i64() && ColumnType::parse("UINTEGER").fits_i64());
-        assert!(!ColumnType::parse("UBIGINT").fits_i64() && !ColumnType::parse("HUGEINT").fits_i64());
     }
 }
