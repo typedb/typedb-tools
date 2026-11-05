@@ -11,7 +11,7 @@ use duckdb::{
     types::{Value, ValueRef},
 };
 
-use crate::sql;
+use crate::sql::{self, ROWID_COLUMN, duckdb_type};
 
 const DUCKDB_DEFAULT_DECIMAL_PRECISION: u8 = 18;
 const DUCKDB_DEFAULT_DECIMAL_SCALE: u8 = 3;
@@ -53,7 +53,7 @@ impl Table {
     }
 
     pub(crate) fn has_rowid_column(&self) -> bool {
-        self.columns.iter().any(|column| column.name.eq_ignore_ascii_case("rowid"))
+        self.columns.iter().any(|column| column.name.eq_ignore_ascii_case(ROWID_COLUMN))
     }
 
     pub(crate) fn foreign_key_of(&self, column: &str) -> Option<&ForeignKey> {
@@ -123,7 +123,7 @@ impl ColumnType {
 
     fn parse(duckdb_type: &str) -> ColumnType {
         let upper = duckdb_type.to_uppercase();
-        if let Some(element) = upper.strip_suffix("[]") {
+        if let Some(element) = upper.strip_suffix(duckdb_type::LIST_SUFFIX) {
             return ColumnType::List(Box::new(ColumnType::parse(element)));
         }
         let integer = |bits, is_signed| ColumnType::Integer { bits, is_signed };

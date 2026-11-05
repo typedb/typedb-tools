@@ -11,6 +11,7 @@ rust_library(
     srcs = glob(["*.rs"]),
     crate_root = "lib.rs",
     deps = [
+        "//common:typedb_cli_common",
         "@typedb_protocol//grpc/rust:typedb_protocol",
         "@typeql//rust:typeql",
 

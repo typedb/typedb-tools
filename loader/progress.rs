@@ -6,6 +6,8 @@
 
 use std::time::{Duration, Instant};
 
+use typedb_cli_common::constants::{GB, KB, MB};
+
 #[derive(Debug, Default)]
 pub(crate) struct LoadStats {
     pub(crate) rows_attempted: usize,
@@ -65,16 +67,13 @@ fn format_bytes_progress(done: u64, total: u64) -> String {
 }
 
 fn format_bytes(n: u64) -> String {
-    const KB: f64 = 1024.0;
-    const MB: f64 = KB * 1024.0;
-    const GB: f64 = MB * 1024.0;
     let n_f = n as f64;
-    if n_f >= GB {
-        format!("{:.2} GB", n_f / GB)
-    } else if n_f >= MB {
-        format!("{:.2} MB", n_f / MB)
-    } else if n_f >= KB {
-        format!("{:.1} KB", n_f / KB)
+    if n >= GB {
+        format!("{:.2} GB", n_f / GB as f64)
+    } else if n >= MB {
+        format!("{:.2} MB", n_f / MB as f64)
+    } else if n >= KB {
+        format!("{:.1} KB", n_f / KB as f64)
     } else {
         format!("{n} B")
     }

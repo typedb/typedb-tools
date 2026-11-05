@@ -10,6 +10,10 @@ use duckdb::arrow::{
     array::{Array, AsArray, BooleanArray, Date32Array, Decimal128Array, Float64Array, Int64Array, StringArray},
     datatypes::{DataType, TimeUnit},
 };
+use typedb_cli_common::constants::{
+    MICROS_IN_SECOND, MILLIS_IN_SECOND, MONTHS_IN_YEAR, NANOS_IN_MICRO, NANOS_IN_SECOND, SECONDS_IN_HOUR,
+    SECONDS_IN_MINUTE,
+};
 use typedb_protocol::{
     migration::{MigrationValue, migration_value::Value as ProtoValue},
     value as proto_value,
@@ -26,14 +30,12 @@ pub(crate) const MIN_EPOCH_DAYS: i64 = -95_746_129 - EPOCH_DAYS_FROM_CE as i64;
 pub(crate) const MAX_EPOCH_DAYS: i64 = 95_745_399 - EPOCH_DAYS_FROM_CE as i64;
 pub(crate) const MIN_EPOCH_SECONDS: i64 = -8_334_601_228_800;
 pub(crate) const MAX_EPOCH_SECONDS: i64 = 8_210_266_876_799;
-pub(crate) const MICROS_PER_SECOND: i64 = 1_000_000;
-const MILLIS_PER_SECOND: i64 = 1_000;
-const NANOS_PER_SECOND: i64 = 1_000_000_000;
-pub(crate) const NANOS_PER_MICRO: u64 = 1_000;
-pub(crate) const SECONDS_PER_MINUTE: i64 = 60;
-pub(crate) const MINUTES_PER_HOUR: i64 = 60;
-const MONTHS_PER_YEAR: i64 = 12;
-const MICROSECOND_DIGITS: usize = 6;
+// DuckDB prints UTC instants for TIMESTAMPTZ, and intervals as `[N year(s)] [N month(s)] [N day(s)] [-]H:MM:SS[.f]`.
+const TIMESTAMPTZ_TIMEZONE: &str = "UTC";
+const INTERVAL_YEAR: &str = "year";
+const INTERVAL_MONTH: &str = "month";
+const INTERVAL_DAY: &str = "day";
+const INTERVAL_MICROSECOND_DIGITS: usize = MICROS_IN_SECOND.ilog10() as usize;
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum TypeDBValue {
@@ -64,8 +66,7 @@ impl TypeDBValue {
             TypeDBValue::Datetime { seconds, nanos } => ProtoValue::Datetime(proto_value::Datetime { seconds, nanos }),
             TypeDBValue::DatetimeTz { seconds, nanos } => ProtoValue::DatetimeTz(proto_value::DatetimeTz {
                 datetime: Some(proto_value::Datetime { seconds, nanos }),
-                // DuckDB stores TIMESTAMPTZ as a UTC instant.
-                timezone: Some(proto_value::datetime_tz::Timezone::Named("UTC".to_owned())),
+                timezone: Some(proto_value::datetime_tz::Timezone::Named(TIMESTAMPTZ_TIMEZONE.to_owned())),
             }),
             TypeDBValue::Duration { months, days, nanos } => {
                 ProtoValue::Duration(proto_value::Duration { months, days, nanos })
@@ -222,7 +223,7 @@ fn decimal(unscaled: i128, scale: u32) -> Result<TypeDBValue, String> {
     })
 }
 
-// `[N year(s)] [N month(s)] [N day(s)] [-]H:MM:SS[.ffffff]`, every part optional and possibly negative.
+// Every part of the interval text is optional and possibly negative.
 fn duration(text: &str) -> Result<TypeDBValue, String> {
     let (mut months, mut days, mut micros) = (0i64, 0i64, 0i128);
     let mut tokens = text.split_whitespace();
@@ -235,17 +236,18 @@ fn duration(text: &str) -> Result<TypeDBValue, String> {
             };
             let [hours, minutes, seconds] = time.split(':').collect::<Vec<_>>()[..] else { return Err(invalid()) };
             let (seconds, fraction) = seconds.split_once('.').unwrap_or((seconds, ""));
-            let fraction: i128 = format!("{fraction:0<MICROSECOND_DIGITS$}").parse().map_err(|_| invalid())?;
+            let fraction: i128 = format!("{fraction:0<INTERVAL_MICROSECOND_DIGITS$}").parse().map_err(|_| invalid())?;
             let whole = |part: &str| part.parse::<i128>().map_err(|_| invalid());
-            let minutes = whole(hours)? * MINUTES_PER_HOUR as i128 + whole(minutes)?;
-            let seconds = minutes * SECONDS_PER_MINUTE as i128 + whole(seconds)?;
-            micros = sign * (seconds * MICROS_PER_SECOND as i128 + fraction);
+            let seconds = whole(hours)? * i128::from(SECONDS_IN_HOUR)
+                + whole(minutes)? * i128::from(SECONDS_IN_MINUTE)
+                + whole(seconds)?;
+            micros = sign * (seconds * i128::from(MICROS_IN_SECOND) + fraction);
         } else {
             let count: i64 = token.parse().map_err(|_| invalid())?;
             match tokens.next().map(|unit| unit.trim_end_matches('s')) {
-                Some("year") => months += MONTHS_PER_YEAR * count,
-                Some("month") => months += count,
-                Some("day") => days += count,
+                Some(INTERVAL_YEAR) => months += MONTHS_IN_YEAR as i64 * count,
+                Some(INTERVAL_MONTH) => months += count,
+                Some(INTERVAL_DAY) => days += count,
                 _ => return Err(invalid()),
             }
         }
@@ -255,7 +257,7 @@ fn duration(text: &str) -> Result<TypeDBValue, String> {
     }
     let nanos = u64::try_from(micros)
         .ok()
-        .and_then(|micros| micros.checked_mul(NANOS_PER_MICRO))
+        .and_then(|micros| micros.checked_mul(NANOS_IN_MICRO))
         .ok_or_else(|| format!("INTERVAL '{text}' has a time part beyond TypeDB's duration range"))?;
     Ok(TypeDBValue::Duration { months: months as u32, days: days as u32, nanos })
 }
@@ -276,17 +278,17 @@ fn timestamp_parts(unit: TimeUnit, raw: i64) -> Result<(i64, u32), String> {
     if raw.unsigned_abs() == i64::MAX as u64 {
         return Err("infinite TIMESTAMP cannot be a TypeDB datetime".to_owned());
     }
-    let units_per_second: i64 = match unit {
+    let units_per_second = match unit {
         TimeUnit::Second => 1,
-        TimeUnit::Millisecond => MILLIS_PER_SECOND,
-        TimeUnit::Microsecond => MICROS_PER_SECOND,
-        TimeUnit::Nanosecond => NANOS_PER_SECOND,
-    };
+        TimeUnit::Millisecond => MILLIS_IN_SECOND,
+        TimeUnit::Microsecond => MICROS_IN_SECOND,
+        TimeUnit::Nanosecond => NANOS_IN_SECOND,
+    } as i64;
     let seconds = raw.div_euclid(units_per_second);
     if !(MIN_EPOCH_SECONDS..=MAX_EPOCH_SECONDS).contains(&seconds) {
         return Err(format!("timestamp {seconds} seconds from 1970-01-01 is outside TypeDB's datetime range"));
     }
-    let nanos = raw.rem_euclid(units_per_second) * (NANOS_PER_SECOND / units_per_second);
+    let nanos = raw.rem_euclid(units_per_second) * (NANOS_IN_SECOND as i64 / units_per_second);
     Ok((seconds, nanos as u32))
 }
 

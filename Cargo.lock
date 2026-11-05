@@ -3828,6 +3828,7 @@ dependencies = [
  "duckdb",
  "prost",
  "typedb-protocol",
+ "typedb_cli_common",
  "typeql",
  "zstd",
 ]

@@ -7,6 +7,7 @@
 use std::collections::HashSet;
 
 use duckdb::Connection;
+use typedb_cli_common::constants::{MICROS_IN_SECOND, NANOS_IN_MICRO};
 
 use crate::{
     Cancellation, Findings,
@@ -14,20 +15,12 @@ use crate::{
     mapping::{MappingPlan, OwnershipColumn, RoleColumn, TableKind, TableMapping},
     schema::ValueType,
     sql::{self, IID_COLUMN, ROWID_COLUMN, value_condition},
-    value::{MAX_EPOCH_DAYS, MAX_EPOCH_SECONDS, MICROS_PER_SECOND, MIN_EPOCH_DAYS, MIN_EPOCH_SECONDS, NANOS_PER_MICRO},
+    value::{MAX_EPOCH_DAYS, MAX_EPOCH_SECONDS, MIN_EPOCH_DAYS, MIN_EPOCH_SECONDS},
 };
 
 const EXAMPLES: usize = 3;
-const INSTANCE_ID_BOUND: u64 = 1 << 63;
-// Every integer part of up to 18 digits fits 64 bits; some of 19 do not.
-const I64_SAFE_DIGITS: u8 = 18;
-// A double holds every integer of up to 53 bits, and every decimal of up to 15 significant digits.
-const DOUBLE_EXACT_INTEGER_BITS: u8 = 53;
-const DOUBLE_EXACT_DIGITS: u8 = 15;
-const MIN_NANOSECOND_EPOCH_MICROS: i64 = i64::MIN / NANOS_PER_MICRO as i64;
-const MAX_NANOSECOND_EPOCH_MICROS: i64 = i64::MAX / NANOS_PER_MICRO as i64;
-// The time part of a TypeDB duration is an unsigned count of nanoseconds.
-const MAX_DURATION_TIME_MICROS: u64 = u64::MAX / NANOS_PER_MICRO;
+const INSTANCE_ID_BOUND: u64 = i64::MAX as u64 + 1;
+const I64_SAFE_DIGITS: u8 = i64::MAX.ilog10() as u8;
 
 // The schema's constraints are the server's to enforce at import.
 pub(crate) fn check_data(
@@ -134,9 +127,9 @@ impl DataChecker<'_> {
             let names: Vec<&str> = tables.iter().map(|table| table.name.as_str()).collect();
             self.run(Check {
                 subject,
-                unit: "_iid value(s)",
-                predicate: "appear in more than one row; an _iid is the instance's id within its type",
-                example_label: "_iid",
+                unit: format!("{IID_COLUMN} value(s)"),
+                predicate: format!("appear in more than one row; an {IID_COLUMN} is the instance's id within its type"),
+                example_label: IID_COLUMN,
                 violations: sql::check::repeated_ids(&names),
             });
         }
@@ -145,17 +138,19 @@ impl DataChecker<'_> {
     fn check_instance_ids(&mut self, table: &TableMapping) {
         self.run(Check {
             subject: format!("table '{}'", table.name),
-            unit: "row(s)",
-            predicate: "have an _iid of 2^63 or more, beyond TypeDB's instance ids; number the rows, and the columns \
-                        referencing them, below that",
-            example_label: "_iid",
+            unit: "row(s)".into(),
+            predicate: format!(
+                "have an {IID_COLUMN} of 2^63 or more, beyond TypeDB's instance ids; number the rows, \
+                 and the columns referencing them, below that"
+            ),
+            example_label: IID_COLUMN,
             violations: sql::check::ids_at_or_above(&table.name, INSTANCE_ID_BOUND),
         });
         if !table.id_guarantees.is_not_null {
             self.run(Check {
                 subject: format!("table '{}'", table.name),
-                unit: "row(s)",
-                predicate: "have no _iid, which every row needs as its instance id",
+                unit: "row(s)".into(),
+                predicate: format!("have no {IID_COLUMN}, which every row needs as its instance id"),
                 example_label: ROWID_COLUMN,
                 violations: sql::check::rows_without_id(&table.name),
             });
@@ -166,9 +161,9 @@ impl DataChecker<'_> {
         let role_columns: Vec<&str> = roles.iter().map(|role| role.column.as_str()).collect();
         self.run(Check {
             subject: format!("relation table '{}'", table.name),
-            unit: "row(s)",
-            predicate: "fill no role (every role column is NULL), and a relation cannot exist without players",
-            example_label: "_iid",
+            unit: "row(s)".into(),
+            predicate: "fill no role (every role column is NULL), and a relation cannot exist without players".into(),
+            example_label: IID_COLUMN,
             violations: sql::check::rows_without_players(&table.name, &role_columns),
         });
     }
@@ -194,8 +189,8 @@ impl DataChecker<'_> {
         };
         self.run(Check {
             subject,
-            unit: "row(s)",
-            predicate: "hold a value that is no _iid of the referenced table",
+            unit: "row(s)".into(),
+            predicate: format!("hold a value that is no {IID_COLUMN} of the referenced table"),
             example_label: "value",
             violations,
         });
@@ -216,10 +211,10 @@ impl DataChecker<'_> {
                 value_condition::integer_part_beyond_i64(),
             ),
             // Rounding would merge distinct values into one attribute; at one scale, exact round-trips stay apart.
-            ColumnType::Integer { bits, .. } if is_read_as_double && *bits > DOUBLE_EXACT_INTEGER_BITS => {
+            ColumnType::Integer { bits, .. } if is_read_as_double && u32::from(*bits) > f64::MANTISSA_DIGITS => {
                 ("hold a value that a double cannot represent exactly", value_condition::inexact_as_double(0))
             }
-            ColumnType::Decimal { precision, scale } if is_read_as_double && *precision > DOUBLE_EXACT_DIGITS => {
+            ColumnType::Decimal { precision, scale } if is_read_as_double && u32::from(*precision) > f64::DIGITS => {
                 ("hold a value that a double cannot represent exactly", value_condition::inexact_as_double(*scale))
             }
             ColumnType::Double => {
@@ -231,7 +226,7 @@ impl DataChecker<'_> {
             ),
             ColumnType::Timestamp { .. } | ColumnType::TimestampTz { .. } if is_widened_to_nanoseconds => (
                 "hold a timestamp outside the nanosecond range that the attribute's nanosecond columns impose",
-                value_condition::timestamp_outside(MIN_NANOSECOND_EPOCH_MICROS, MAX_NANOSECOND_EPOCH_MICROS),
+                value_condition::timestamp_outside(i64::MIN / NANOS_IN_MICRO as i64, i64::MAX / NANOS_IN_MICRO as i64),
             ),
             // Nanoseconds since 1970 in 64 bits are within TypeDB's range.
             ColumnType::TimestampTz { has_nanoseconds: true } => {
@@ -240,13 +235,13 @@ impl DataChecker<'_> {
             ColumnType::Timestamp { .. } | ColumnType::TimestampTz { has_nanoseconds: false } => (
                 "hold a timestamp that is infinite or outside TypeDB's datetime range",
                 value_condition::timestamp_outside(
-                    MIN_EPOCH_SECONDS * MICROS_PER_SECOND,
-                    (MAX_EPOCH_SECONDS + 1) * MICROS_PER_SECOND - 1,
+                    MIN_EPOCH_SECONDS * MICROS_IN_SECOND as i64,
+                    (MAX_EPOCH_SECONDS + 1) * MICROS_IN_SECOND as i64 - 1,
                 ),
             ),
             ColumnType::Interval => (
                 "hold an interval with a negative part or a time part beyond TypeDB's duration range",
-                value_condition::interval_negative_or_beyond(MAX_DURATION_TIME_MICROS),
+                value_condition::interval_negative_or_beyond(u64::MAX / NANOS_IN_MICRO),
             ),
             ColumnType::Boolean
             | ColumnType::Integer { .. }
@@ -258,9 +253,9 @@ impl DataChecker<'_> {
         };
         self.run(Check {
             subject: format!("table '{}': column '{}'", table.name, ownership.column),
-            unit: "row(s)",
-            predicate,
-            example_label: "_iid",
+            unit: "row(s)".into(),
+            predicate: predicate.into(),
+            example_label: IID_COLUMN,
             violations: sql::check::rows_with_values_where(&table.name, &ownership.unnested_values(), &condition),
         });
     }
@@ -268,15 +263,16 @@ impl DataChecker<'_> {
     // Decimals of different scales can each round-trip and still make one double: 0.1 and 0.10000000000000001.
     fn check_decimals_stay_distinct_as_doubles(&mut self, attribute: &str, sources: &[DecimalSource<'_>]) {
         let scales: HashSet<u8> = sources.iter().map(|source| source.scale).collect();
-        if scales.len() < 2 || sources.iter().all(|source| source.precision <= DOUBLE_EXACT_DIGITS) {
+        if scales.len() < 2 || sources.iter().all(|source| u32::from(source.precision) <= f64::DIGITS) {
             return;
         }
         let columns: Vec<(&str, String)> =
             sources.iter().map(|source| (source.table.name.as_str(), source.ownership.unnested_values())).collect();
         self.run(Check {
             subject: format!("attribute '{attribute}'"),
-            unit: "double(s)",
-            predicate: "are made from distinct decimals of different scales, which would merge into one attribute",
+            unit: "double(s)".into(),
+            predicate: "are made from distinct decimals of different scales, which would merge into one attribute"
+                .into(),
             example_label: "decimals",
             violations: sql::check::distinct_decimals_making_one_double(&columns),
         });
@@ -295,7 +291,7 @@ impl DataChecker<'_> {
             Err(err) => self.findings.error(format!("{}: could not be checked: {err}", check.subject)),
             Ok((count, nulls, examples)) if count > 0 => {
                 let examples = match (examples.is_empty(), nulls > 0) {
-                    (true, _) => "NULL".to_owned(),
+                    (true, _) => "NULL".into(),
                     (false, true) => format!("NULL, {examples}"),
                     (false, false) => examples,
                 };
@@ -316,8 +312,8 @@ struct TablesOfType<'a> {
 
 struct Check {
     subject: String,
-    unit: &'static str,
-    predicate: &'static str,
+    unit: String,
+    predicate: String,
     example_label: &'static str,
     violations: String,
 }

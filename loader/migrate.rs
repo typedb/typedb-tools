@@ -7,14 +7,14 @@
 use std::{
     fs,
     future::Future,
-    io::{self, Write},
+    io,
     path::{self, Path, PathBuf},
     process,
     sync::{Arc, Mutex, MutexGuard},
     time::{Duration, Instant},
 };
 
-use typedb_cli_common::{build_tls_config, format_error, parse_addresses, println_error, println_warning};
+use typedb_cli_common::{build_tls_config, parse_addresses, println_error, println_warning, try_println};
 use typedb_driver::{Addresses, Credentials, DriverOptions, TypeDBDriver};
 use typedb_migration::{Cancellation, Checksums, Migration, PrepareError, ProgressListener, ScanProgress};
 
@@ -23,7 +23,7 @@ use crate::{
     cli::Args,
     fatal_with,
     progress::format_duration,
-    startup::{Termination, prompt_password_if_missing},
+    startup::{FORCE_EXIT_MESSAGE, Termination, prompt_password_if_missing},
 };
 
 const INTERRUPT_REPEAT: Duration = Duration::from_millis(100);
@@ -32,6 +32,8 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 const ALREADY_EXISTS: &str = "DBC6";
 const IS_BEING_IMPORTED: &str = "DBC8";
 const DUCKDB_SPILL_FILE_PREFIX: &str = "duckdb_temp_";
+const CURRENT_DIRECTORY: &str = ".";
+const CONSOLE_COMMAND: &str = "typedb console";
 
 pub(crate) async fn run_migration(args: &Args) -> ! {
     let input = MigrationInput::read(args);
@@ -49,7 +51,7 @@ async fn migrate(args: &Args, input: &MigrationInput) -> Result<(), Failure> {
         Output::DataFile(_) | Output::DryRun { .. } => None,
     };
     let mut termination = Termination::listen();
-    print(format_args!("Migrating from DuckDB file '{}'", input.duckdb_path.display()));
+    try_println!("Migrating from DuckDB file '{}'", input.duckdb_path.display());
     let progress = Progress::new();
     let heartbeat = progress.keep_reporting();
     let cancellation = Arc::new(Cancellation::default());
@@ -67,23 +69,23 @@ async fn migrate(args: &Args, input: &MigrationInput) -> Result<(), Failure> {
     print_conversion_counts(&checksums, elapsed);
 
     let (Output::DataFile(data_file), Some(import_command)) = (output, import_command) else {
-        print(format_args!("Nothing was written or loaded (--dry-run)."));
+        try_println!("Nothing was written or loaded (--dry-run).");
         return Ok(());
     };
     let Some(settings) = server else {
-        print(format_args!("  Data file:      {}", data_file.path.display()));
-        print(format_args!("Import with: {import_command}"));
+        try_println!("  Data file:      {}", data_file.path.display());
+        try_println!("Import with: {import_command}");
         return Ok(());
     };
     let kept = |failure: Failure| Failure { kept_hint: Some(kept_hint(&data_file.path, &import_command)), ..failure };
     let database = &input.database;
-    print(format_args!("Importing into '{database}' from {} (kept if the import fails)...", data_file.path.display()));
+    try_println!("Importing into '{database}' from {} (kept if the import fails)...", data_file.path.display());
     let started = Instant::now();
     let import = tokio::spawn(import(settings, database.clone(), input.schema_text.clone(), data_file.path.clone()));
     let imported = until_terminated(&mut termination, import).await;
     joined(imported.map_err(|exit_code| kept(Failure::interrupted_import(exit_code)))?).map_err(kept)?;
     remove_file_if_exists(&data_file.path);
-    print(format_args!("Imported in {}.", format_duration(started.elapsed())));
+    try_println!("Imported in {}.", format_duration(started.elapsed()));
     Ok(())
 }
 
@@ -149,7 +151,7 @@ impl Output {
             return Ok(Output::DryRun { spill_dir });
         }
         let output_dir = match args.output_dir.as_deref() {
-            Some(dir) => PathBuf::from(if dir.is_empty() { "." } else { dir }),
+            Some(dir) => PathBuf::from(if dir.is_empty() { CURRENT_DIRECTORY } else { dir }),
             None => default_output_dir(&input.duckdb_path),
         };
         fs::create_dir_all(&output_dir).map_err(|err| {
@@ -174,7 +176,7 @@ impl Output {
 fn default_output_dir(duckdb_path: &Path) -> PathBuf {
     match duckdb_path.parent() {
         Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
-        _ => PathBuf::from("."),
+        _ => PathBuf::from(CURRENT_DIRECTORY),
     }
 }
 
@@ -253,8 +255,7 @@ fn remove_file_if_exists(path: &Path) {
         Ok(()) => {}
         Err(err) if err.kind() == io::ErrorKind::NotFound => {}
         Err(err) => {
-            let warning = typedb_cli_common::format_warning!("warning:");
-            let _ = writeln!(io::stderr(), "{warning} failed to remove '{}': {err}", path.display());
+            println_warning!("failed to remove '{}': {err}", path.display());
         }
     }
 }
@@ -341,9 +342,9 @@ impl Failure {
     }
 
     fn report(self) -> i32 {
-        let _ = writeln!(io::stderr(), "{} {}", format_error!("error:"), self.message);
+        println_error!("{}", self.message);
         if let Some(kept_hint) = self.kept_hint {
-            print(format_args!("{kept_hint}"));
+            try_println!("{kept_hint}");
         }
         self.exit_code
     }
@@ -377,7 +378,7 @@ async fn cancel_on_termination<T: Send + 'static>(
             outcome = &mut task => return Err(Interrupted { exit_code, outcome: joined(outcome) }),
             _ = repeat.tick() => cancellation.cancel(),
             second_exit_code = termination.next_exit_code() => {
-                let _ = writeln!(io::stderr(), "Force-exiting.");
+                eprintln!("{FORCE_EXIT_MESSAGE}");
                 process::exit(second_exit_code)
             }
         }
@@ -408,11 +409,11 @@ async fn prepare(
         Ok(migration) => {
             print_mapping(&migration.describe_mapping());
             print_warnings(migration.warnings());
-            print(format_args!(
+            try_println!(
                 "Checked in {} (source DB memory limit {}).",
                 format_duration(started.elapsed()),
                 migration.memory_limit()
-            ));
+            );
             Ok(migration)
         }
         Err(PrepareError::Setup(message)) => Err(Failure::new(ExitCode::UserInputError, message)),
@@ -525,7 +526,7 @@ impl Progress {
             loop {
                 ticks.tick().await;
                 let latest = progress.latest_scan().take().unwrap_or_else(|| "working".to_owned());
-                print(format_args!("  {latest} ({} elapsed)", format_duration(progress.started.elapsed())));
+                try_println!("  {latest} ({} elapsed)", format_duration(progress.started.elapsed()));
             }
         }))
     }
@@ -582,7 +583,7 @@ fn kept_hint(data_path: &Path, import_command: &str) -> String {
 
 // Paths are made absolute so that the command can be run from anywhere.
 fn console_import_command(args: &Args, database: &str, schema_path: &str, data_path: &Path) -> String {
-    let mut command = String::from("typedb console");
+    let mut command = String::from(CONSOLE_COMMAND);
     if let Some(addresses) = &args.addresses {
         command += &format!(" --address {addresses}");
     }
@@ -600,14 +601,10 @@ fn console_import_command(args: &Args, database: &str, schema_path: &str, data_p
     format!("{command} --command=\"database import {database} {} {}\"", schema_path.display(), data_path.display())
 }
 
-fn print(line: std::fmt::Arguments<'_>) {
-    let _ = writeln!(io::stdout(), "{line}");
-}
-
 fn print_mapping(lines: &[String]) {
-    print(format_args!("Mapping:"));
+    try_println!("Mapping:");
     for line in lines {
-        print(format_args!("  {line}"));
+        try_println!("  {line}");
     }
 }
 
@@ -618,10 +615,10 @@ fn print_warnings(warnings: &[String]) {
 }
 
 fn print_conversion_counts(checksums: &Checksums, elapsed: Duration) {
-    print(format_args!("Converted in {}.", format_duration(elapsed)));
-    print(format_args!("  Attributes:     {:>8}", checksums.attribute_count));
-    print(format_args!("  Entities:       {:>8}", checksums.entity_count));
-    print(format_args!("  Relations:      {:>8}", checksums.relation_count));
-    print(format_args!("  Ownerships:     {:>8}", checksums.ownership_count));
-    print(format_args!("  Role players:   {:>8}", checksums.role_count));
+    try_println!("Converted in {}.", format_duration(elapsed));
+    try_println!("  Attributes:     {:>8}", checksums.attribute_count);
+    try_println!("  Entities:       {:>8}", checksums.entity_count);
+    try_println!("  Relations:      {:>8}", checksums.relation_count);
+    try_println!("  Ownerships:     {:>8}", checksums.ownership_count);
+    try_println!("  Role players:   {:>8}", checksums.role_count);
 }

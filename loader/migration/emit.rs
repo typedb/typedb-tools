@@ -17,13 +17,14 @@ use duckdb::arrow::{
     record_batch::RecordBatch,
 };
 use prost::Message;
+use typedb_cli_common::constants::MB;
 use typedb_protocol::migration::{
     Item,
     item::{self, Checksums},
 };
 
 use crate::{
-    MB, Migration, ProgressListener, ScanProgress,
+    Migration, ProgressListener, ScanProgress,
     chunks::{ChunkReader, encode_in_order},
     mapping::{MappingPlan, OwnershipColumn, TableKind, TableMapping},
     schema::ValueType,

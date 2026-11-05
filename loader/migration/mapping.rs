@@ -13,6 +13,11 @@ use crate::{
 };
 
 const DIRECTIVE_PREFIX: &str = "@typedb";
+const SKIP_DIRECTIVE: &str = "skip";
+const ENTITY_DIRECTIVE: &str = ObjectKind::Entity.name();
+const RELATION_DIRECTIVE: &str = ObjectKind::Relation.name();
+const OWNS_DIRECTIVE: &str = "owns";
+const REFERENCES_DIRECTIVE: &str = "references";
 const IID_CONTRACT: &str = "add `_iid UBIGINT`, unique and not null, holding the row's instance id (unsigned 64-bit; \
      see Ids in the loader's README)";
 const GENERATED_COLUMN: &str = "is generated, and DuckDB computes it anew on every read, so the checks and the \
@@ -71,11 +76,11 @@ impl TableMapping {
         let checked = |is_declared: bool| if is_declared { "declared" } else { "checked by the loader" };
         let are_ids_declared = self.id_guarantees.is_unique && self.id_guarantees.is_not_null;
         let (kind, roles, references) = match &self.kind {
-            TableKind::Entity => ("entity", String::new(), String::new()),
+            TableKind::Entity => (ObjectKind::Entity.name(), String::new(), String::new()),
             TableKind::Relation { roles } => {
                 let are_references_declared = roles.iter().all(|role| role.is_reference_declared);
                 let references = format!(", references {}", checked(are_references_declared));
-                ("relation", format!(", {} role column(s)", roles.len()), references)
+                (ObjectKind::Relation.name(), format!(", {} role column(s)", roles.len()), references)
             }
         };
         format!(
@@ -791,9 +796,9 @@ enum ColumnDirective {
 fn parse_table_directive(table: &Table) -> Result<Option<TableDirective>, String> {
     let Some((keyword, argument)) = parse_directive(table.comment.as_deref()) else { return Ok(None) };
     match (keyword.as_str(), argument) {
-        ("skip", "") => Ok(Some(TableDirective::Skip)),
-        ("entity", label) if !label.is_empty() => Ok(Some(TableDirective::Entity { label: label.to_owned() })),
-        ("relation", argument) if !argument.is_empty() => parse_relation_directive(argument)
+        (SKIP_DIRECTIVE, "") => Ok(Some(TableDirective::Skip)),
+        (ENTITY_DIRECTIVE, label) if !label.is_empty() => Ok(Some(TableDirective::Entity { label: label.to_owned() })),
+        (RELATION_DIRECTIVE, argument) if !argument.is_empty() => parse_relation_directive(argument)
             .map(Some)
             .map_err(|err| format!("table '{}': malformed @typedb relation directive: {err}", table.name)),
         _ => Err(format!(
@@ -808,12 +813,12 @@ fn parse_table_directive(table: &Table) -> Result<Option<TableDirective>, String
 fn parse_column_directive(table: &Table, column: &Column) -> Result<Option<ColumnDirective>, String> {
     let Some((keyword, argument)) = parse_directive(column.comment.as_deref()) else { return Ok(None) };
     match (keyword.as_str(), argument) {
-        ("skip", "") => Ok(Some(ColumnDirective::Skip)),
-        ("owns", label) if !label.is_empty() => Ok(Some(ColumnDirective::Owns(label.to_owned()))),
-        ("references", referenced_table) if !referenced_table.is_empty() => {
+        (SKIP_DIRECTIVE, "") => Ok(Some(ColumnDirective::Skip)),
+        (OWNS_DIRECTIVE, label) if !label.is_empty() => Ok(Some(ColumnDirective::Owns(label.to_owned()))),
+        (REFERENCES_DIRECTIVE, referenced_table) if !referenced_table.is_empty() => {
             Ok(Some(ColumnDirective::References(referenced_table.to_owned())))
         }
-        ("relation", _) => {
+        (RELATION_DIRECTIVE, _) => {
             Err(format!("table '{}': column '{}' cannot be a relation: {RELATION_IS_A_TABLE}", table.name, column.name))
         }
         _ => Err(format!(

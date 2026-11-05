@@ -21,6 +21,9 @@
 	[dependencies.typedb-protocol]
 		workspace = true
 
+	[dependencies.typedb_cli_common]
+		workspace = true
+
 	[dependencies.typeql]
 		workspace = true
 
