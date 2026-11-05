@@ -45,6 +45,15 @@ macro_rules! format_argument {
     };
 }
 
+// For progress lines: a closed terminal or pipe must not stop the work that prints them.
+#[macro_export]
+macro_rules! try_println {
+    ($($arg:tt)*) => {{
+        use std::io::Write as _;
+        let _ = writeln!(std::io::stdout(), $($arg)*);
+    }};
+}
+
 #[macro_export]
 macro_rules! println_error {
     ($($arg:tt)*) => {

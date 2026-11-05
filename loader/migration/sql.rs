@@ -8,6 +8,7 @@ pub(crate) const IID_COLUMN: &str = "_iid";
 pub(crate) const ROWID_COLUMN: &str = "rowid";
 const TABLE_ALIAS: &str = "t";
 const ELEMENT: &str = "e";
+const UNION_ALL: &str = " UNION ALL ";
 
 pub(crate) mod duckdb_type {
     pub(crate) const BOOLEAN: &str = "BOOLEAN";
@@ -19,6 +20,7 @@ pub(crate) mod duckdb_type {
     pub(crate) const TIMESTAMP: &str = "TIMESTAMP";
     pub(crate) const TIMESTAMPTZ: &str = "TIMESTAMPTZ";
     pub(crate) const INTERVAL: &str = "INTERVAL";
+    pub(crate) const LIST_SUFFIX: &str = "[]";
     pub(crate) const MAX_DECIMAL_PRECISION: u8 = 38;
 
     pub(crate) fn decimal(precision: u8, scale: u8) -> String {
@@ -45,25 +47,32 @@ pub(crate) mod catalog {
 }
 
 pub(crate) mod setting {
+    pub(crate) const MEMORY_LIMIT: &str = "memory_limit";
+    pub(crate) const THREADS: &str = "threads";
+    pub(crate) const TEMP_DIRECTORY: &str = "temp_directory";
+    pub(crate) const PRESERVE_INSERTION_ORDER: &str = "preserve_insertion_order";
+    pub(crate) const AUTOINSTALL_KNOWN_EXTENSIONS: &str = "autoinstall_known_extensions";
+    pub(crate) const AUTOLOAD_KNOWN_EXTENSIONS: &str = "autoload_known_extensions";
+
     pub(crate) fn current(name: &str) -> String {
         format!("SELECT current_setting('{name}')::VARCHAR")
     }
 
     pub(crate) fn set_memory_limit(limit: &str) -> String {
-        format!("SET memory_limit = '{}'", limit.replace('\'', "''"))
+        format!("SET {MEMORY_LIMIT} = '{}'", limit.replace('\'', "''"))
     }
 
     pub(crate) fn set_threads(threads: usize) -> String {
-        format!("SET threads = {threads}")
+        format!("SET {THREADS} = {threads}")
     }
 
     pub(crate) fn set_preserve_insertion_order(is_preserved: bool) -> String {
-        format!("SET preserve_insertion_order = {is_preserved}")
+        format!("SET {PRESERVE_INSERTION_ORDER} = {is_preserved}")
     }
 }
 
 pub(crate) mod scan {
-    use super::quoted;
+    use super::{UNION_ALL, quoted};
 
     pub(crate) fn row_count(table: &str) -> String {
         format!("SELECT count(*)::UBIGINT FROM {}", quoted(table))
@@ -80,12 +89,12 @@ pub(crate) mod scan {
     }
 
     pub(crate) fn distinct_values_in_order(values: &[String]) -> String {
-        format!("SELECT DISTINCT v FROM ({}) WHERE v IS NOT NULL ORDER BY 1", values.join(" UNION ALL "))
+        format!("SELECT DISTINCT v FROM ({}) WHERE v IS NOT NULL ORDER BY 1", values.join(UNION_ALL))
     }
 }
 
 pub(crate) mod check {
-    use super::{ELEMENT, IID_COLUMN, ROWID_COLUMN, number_text, quoted};
+    use super::{ELEMENT, IID_COLUMN, ROWID_COLUMN, UNION_ALL, number_text, quoted};
 
     pub(crate) fn count_and_examples(violations: &str, examples: usize) -> String {
         format!(
@@ -108,7 +117,7 @@ pub(crate) mod check {
         let ids: Vec<String> = tables.iter().map(|table| format!("SELECT {iid} FROM {}", quoted(table))).collect();
         format!(
             "SELECT {iid} AS example FROM ({}) WHERE {iid} IS NOT NULL GROUP BY {iid} HAVING count(*) > 1",
-            ids.join(" UNION ALL ")
+            ids.join(UNION_ALL)
         )
     }
 
@@ -156,7 +165,7 @@ pub(crate) mod check {
         format!(
             "SELECT string_agg(DISTINCT v, ' and ' ORDER BY v) AS example FROM ({}) WHERE d IS NOT NULL GROUP BY d \
              HAVING count(DISTINCT v) > 1",
-            selects.join(" UNION ALL ")
+            selects.join(UNION_ALL)
         )
     }
 
@@ -170,10 +179,9 @@ pub(crate) mod check {
 }
 
 pub(crate) mod value_condition {
-    use super::{ELEMENT, number_text};
-    use crate::value::{MICROS_PER_SECOND, MINUTES_PER_HOUR, SECONDS_PER_MINUTE};
+    use typedb_cli_common::constants::{MICROS_IN_SECOND, SECONDS_IN_HOUR, SECONDS_IN_MINUTE};
 
-    const MICROS_PER_MINUTE: i64 = SECONDS_PER_MINUTE * MICROS_PER_SECOND;
+    use super::{ELEMENT, number_text};
 
     pub(crate) fn beyond_i64() -> String {
         format!("{ELEMENT} NOT BETWEEN {} AND {}", i64::MIN, i64::MAX)
@@ -216,8 +224,8 @@ pub(crate) mod value_condition {
     pub(crate) fn interval_negative_or_beyond(max_time_micros: u64) -> String {
         format!(
             "{ELEMENT}::VARCHAR LIKE '%-%' \
-             OR (date_part('hour', {ELEMENT})::HUGEINT * {MINUTES_PER_HOUR} + date_part('minute', {ELEMENT})) \
-             * {MICROS_PER_MINUTE} \
+             OR (date_part('hour', {ELEMENT})::HUGEINT * {SECONDS_IN_HOUR} \
+             + date_part('minute', {ELEMENT}) * {SECONDS_IN_MINUTE}) * {MICROS_IN_SECOND} \
              + date_part('microseconds', {ELEMENT}) > {max_time_micros}"
         )
     }
@@ -236,7 +244,7 @@ pub(crate) fn cast(expression: &str, duckdb_type: &str) -> String {
 }
 
 pub(crate) fn list_cast(expression: &str, element_type: &str) -> String {
-    format!("{expression}::{element_type}[]")
+    format!("{expression}::{element_type}{}", duckdb_type::LIST_SUFFIX)
 }
 
 pub(crate) fn unnest(expression: &str) -> String {

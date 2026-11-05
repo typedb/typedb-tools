@@ -152,11 +152,34 @@ hundreds of millions of rows and more, stage without keys.
 
 ## What is checked
 
-Before converting anything, the loader checks the structure (the `_iid` column, role columns, column types,
-directives), the mapping against the schema (types, attributes and roles exist, with compatible value types), and
-the data: values TypeDB cannot hold (above), relation rows that fill no role, and, where no key declares them,
-duplicate or missing `_iid`s and role values that are no `_iid` of the referenced table. Each violation is reported
-with a count and a few examples. Any error stops the run with nothing written.
+Before converting anything, the loader checks the source in three steps. Any error stops the run with nothing
+written, and every error is reported, each data violation with a count and a few examples.
+
+1. **Structure.** Every mapped table has an `_iid UBIGINT` column that is neither generated, a `FOREIGN KEY`, nor
+   under a directive. Every mapped column has a supported type (see [Type conversions](#type-conversions)) and is not
+   generated. Directives are well-formed and name columns and tables that exist.
+2. **Mapping.** Every table and column has a counterpart in the schema, or is skipped; every role column names its
+   players' table, and the role is unambiguous; value types are compatible; abstract types and roles have no tables
+   or columns; ordered (list) ownerships and roles, and struct-valued attributes, are refused.
+3. **Data**, with one DuckDB query per check:
+
+| Check | Runs on | Unless |
+|---|---|---|
+| `_iid` unique within a type, across all of its tables | every type | its one table declares `PRIMARY KEY` or `UNIQUE` on `_iid`, or its ids are dense in row order |
+| `_iid` below 2^63 | every table | |
+| `_iid` present | every table | `_iid` is `PRIMARY KEY` or `NOT NULL` |
+| every row fills a role | every relation table | |
+| a role value is an `_iid` of the referenced table, whose ids are dense in row order | every role column | the column is a `FOREIGN KEY` |
+| an integer fits 64 bits | `HUGEINT`, `UBIGINT` columns | |
+| a decimal's integer part fits 64 bits | `DECIMAL` columns with over 18 integer digits | the attribute is `double` |
+| a double holds the value exactly | into `double`: integers wider than 53 bits, decimals of over 15 digits | |
+| distinct decimals stay distinct doubles | a `double` attribute fed by decimals of several scales | every decimal has at most 15 digits |
+| a double is finite | `FLOAT`, `DOUBLE` columns | |
+| a date is finite and within TypeDB's range | `DATE` columns | |
+| a timestamp is finite and within TypeDB's range | `TIMESTAMP`, `_S`, `_MS`, `_NS`, `TIMESTAMPTZ` columns | |
+| a timestamp fits nanoseconds (years 1677 to 2262) | microsecond and coarser columns of an attribute that also has a nanosecond column | |
+| a nanosecond timestamp is finite | `TIMESTAMPTZ_NS` columns | |
+| an interval has no negative part, and a time part below 2^64 ns | `INTERVAL` columns | |
 
 The schema's constraints (`@card`, `@key`, `@unique`, `@regex`, `@values`, `@range`) are the server's to enforce at
 import. Equal values are one attribute, and a player named twice in a role is one player.
@@ -186,8 +209,9 @@ attribute's values in sorted order, which the server imports faster), every enti
 The schema is not copied. Import the file with the schema file it was prepared with.
 
 The file is `<database>.data.typedb` next to the DuckDB file, or in `--output-dir`. It is written under a
-temporary name and renamed when complete. An existing file is refused unless `--overwrite` is given. That, an
-unreachable server and an existing database are all found before the checks start. One loader at a time prepares a
+temporary name and renamed when complete, and never over the DuckDB file. An existing file is refused unless
+`--overwrite` is given. That, an existing database, and a server that is unreachable or does not answer within 30 s are
+all found before the checks start. One loader at a time prepares a
 database in a directory: `.<database>.lock`, which stays, makes a second one fail at once, and the next run removes
 what a run that died left behind.
 
@@ -197,3 +221,12 @@ import keeps it, and the loader prints the `typedb console` command that imports
 Ctrl+C or SIGTERM stops the run. An interrupted conversion removes what it wrote. An interrupted import keeps the
 data file, and the server discards the partial import. A second interrupt exits at once, and the next run removes
 what it left.
+
+| Exit code | Meaning |
+|---|---|
+| 0 | done |
+| 1 | the import failed on the server |
+| 2 | wrong arguments or paths, a run of the same database and directory in progress, or the checks failed |
+| 3 | the server could not be reached |
+| 4 | the conversion failed, such as on a full disk |
+| 130, 143 | stopped by Ctrl+C (SIGINT), or by SIGTERM |

@@ -10,6 +10,7 @@
 //! build driver config objects, but never decide how a caller should report errors or exit.
 
 mod addresses;
+pub mod constants;
 pub mod printer;
 mod tls;
 

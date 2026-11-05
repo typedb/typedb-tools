@@ -24,15 +24,10 @@ use std::{
 };
 
 use duckdb::{AccessMode, Config, Connection};
+use typedb_cli_common::constants::{GB, KB, MB, TB};
 pub use typedb_protocol::migration::item::Checksums;
 
-use crate::mapping::MappingPlan;
-
-const KB: u64 = 1024;
-pub(crate) const MB: u64 = 1024 * KB;
-const GB: u64 = 1024 * MB;
-const TB: u64 = 1024 * GB;
-const BYTES_PER_GB: f64 = 1e9;
+use crate::{mapping::MappingPlan, sql::setting};
 
 const DUCKDB_DEFAULT_MEMORY_PERCENT: u64 = 80;
 // Half of the machine, leaving room for the conversion's buffers and for a server running alongside.
@@ -140,7 +135,7 @@ pub struct ScanProgress<'a> {
 impl fmt::Display for ScanProgress<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let total = self.total_rows.map(|total| format!(" of {total}")).unwrap_or_default();
-        let encoded = self.encoded_bytes as f64 / BYTES_PER_GB;
+        let encoded = self.encoded_bytes as f64 / GB as f64;
         write!(f, "{}: {}{total} rows, {encoded:.1} GB encoded", self.scan, self.rows)
     }
 }
@@ -211,11 +206,11 @@ fn open_duckdb(path: &Path, spill_dir: &Path) -> Result<Connection, PrepareError
     Config::default()
         .access_mode(AccessMode::ReadOnly)
         // Nothing is fetched from the network, and a file reads the same on every machine.
-        .and_then(|config| config.with("autoinstall_known_extensions", "false"))
-        .and_then(|config| config.with("autoload_known_extensions", "false"))
-        .and_then(|config| config.with("temp_directory", spill_dir.to_string_lossy()))
+        .and_then(|config| config.with(setting::AUTOINSTALL_KNOWN_EXTENSIONS, "false"))
+        .and_then(|config| config.with(setting::AUTOLOAD_KNOWN_EXTENSIONS, "false"))
+        .and_then(|config| config.with(setting::TEMP_DIRECTORY, spill_dir.to_string_lossy()))
         // No scan depends on the order of its rows; preserving it would keep DuckDB from spilling.
-        .and_then(|config| config.with("preserve_insertion_order", "false"))
+        .and_then(|config| config.with(setting::PRESERVE_INSERTION_ORDER, "false"))
         .and_then(|config| Connection::open_with_flags(path, config))
         .map_err(|err| {
             PrepareError::Setup(format!(
@@ -230,7 +225,7 @@ fn set_memory_limit(connection: &Connection, requested: Option<&str>) -> Result<
     let limit = match requested {
         Some(limit) => limit.to_owned(),
         None => {
-            let default = current_setting(connection, "memory_limit")?;
+            let default = current_setting(connection, setting::MEMORY_LIMIT)?;
             // DuckDB reports an unlimited size when it cannot tell the machine's memory; that default is kept.
             let Some(bytes) = size_in_bytes(&default) else { return Ok(default) };
             let half_of_the_machine = bytes / DUCKDB_DEFAULT_MEMORY_PERCENT * DEFAULT_MEMORY_PERCENT;
@@ -238,9 +233,9 @@ fn set_memory_limit(connection: &Connection, requested: Option<&str>) -> Result<
         }
     };
     connection
-        .execute_batch(&sql::setting::set_memory_limit(&limit))
+        .execute_batch(&setting::set_memory_limit(&limit))
         .map_err(|err| PrepareError::Setup(format!("invalid memory limit '{limit}': {err}")))?;
-    let limit = current_setting(connection, "memory_limit")?;
+    let limit = current_setting(connection, setting::MEMORY_LIMIT)?;
     if size_in_bytes(&limit).is_some_and(|bytes| bytes < MEMORY_FLOOR) {
         return Err(PrepareError::Setup(format!(
             "the memory limit {limit} is too small: the conversion needs at least {} MiB",
@@ -251,12 +246,12 @@ fn set_memory_limit(connection: &Connection, requested: Option<&str>) -> Result<
 }
 
 fn fit_threads(connection: &Connection, memory_limit: &str) -> Result<usize, PrepareError> {
-    let threads: usize = current_setting(connection, "threads")?.parse().unwrap_or(1);
+    let threads: usize = current_setting(connection, setting::THREADS)?.parse().unwrap_or(1);
     let Some(bytes) = size_in_bytes(memory_limit) else { return Ok(threads) };
     let affordable = usize::try_from(bytes / MEMORY_PER_THREAD).unwrap_or(usize::MAX).max(1);
     if affordable < threads {
         connection
-            .execute_batch(&sql::setting::set_threads(affordable))
+            .execute_batch(&setting::set_threads(affordable))
             .map_err(|err| PrepareError::Setup(format!("failed to set DuckDB's threads: {err}")))?;
     }
     Ok(threads.min(affordable))
@@ -264,7 +259,7 @@ fn fit_threads(connection: &Connection, memory_limit: &str) -> Result<usize, Pre
 
 fn current_setting(connection: &Connection, name: &str) -> Result<String, PrepareError> {
     connection
-        .query_row(&sql::setting::current(name), [], |row| row.get(0))
+        .query_row(&setting::current(name), [], |row| row.get(0))
         .map_err(|err| PrepareError::Setup(format!("failed to read DuckDB's {name}: {err}")))
 }
 

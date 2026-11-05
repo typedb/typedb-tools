@@ -10,8 +10,9 @@ use std::{
 };
 
 use duckdb::{Statement, arrow::record_batch::RecordBatch};
+use typedb_cli_common::constants::MB;
 
-use crate::{Cancellation, MB};
+use crate::Cancellation;
 
 // A chunk is cut by rows or by bytes, whichever comes first, so that wide rows do not inflate what is in flight.
 const CHUNK_ROWS: usize = 32_768;

@@ -253,10 +253,10 @@ pub(crate) enum ObjectKind {
 }
 
 impl ObjectKind {
-    pub(crate) fn name(&self) -> &'static str {
+    pub(crate) const fn name(&self) -> &'static str {
         match self {
-            ObjectKind::Entity => "entity",
-            ObjectKind::Relation => "relation",
+            ObjectKind::Entity => token::Kind::Entity.as_str(),
+            ObjectKind::Relation => token::Kind::Relation.as_str(),
         }
     }
 }
@@ -296,17 +296,17 @@ pub(crate) enum ValueType {
 }
 
 impl ValueType {
-    pub(crate) fn name(&self) -> &'static str {
+    pub(crate) const fn name(&self) -> &'static str {
         match self {
-            Self::Boolean => "boolean",
-            Self::Integer => "integer",
-            Self::Double => "double",
-            Self::Decimal => "decimal",
-            Self::String => "string",
-            Self::Date => "date",
-            Self::Datetime => "datetime",
-            Self::DatetimeTz => "datetime-tz",
-            Self::Duration => "duration",
+            Self::Boolean => token::ValueType::Boolean.as_str(),
+            Self::Integer => token::ValueType::Integer.as_str(),
+            Self::Double => token::ValueType::Double.as_str(),
+            Self::Decimal => token::ValueType::Decimal.as_str(),
+            Self::String => token::ValueType::String.as_str(),
+            Self::Date => token::ValueType::Date.as_str(),
+            Self::Datetime => token::ValueType::DateTime.as_str(),
+            Self::DatetimeTz => token::ValueType::DateTimeTZ.as_str(),
+            Self::Duration => token::ValueType::Duration.as_str(),
         }
     }
 }
