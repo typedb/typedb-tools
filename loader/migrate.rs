@@ -26,7 +26,6 @@ use crate::{
     startup::{Termination, prompt_password_if_missing},
 };
 
-const INTERRUPT_REPEAT: Duration = Duration::from_millis(100);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
 const ALREADY_EXISTS: &str = "DBC6";
@@ -372,15 +371,12 @@ async fn cancel_on_termination<T: Send + 'static>(
         outcome = &mut task => return Ok(joined(outcome)),
         exit_code = termination.next_exit_code() => exit_code,
     };
-    let mut repeat = tokio::time::interval(INTERRUPT_REPEAT);
-    loop {
-        tokio::select! {
-            outcome = &mut task => return Err(Interrupted { exit_code, outcome: joined(outcome) }),
-            _ = repeat.tick() => cancellation.cancel(),
-            second_exit_code = termination.next_exit_code() => {
-                eprintln!("Forcing exiting...");
-                process::exit(second_exit_code)
-            }
+    cancellation.cancel();
+    tokio::select! {
+        outcome = task => Err(Interrupted { exit_code, outcome: joined(outcome) }),
+        second_exit_code = termination.next_exit_code() => {
+            eprintln!("Forcing exiting...");
+            process::exit(second_exit_code)
         }
     }
 }

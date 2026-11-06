@@ -18,12 +18,14 @@ use std::{
     io::Write,
     path::{Path, PathBuf},
     sync::{
-        Arc, OnceLock,
+        Arc, Mutex, Weak,
         atomic::{AtomicBool, Ordering},
     },
+    thread,
+    time::Duration,
 };
 
-use duckdb::{AccessMode, Config, Connection};
+use duckdb::{AccessMode, Config, Connection, InterruptHandle};
 use typedb_cli_common::constants::{GB, KB, MB, TB};
 pub use typedb_protocol::migration::item::Checksums;
 
@@ -35,6 +37,7 @@ const DEFAULT_MEMORY_PERCENT: u64 = 50;
 const MEMORY_FLOOR: u64 = 512 * MB;
 // A hash aggregate or join fails instead of spilling below a few tens of MB per thread.
 const MEMORY_PER_THREAD: u64 = 64 * MB;
+const INTERRUPT_REPEAT: Duration = Duration::from_millis(100);
 
 pub struct Migration {
     connection: Connection,
@@ -95,8 +98,7 @@ impl Migration {
         })?;
         let spill_dir_guard = SpillDir(spill_dir.to_path_buf());
         let connection = open_duckdb(source, spill_dir)?;
-        let interrupt = connection.interrupt_handle();
-        cancellation.set_cancel_action(move || interrupt.interrupt());
+        cancellation.watch(&connection);
         let memory_limit = set_memory_limit(&connection, memory_limit)?;
         let threads = fit_threads(&connection, &memory_limit)?;
         let catalog = catalog::Catalog::read(&connection).map_err(PrepareError::Setup)?;
@@ -143,14 +145,13 @@ impl fmt::Display for ScanProgress<'_> {
 #[derive(Default)]
 pub struct Cancellation {
     is_cancelled: AtomicBool,
-    cancel_action: OnceLock<Box<dyn Fn() + Send + Sync>>,
+    interrupt: Mutex<Option<Weak<InterruptHandle>>>,
 }
 
 impl Cancellation {
     pub fn cancel(&self) {
-        self.is_cancelled.store(true, Ordering::SeqCst);
-        if let Some(action) = self.cancel_action.get() {
-            action();
+        if !self.is_cancelled.swap(true, Ordering::SeqCst) {
+            self.interrupt_until_closed();
         }
     }
 
@@ -158,11 +159,23 @@ impl Cancellation {
         self.is_cancelled.load(Ordering::SeqCst)
     }
 
-    fn set_cancel_action(&self, action: impl Fn() + Send + Sync + 'static) {
-        assert!(self.cancel_action.set(Box::new(action)).is_ok(), "a cancellation serves one migration");
+    fn watch(&self, connection: &Connection) {
+        let interrupt = Arc::downgrade(&connection.interrupt_handle());
+        let previous = self.interrupt.lock().expect("nothing panics holding the lock").replace(interrupt);
+        assert!(previous.is_none(), "a cancellation serves one migration");
         if self.is_cancelled() {
-            self.cancel_action.get().expect("just set")();
+            self.interrupt_until_closed();
         }
+    }
+
+    // DuckDB clears an interrupt when the next statement starts, so it is repeated until the connection closes.
+    fn interrupt_until_closed(&self) {
+        let Some(interrupt) = self.interrupt.lock().expect("nothing panics holding the lock").clone() else { return };
+        thread::spawn(move || {
+            while interrupt.upgrade().map(|handle| handle.interrupt()).is_some() {
+                thread::sleep(INTERRUPT_REPEAT);
+            }
+        });
     }
 }
 
@@ -301,6 +314,20 @@ mod test {
         assert!(halved.abs_diff(expected) < 64 * MB, "{halved} vs {expected}");
         assert_eq!(set_memory_limit(&connection, Some("512MiB")).unwrap(), "512.0 MiB");
         assert!(matches!(set_memory_limit(&connection, Some("lots")), Err(PrepareError::Setup(_))));
+    }
+
+    #[test]
+    fn a_cancellation_before_a_statement_stops_it() {
+        let connection = Connection::open_in_memory().unwrap();
+        let cancellation = Cancellation::default();
+        cancellation.watch(&connection);
+        cancellation.cancel();
+        // The first interrupt is spent before the statement starts; hours of work if no other followed.
+        thread::sleep(INTERRUPT_REPEAT);
+        let count = connection.query_row("SELECT count(*) FROM range(1000000000000) a(i) WHERE i % 7 = 3", [], |row| {
+            row.get::<_, i64>(0)
+        });
+        assert!(count.is_err(), "interrupted");
     }
 
     #[test]
