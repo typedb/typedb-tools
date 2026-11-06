@@ -17,10 +17,11 @@ use ureq;
 
 use crate::{
     ConsoleContext,
-    constants::DEFAULT_TRANSACTION_TIMEOUT,
+    constants::{DEFAULT_TRANSACTION_TIMEOUT, FORCE_FLAG, FORCE_FLAG_SHORT},
     printer::{print_document, print_row, print_servers_table},
     repl::{
         command::{CommandResult, ReplError},
+        line_reader::LineReaderVisible,
         parser::{parse_one_query, parse_server_routing},
     },
     transaction_repl,
@@ -133,9 +134,31 @@ pub(crate) fn database_export(context: &mut ConsoleContext, input: &[String]) ->
 pub(crate) fn database_delete(context: &mut ConsoleContext, input: &[String]) -> CommandResult {
     let driver = context.driver.clone();
     let db_name = input[0].clone();
+    let force = match input.get(1) {
+        None => false,
+        Some(flag) if flag == FORCE_FLAG || flag == FORCE_FLAG_SHORT => true,
+        Some(other) => {
+            return Err(Box::new(ReplError {
+                message: format!("Unrecognised argument '{}'. Expected '{}'.", other, FORCE_FLAG),
+            }));
+        }
+    };
+    if !force && context.can_prompt() && !confirm_database_delete(&db_name)? {
+        println!("Cancelled: database '{}' was not deleted.", db_name);
+        return Ok(());
+    }
     context.background_runtime.run(async move { execute_database_delete(&driver, db_name).await })?;
     println!("Successfully deleted database.");
     Ok(())
+}
+
+// irreversible, so require the name to be re-typed rather than a keystroke that is easy to agree to by reflex
+fn confirm_database_delete(db_name: &str) -> CommandResult<bool> {
+    println!("Deleting database '{}' permanently removes all of its schema and data. This cannot be undone.", db_name);
+    let entered = LineReaderVisible::new()
+        .readline("  Type the database name to confirm: ")
+        .map_err(|err| Box::new(err) as Box<dyn Error + Send>)?;
+    Ok(entered == db_name)
 }
 
 pub(crate) fn database_schema(context: &mut ConsoleContext, input: &[String]) -> CommandResult {

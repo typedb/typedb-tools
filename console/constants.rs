@@ -16,3 +16,6 @@ pub mod common {
 
 pub const DEFAULT_TRANSACTION_TIMEOUT: Duration = Duration::from_secs(1 * SECONDS_IN_HOUR);
 pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(10 * SECONDS_IN_MINUTE);
+
+pub const FORCE_FLAG: &str = "--force";
+pub const FORCE_FLAG_SHORT: &str = "-f";

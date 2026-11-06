@@ -55,9 +55,6 @@ features = {}
 	[dependencies.serde_json]
 		workspace = true
 
-	[dependencies.sentry]
-		workspace = true
-
 	[dependencies.ureq]
 		workspace = true
 

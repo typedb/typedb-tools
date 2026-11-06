@@ -9,7 +9,7 @@ use std::sync::Arc;
 use glob::glob;
 use typedb_driver::TypeDBDriver;
 
-use crate::{BackgroundRuntime, repl::command::InputCompleterFn};
+use crate::{BackgroundRuntime, constants::FORCE_FLAG, repl::command::InputCompleterFn};
 
 pub(crate) fn database_name_completer_fn(
     driver: Arc<TypeDBDriver>,
@@ -35,4 +35,8 @@ pub(crate) fn file_completer(input: &str) -> Vec<String> {
         Ok(paths) => paths.filter_map(Result::ok).map(|path| path.to_string_lossy().into_owned()).collect(),
         Err(_) => Vec::new(),
     }
+}
+
+pub(crate) fn force_flag_completer(input: &str) -> Vec<String> {
+    if FORCE_FLAG.starts_with(input) { vec![FORCE_FLAG.to_owned()] } else { Vec::with_capacity(0) }
 }
