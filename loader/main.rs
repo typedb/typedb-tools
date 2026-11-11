@@ -22,6 +22,7 @@ use crate::{
 mod checkpoint;
 mod cli;
 mod csv_reader;
+mod import_command;
 mod load;
 mod migrate;
 mod output;

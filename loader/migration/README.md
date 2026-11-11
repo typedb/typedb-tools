@@ -121,12 +121,12 @@ Directives are DuckDB comments, kept in the file:
 | `BOOLEAN` | `boolean` | |
 | integer types | `integer` | must fit 64 bits. Also into `decimal`, and into `double` when the double holds the value exactly |
 | `FLOAT`, `DOUBLE` | `double` | finite only. `-0.0` loads as `0.0` |
-| `DECIMAL(p,s)` | `decimal` | exact. Scale at most 19, integer part within 64 bits. Into `double` only when the double, printed at the column's scale, reads back as the value, and no two distinct decimals of the attribute make one double |
+| `DECIMAL(p,s)` | `decimal` | exact. Scale at most 19, integer part within 64 bits. Into `double`, at any scale, only when the double, printed at the column's scale, reads back as the value, and no two distinct decimals of the attribute make one double |
 | `VARCHAR`, `ENUM`, `UUID`, `JSON` | `string` | compared byte-wise whatever the collation: `'Bob'` and `'BOB'` are two values |
 | `DATE` | `date` | finite, years -262143 to 262142 |
 | `TIMESTAMP`, `_S`, `_MS`, `_NS` | `datetime` | exact to the nanosecond, finite |
 | `TIMESTAMPTZ`, `TIMESTAMPTZ_NS` | `datetime-tz` | as `datetime`, in UTC: DuckDB stores the instant, not the zone |
-| `INTERVAL` | `duration` | months, days and nanoseconds kept apart (`1 month` and `30 days` are two values). No negative parts, and a time part below 2^64 ns (584 years) |
+| `INTERVAL` | `duration` | months, days and nanoseconds kept apart (`1 month` and `30 days` are two values). No negative parts, at most 6291432 months (524286 years), and a time part below 2^64 ns (584 years) |
 | `BLOB`, `TIME`, `STRUCT`, `MAP`, `UNION`, `UHUGEINT`, fixed-size `ARRAY`, nested lists, others | | refused |
 
 An attribute fed by a nanosecond column reads all its columns in nanoseconds, so their timestamps must fit years
@@ -143,7 +143,8 @@ mapping summary says which are declared and which are checked.
 
 Without a `FOREIGN KEY`, the `_iid`s of the referenced table must be dense in row order, `first, first + 1, ...`, as
 `row_number() OVER ()` numbers the rows while DuckDB preserves insertion order (its default). One scan then proves
-them unique, and every reference is checked against their range. Other ids of a referenced table are refused. The
+them unique, and every reference is checked against their range. Other ids of a referenced table are refused, and
+so is a table that had rows deleted, whose row order keeps the gaps: copy it with `CREATE TABLE ... AS SELECT`. The
 ids of a table that no such column references may be anything: their uniqueness takes a GROUP BY, which spills to
 disk on large data.
 
@@ -179,7 +180,7 @@ written, and every error is reported, each data violation with a count and a few
 | a timestamp is finite and within TypeDB's range | `TIMESTAMP`, `_S`, `_MS`, `_NS`, `TIMESTAMPTZ` columns | |
 | a timestamp fits nanoseconds (years 1677 to 2262) | microsecond and coarser columns of an attribute that also has a nanosecond column | |
 | a nanosecond timestamp is finite | `TIMESTAMPTZ_NS` columns | |
-| an interval has no negative part, and a time part below 2^64 ns | `INTERVAL` columns | |
+| an interval has no negative part, at most 6291432 months, and a time part below 2^64 ns | `INTERVAL` columns | |
 
 The schema's constraints (`@card`, `@key`, `@unique`, `@regex`, `@values`, `@range`) are the server's to enforce at
 import. Equal values are one attribute, and a player named twice in a role is one player.
@@ -204,19 +205,20 @@ temporary directory (`TMPDIR`), as `.typedb-loader.<process id>.tmp`, which a ki
 ## The data file and the import
 
 The file is the `typedb export` format: length-delimited `Migration.Item` protobuf messages, as zstd frames that each
-carry a checksum, so a damaged or truncated file fails to decompress. It holds a header, every attribute (each
-attribute's values in sorted order, which the server imports faster), every entity, every relation, and checksums.
+carry a checksum, so a damaged file fails to decompress, and a file cut short lacks the closing checksums that the
+import requires. It holds a header, every attribute (each attribute's values sorted, which the server imports
+faster), every entity, every relation, and checksums.
 The schema is not copied. Import the file with the schema file it was prepared with.
 
 The file is `<database>.data.typedb` next to the DuckDB file, or in `--output-dir`. It is written under a
 temporary name and renamed when complete, and never over the DuckDB file. An existing file is refused unless
-`--overwrite` is given. That, an existing database, and a server that is unreachable or does not answer within 30 s are
-all found before the checks start. One loader at a time prepares a
-database in a directory: `.<database>.lock`, which stays, makes a second one fail at once, and the next run removes
-what a run that died left behind.
+`--overwrite` is given. That, an existing database, and a server that is unreachable or does not answer within 30 s
+are all found before the checks start. One loader at a time prepares a database in a directory: `.<database>.lock`,
+which stays, makes a second one fail at once, and the next run removes what a run that died left behind.
 
 The import starts once the file is complete, over a fresh connection. A successful import removes the file. A failed
-import keeps it, and the loader prints the `typedb console` command that imports it.
+import keeps it, and the loader prints the `typedb console` command that imports it, quoted for the shell. The
+console reads each path as one word, so the command works only for paths without spaces.
 
 Ctrl+C or SIGTERM stops the run. An interrupted conversion removes what it wrote. An interrupted import keeps the
 data file, and the server discards the partial import. A second interrupt exits at once, and the next run removes

@@ -371,14 +371,16 @@ fn decimals_of_any_scale_feed_one_double_attribute() -> Result<(), Box<dyn Error
     let dir = scratch(
         "decimals-to-double",
         "define\n  attribute v, value double;\n  entity t, owns v @card(0..);\n",
-        "CREATE TABLE t (_iid UBIGINT PRIMARY KEY, v DECIMAL(18,18), w DECIMAL(16,1), x DECIMAL(16,0));
+        "CREATE TABLE t (_iid UBIGINT PRIMARY KEY, v DECIMAL(18,18), w DECIMAL(16,1), x DECIMAL(16,0),
+                         y DECIMAL(38,25));
          COMMENT ON COLUMN t.w IS '@typedb owns v';
          COMMENT ON COLUMN t.x IS '@typedb owns v';
-         INSERT INTO t VALUES (1, 0.5, 0.5, 10), (2, -0.25, 10.0, 0), (3, 0, NULL, NULL);",
+         COMMENT ON COLUMN t.y IS '@typedb owns v';
+         INSERT INTO t VALUES (1, 0.5, 0.5, 10, 0.125), (2, -0.25, 10.0, 0, 0.5), (3, 0, NULL, NULL, NULL);",
     )?;
     let items = convert(&dir)?;
     let attributes = items.iter().filter(|item| matches!(item, item::Item::Attribute(_))).count();
-    assert_eq!(attributes, 4, "0.5, -0.25, 10 and 0");
+    assert_eq!(attributes, 5, "0.5, -0.25, 10, 0 and 0.125");
     Ok(())
 }
 
@@ -695,9 +697,10 @@ fn values_typedb_cannot_hold_are_found_before_the_conversion() -> Result<(), Box
         ),
         ("day DATE", "'-infinity'", "hold a date that is infinite or outside TypeDB's range"),
         ("score DOUBLE[]", "['nan'::DOUBLE, 1.5]", "hold a double that is not finite"),
-        ("span INTERVAL", "INTERVAL '1 month -2 days'", "hold an interval with a negative part or a time part"),
-        ("span INTERVAL[]", "[INTERVAL '5124096 hours']", "hold an interval with a negative part or a time part"),
-        ("span INTERVAL", "INTERVAL '5124095:34:33.709552'", "hold an interval with a negative part or a time part"),
+        ("span INTERVAL", "INTERVAL '1 month -2 days'", "hold an interval with a negative part, or with months"),
+        ("span INTERVAL[]", "[INTERVAL '5124096 hours']", "hold an interval with a negative part, or with months"),
+        ("span INTERVAL", "INTERVAL '5124095:34:33.709552'", "hold an interval with a negative part, or with months"),
+        ("span INTERVAL", "INTERVAL '524286 years 1 month'", "hold an interval with a negative part, or with months"),
         ("count UBIGINT", "18446744073709551615", "hold an integer that does not fit TypeDB's 64-bit integer"),
     ];
     for (column, value, fragment) in cases {
@@ -1204,12 +1207,12 @@ fn equal_values_from_columns_of_different_types_are_one_attribute() -> Result<()
 }
 
 #[test]
-fn intervals_of_millions_of_years_are_durations() -> Result<(), Box<dyn Error>> {
+fn intervals_of_hundreds_of_millennia_are_durations() -> Result<(), Box<dyn Error>> {
     let dir = scratch(
         "long-intervals",
         "define\n  attribute span value duration;\n  entity thing, owns span;\n",
         "CREATE TABLE thing (_iid UBIGINT, span INTERVAL);
-         INSERT INTO thing VALUES (1, INTERVAL '4000000 years 5 days 25:00:00.5');",
+         INSERT INTO thing VALUES (1, INTERVAL '500000 years 5 days 25:00:00.5');",
     )?;
     let durations: Vec<_> = convert(&dir)?
         .into_iter()
@@ -1219,7 +1222,7 @@ fn intervals_of_millions_of_years_are_durations() -> Result<(), Box<dyn Error>> 
         })
         .collect();
     let [migration_value::Value::Duration(duration)] = durations.as_slice() else { panic!("{durations:?}") };
-    assert_eq!((duration.months, duration.days, duration.nanos), (48_000_000, 5, 90_000_500_000_000));
+    assert_eq!((duration.months, duration.days, duration.nanos), (6_000_000, 5, 90_000_500_000_000));
     Ok(())
 }
 

@@ -4,6 +4,8 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 
+use std::io::{IsTerminal, stderr};
+
 use clap::builder::styling::{AnsiColor, Color, Style};
 
 pub const STYLE_RED: Style = Style::new().fg_color(Some(Color::Ansi(AnsiColor::Red)));
@@ -57,21 +59,20 @@ macro_rules! try_println {
 #[macro_export]
 macro_rules! println_error {
     ($($arg:tt)*) => {
-        eprintln!(
-            "{} {}",
-            $crate::format_error!("error:"),
-            format!($($arg)*)
-        );
+        $crate::printer::eprintln_labelled($crate::printer::STYLE_ERROR, "error:", &format!($($arg)*))
     }
 }
 
 #[macro_export]
 macro_rules! println_warning {
     ($($arg:tt)*) => {
-        eprintln!(
-            "{} {}",
-            $crate::format_warning!("warning:"),
-            format!($($arg)*)
-        );
+        $crate::printer::eprintln_labelled($crate::printer::STYLE_WARNING, "warning:", &format!($($arg)*))
     }
+}
+
+// Styled only for a terminal, so that a redirected log stays plain; a closed stderr must not stop the work either.
+pub fn eprintln_labelled(style: Style, label: &str, message: &str) {
+    use std::io::Write as _;
+    let style = if stderr().is_terminal() { style } else { Style::new() };
+    let _ = writeln!(stderr(), "{}{label}{} {message}", style.render(), style.render_reset());
 }

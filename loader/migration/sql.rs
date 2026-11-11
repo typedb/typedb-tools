@@ -53,6 +53,7 @@ pub(crate) mod setting {
     pub(crate) const PRESERVE_INSERTION_ORDER: &str = "preserve_insertion_order";
     pub(crate) const AUTOINSTALL_KNOWN_EXTENSIONS: &str = "autoinstall_known_extensions";
     pub(crate) const AUTOLOAD_KNOWN_EXTENSIONS: &str = "autoload_known_extensions";
+    pub(crate) const ARROW_LARGE_BUFFER_SIZE: &str = "arrow_large_buffer_size";
 
     pub(crate) fn current(name: &str) -> String {
         format!("SELECT current_setting('{name}')::VARCHAR")
@@ -179,7 +180,7 @@ pub(crate) mod check {
 }
 
 pub(crate) mod value_condition {
-    use typedb_cli_common::constants::{MICROS_IN_SECOND, SECONDS_IN_HOUR, SECONDS_IN_MINUTE};
+    use typedb_cli_common::constants::{MICROS_IN_SECOND, MONTHS_IN_YEAR, SECONDS_IN_HOUR, SECONDS_IN_MINUTE};
 
     use super::{ELEMENT, number_text};
 
@@ -221,9 +222,10 @@ pub(crate) mod value_condition {
         format!("isinf({ELEMENT}::TIMESTAMPTZ)")
     }
 
-    pub(crate) fn interval_negative_or_beyond(max_time_micros: u64) -> String {
+    pub(crate) fn interval_negative_or_beyond(max_months: u64, max_time_micros: u64) -> String {
         format!(
             "{ELEMENT}::VARCHAR LIKE '%-%' \
+             OR date_part('year', {ELEMENT})::BIGINT * {MONTHS_IN_YEAR} + date_part('month', {ELEMENT}) > {max_months} \
              OR (date_part('hour', {ELEMENT})::HUGEINT * {SECONDS_IN_HOUR} \
              + date_part('minute', {ELEMENT}) * {SECONDS_IN_MINUTE}) * {MICROS_IN_SECOND} \
              + date_part('microseconds', {ELEMENT}) > {max_time_micros}"
