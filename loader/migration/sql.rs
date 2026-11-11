@@ -126,7 +126,7 @@ pub(crate) mod check {
         let iid = quoted(IID_COLUMN);
         format!(
             "SELECT count(*)::UBIGINT, count({iid})::UBIGINT, min({iid}), max({iid}), \
-             min({iid}::HUGEINT - rowid) = max({iid}::HUGEINT - rowid) FROM {}",
+             min({iid}::HUGEINT - {ROWID_COLUMN}) = max({iid}::HUGEINT - {ROWID_COLUMN}) FROM {}",
             quoted(table)
         )
     }

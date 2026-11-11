@@ -205,29 +205,21 @@ fn table_targets<'a>(catalog: &'a Catalog, schema: &'a Schema, findings: &mut Fi
             continue;
         }
         let Some(id_guarantees) = instance_id_guarantees(table, findings) else { continue };
+        let role_bindings = role_bindings
+            .into_iter()
+            .map(|binding| RoleBinding { column: table.declared_column_name(binding.column), ..binding })
+            .collect();
         targets.push(TableTarget { table, object, role_bindings, id_guarantees });
     }
     targets
 }
 
 fn directive_implied_by_name(table: &Table, schema: &Schema, findings: &mut Findings) -> Option<TableDirective> {
-    let entity = find_by_name_or_dashed(schema.objects(ObjectKind::Entity), &table.name, |entity| &entity.label);
-    let relation =
-        find_by_name_or_dashed(schema.objects(ObjectKind::Relation), &table.name, |relation| &relation.label);
-    match (entity, relation) {
-        (Some(entity), None) => Some(TableDirective::Entity { label: entity.label.clone() }),
-        (None, Some(relation)) => {
-            Some(TableDirective::Relation { label: relation.label.clone(), role_bindings: Vec::new() })
-        }
-        (Some(_), Some(_)) => {
-            findings.error(format!(
-                "table '{}' matches both an entity and a relation type; disambiguate with \
-                 COMMENT ON TABLE ... IS '@typedb entity <label>' or '@typedb relation <label> (...)'",
-                table.name
-            ));
-            None
-        }
-        (None, None) => {
+    let object = find_by_name_or_dashed(schema.objects(), &table.name, |object| &object.label);
+    match object.map(|object| (object.label.clone(), object.kind)) {
+        Some((label, ObjectKind::Entity)) => Some(TableDirective::Entity { label }),
+        Some((label, ObjectKind::Relation)) => Some(TableDirective::Relation { label, role_bindings: Vec::new() }),
+        None => {
             findings.error(format!(
                 "table '{}' has no matching entity or relation type in the TypeDB schema \
                  (add the type, or mark the table '@typedb skip')",
@@ -542,8 +534,7 @@ impl<'a, 'f> TableMapper<'a, 'f> {
         let attribute_label = match named_attribute {
             Some(label) => label.to_owned(),
             None => {
-                let found =
-                    find_by_name_or_dashed(schema.attributes.iter(), &column.name, |attribute| &attribute.label);
+                let found = find_by_name_or_dashed(schema.attributes(), &column.name, |attribute| &attribute.label);
                 let Some(attribute) = found else {
                     let player_hint = match target.object.kind {
                         ObjectKind::Relation => " / '@typedb references <table>' if it holds players' ids",
@@ -743,7 +734,7 @@ fn column_type_holding(value_type: ValueType) -> &'static str {
 }
 
 fn warn_about_types_without_source(plan: &MappingPlan, schema: &Schema, findings: &mut Findings) {
-    for object in schema.objects.iter().filter(|object| !object.is_abstract) {
+    for object in schema.objects().filter(|object| !object.is_abstract) {
         if !plan.tables.iter().any(|table| table.type_label == object.label) {
             findings.warning(format!(
                 "{} type '{}' has no DuckDB source; no instances will be produced",
@@ -752,7 +743,7 @@ fn warn_about_types_without_source(plan: &MappingPlan, schema: &Schema, findings
             ));
         }
     }
-    for attribute in schema.attributes.iter().filter(|attribute| !attribute.is_abstract) {
+    for attribute in schema.attributes().filter(|attribute| !attribute.is_abstract) {
         let is_sourced = plan
             .tables
             .iter()
@@ -856,7 +847,7 @@ fn parse_relation_directive(argument: &str) -> Result<TableDirective, String> {
     let label = argument[..open].trim().to_owned();
     let inner = argument[open + 1..].trim().strip_suffix(')').ok_or("missing closing ')'")?;
     let mut role_bindings = Vec::new();
-    for part in inner.split(',') {
+    for part in inner.split(',').filter(|part| !part.trim().is_empty()) {
         let (role, column) = part.split_once('=').ok_or_else(|| format!("expected '<role> = <column>' in '{part}'"))?;
         role_bindings.push(RoleBinding { role: role.trim().to_owned(), column: column.trim().to_owned() });
     }
