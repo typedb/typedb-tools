@@ -60,8 +60,8 @@ impl Table {
         self.foreign_keys.iter().find(|foreign_key| foreign_key.columns.iter().any(|name| name == column))
     }
 
-    // Constraints keep a column's name as the constraint spelled it, and DuckDB resolves names case-insensitively.
-    fn declared_column_name(&self, name: String) -> String {
+    // Constraints and directives spell a column's name freely, and DuckDB resolves names case-insensitively.
+    pub(crate) fn declared_column_name(&self, name: String) -> String {
         let declared = self.columns.iter().find(|column| column.name.eq_ignore_ascii_case(&name));
         declared.map_or(name, |column| column.name.clone())
     }

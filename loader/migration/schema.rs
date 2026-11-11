@@ -19,8 +19,8 @@ use typeql::{
 
 #[derive(Debug, Default)]
 pub(crate) struct Schema {
-    pub(crate) attributes: Vec<AttributeType>,
-    pub(crate) objects: Vec<ObjectType>,
+    attributes: Vec<AttributeType>,
+    objects: Vec<ObjectType>,
 }
 
 impl Schema {
@@ -28,10 +28,19 @@ impl Schema {
         let declarations = type_declarations(schema_text)?;
         let mut schema = Schema::default();
         schema.declare_types(&declarations);
+        schema.refuse_labels_of_several_kinds()?;
         schema.apply_capabilities(declarations)?;
         schema.refuse_unknown_supertypes()?;
         schema.refuse_reserved_labels()?;
         Ok(schema)
+    }
+
+    pub(crate) fn attributes(&self) -> impl Iterator<Item = &AttributeType> + Clone {
+        self.attributes.iter()
+    }
+
+    pub(crate) fn objects(&self) -> impl Iterator<Item = &ObjectType> + Clone {
+        self.objects.iter()
     }
 
     pub(crate) fn attribute(&self, label: &str) -> Option<&AttributeType> {
@@ -40,10 +49,6 @@ impl Schema {
 
     pub(crate) fn object(&self, label: &str, kind: ObjectKind) -> Option<&ObjectType> {
         self.objects.iter().find(|object| object.label == label && object.kind == kind)
-    }
-
-    pub(crate) fn objects(&self, kind: ObjectKind) -> impl Iterator<Item = &ObjectType> + Clone {
-        self.objects.iter().filter(move |object| object.kind == kind)
     }
 
     pub(crate) fn value_type(&self, attribute: &AttributeType) -> Option<ValueType> {
@@ -122,6 +127,17 @@ impl Schema {
             }
         }
         Ok(())
+    }
+
+    // A label names one type, which is how a declaration without a kind finds its type.
+    fn refuse_labels_of_several_kinds(&self) -> Result<(), String> {
+        let mut labels = HashSet::new();
+        let attributes = self.attributes.iter().map(|attribute| &attribute.label);
+        let mut declared = attributes.chain(self.objects.iter().map(|object| &object.label));
+        match declared.find(|label| !labels.insert(*label)) {
+            Some(label) => Err(format!("'{label}' is declared as more than one kind of type; a label names one type")),
+            None => Ok(()),
+        }
     }
 
     fn refuse_unknown_supertypes(&self) -> Result<(), String> {
@@ -231,7 +247,10 @@ impl ObjectType {
                 let is_abstract =
                     capability.annotations.iter().any(|annotation| matches!(annotation, Annotation::Abstract(_)));
                 match self.roles.iter_mut().find(|declared| declared.label == role) {
-                    Some(declared) => declared.is_abstract |= is_abstract,
+                    Some(declared) => {
+                        declared.is_abstract |= is_abstract;
+                        declared.specialises = specialises.or(declared.specialises.take());
+                    }
                     None => {
                         let relation = self.label.clone();
                         self.roles.push(RoleType { label: role, relation, specialises, is_abstract });

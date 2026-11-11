@@ -386,7 +386,7 @@ fn decimals_of_any_scale_feed_one_double_attribute() -> Result<(), Box<dyn Error
 
 #[test]
 fn structure_and_mapping_errors_name_the_table_and_the_fix() -> Result<(), Box<dyn Error>> {
-    let schema = "define\n  entity person;\n  entity friend_ship;\n  relation friend-ship, relates friend;\n";
+    let schema = "define\n  entity person;\n";
     let check = |sql: &str, fragment: &str| -> Result<(), Box<dyn Error>> {
         let dir = scratch("structure", schema, sql)?;
         assert_error(&validation_errors(&dir), &[fragment]);
@@ -407,10 +407,6 @@ fn structure_and_mapping_errors_name_the_table_and_the_fix() -> Result<(), Box<d
             "CREATE TABLE person (_iid UBIGINT NOT NULL); INSERT INTO person VALUES (1), (2), (2), (3), (3), (3)",
             "table 'person': 2 _iid value(s) appear in more than one row; an _iid is the instance's id within its \
              type, e.g. _iid 2, 3",
-        ),
-        (
-            "CREATE TABLE friend_ship (_iid UBIGINT PRIMARY KEY)",
-            "table 'friend_ship' matches both an entity and a relation",
         ),
         (
             "CREATE TABLE stranger (_iid UBIGINT PRIMARY KEY)",
@@ -584,12 +580,24 @@ fn subtypes_inherit_ownerships_and_roles() -> Result<(), Box<dyn Error>> {
 #[test]
 fn inherited_roles_are_scoped_to_their_declaring_relation() -> Result<(), Box<dyn Error>> {
     // `posting` specialises `subject` as `author`, so the person, who plays both, plays `author` in a posting.
-    let dir = scratch(
-        "scoping",
+    let inline = "relation posting, sub interaction, relates author as subject, relates post;";
+    let restated =
+        "relation posting, sub interaction, relates author, relates post;\n  posting relates author as subject;";
+    for posting in [inline, restated] {
+        roles_are_scoped_to_their_declaring_relation(posting)?;
+    }
+    Ok(())
+}
+
+fn roles_are_scoped_to_their_declaring_relation(posting: &str) -> Result<(), Box<dyn Error>> {
+    let schema = format!(
         "define\n  entity person, plays interaction:subject, plays posting:author;\n  \
          entity observer, plays interaction:witness;\n  entity post, plays posting:post;\n  \
-         relation interaction @abstract, relates subject, relates witness;\n  \
-         relation posting, sub interaction, relates author as subject, relates post;\n",
+         relation interaction @abstract, relates subject, relates witness;\n  {posting}\n"
+    );
+    let dir = scratch(
+        "scoping",
+        &schema,
         "CREATE TABLE person (_iid UBIGINT PRIMARY KEY);
          CREATE TABLE observer (_iid UBIGINT PRIMARY KEY);
          CREATE TABLE post (_iid UBIGINT PRIMARY KEY);
@@ -912,10 +920,11 @@ fn exact_names_win_over_dashed_readings() -> Result<(), Box<dyn Error>> {
     let dir = scratch(
         "exact-names",
         "define\n  attribute a-b value string;\n  attribute a_b value string;\n  entity t, owns a-b, owns a_b;\n  \
-         entity t_x;\n  entity t-x;\n",
+         entity t_x;\n  entity t-x;\n  relation u-v, relates part;\n  entity u_v;\n",
         "CREATE TABLE t (_iid UBIGINT PRIMARY KEY, a_b VARCHAR);
          CREATE TABLE t_x (_iid UBIGINT PRIMARY KEY);
-         INSERT INTO t VALUES (1, 'v'); INSERT INTO t_x VALUES (1);",
+         CREATE TABLE u_v (_iid UBIGINT PRIMARY KEY);
+         INSERT INTO t VALUES (1, 'v'); INSERT INTO t_x VALUES (1); INSERT INTO u_v VALUES (1);",
     )?;
     let items = convert(&dir)?;
     let labels: Vec<&str> = items
@@ -926,7 +935,19 @@ fn exact_names_win_over_dashed_readings() -> Result<(), Box<dyn Error>> {
             _ => None,
         })
         .collect();
-    assert_eq!(labels, ["a_b", "t", "t_x"]);
+    assert_eq!(labels, ["a_b", "t", "t_x", "u_v"]);
+    Ok(())
+}
+
+#[test]
+fn a_label_names_one_type() -> Result<(), Box<dyn Error>> {
+    let dir = scratch(
+        "two-kinds",
+        "define\n  entity thing;\n  relation thing, relates part;\n",
+        "CREATE TABLE thing (_iid UBIGINT PRIMARY KEY);",
+    )?;
+    let Err(PrepareError::Setup(message)) = prepare(&dir) else { panic!("a label was accepted for two types") };
+    assert!(message.contains("'thing' is declared as more than one kind of type"), "{message}");
     Ok(())
 }
 
@@ -1275,6 +1296,37 @@ fn relation_directive_bindings_are_checked() -> Result<(), Box<dyn Error>> {
     assert_error(&errors, &["binds role 'a' to column '_iid', which holds the relations' own ids"]);
     assert_error(&errors, &["column 'r' is bound to role 'link:a'", "'rock'", "does not play that role"]);
     assert_error(&errors, &["table 'link': column 'o' holds role players", "cannot own"]);
+    Ok(())
+}
+
+#[test]
+fn directive_bindings_may_be_empty_and_spell_columns_in_any_case() -> Result<(), Box<dyn Error>> {
+    let schema = "define\n  entity person, plays mentorship:mentor, plays mentorship:student;\n  \
+                  entity pet, plays ownership:owned;\n  relation ownership, relates owned;\n  \
+                  relation mentorship, relates mentor, relates student;\n";
+    let dir = scratch(
+        "binding-spelling",
+        schema,
+        "CREATE TABLE person (_iid UBIGINT PRIMARY KEY);
+         CREATE TABLE pet (_iid UBIGINT PRIMARY KEY);
+         CREATE TABLE mentorship (_iid UBIGINT PRIMARY KEY, student_id UBIGINT REFERENCES person(_iid),
+                                  Mentor_Id UBIGINT REFERENCES person(_iid));
+         COMMENT ON TABLE mentorship IS '@typedb relation mentorship (mentor = MENTOR_ID, student = Student_Id, )';
+         CREATE TABLE ownership (_iid UBIGINT PRIMARY KEY, pet_id UBIGINT REFERENCES pet(_iid));
+         COMMENT ON TABLE ownership IS '@typedb relation ownership ()';
+         INSERT INTO person VALUES (1), (2);
+         INSERT INTO pet VALUES (1);
+         INSERT INTO mentorship VALUES (1, 1, 2);
+         INSERT INTO ownership VALUES (1, 1);",
+    )?;
+    let mut roles: Vec<String> = convert(&dir)?
+        .into_iter()
+        .filter_map(|item| if let item::Item::Relation(relation) = item { Some(relation.roles) } else { None })
+        .flatten()
+        .map(|role| role.label)
+        .collect();
+    roles.sort();
+    assert_eq!(roles, ["mentorship:mentor", "mentorship:student", "ownership:owned"]);
     Ok(())
 }
 
@@ -1828,6 +1880,13 @@ fn cancelling_stops_the_checks_and_reports_cancelled() -> Result<(), Box<dyn Err
     let outcome = Migration::prepare(&source, &schema, &spill_dir, None, cancelled);
     assert!(matches!(outcome, Err(PrepareError::Cancelled)), "cancelled before it began");
 
+    // Machines differ too much for a fixed bound: a cancelled run is measured against an undisturbed one.
+    let started = Instant::now();
+    let undisturbed = Migration::prepare(&source, &schema, &spill_dir, None, Arc::new(Cancellation::default()));
+    assert!(undisturbed.is_ok(), "the fixture passes the checks");
+    drop(undisturbed);
+    let undisturbed = started.elapsed();
+
     let cancellation = Arc::new(Cancellation::default());
     let canceller = {
         let cancellation = cancellation.clone();
@@ -1840,7 +1899,8 @@ fn cancelling_stops_the_checks_and_reports_cancelled() -> Result<(), Box<dyn Err
     let outcome = Migration::prepare(&source, &schema, &spill_dir, None, cancellation);
     let cancelled_at = canceller.join().expect("the canceller does not panic");
     assert!(matches!(outcome, Err(PrepareError::Cancelled)), "cancelled during the checks");
-    assert!(cancelled_at.elapsed() < Duration::from_secs(1), "took {:?} to stop", cancelled_at.elapsed());
+    let stopped_in = cancelled_at.elapsed();
+    assert!(stopped_in < undisturbed / 2, "took {stopped_in:?} to stop checks that take {undisturbed:?}");
     assert!(!spill_dir.exists(), "the spill directory is removed");
     Ok(())
 }
