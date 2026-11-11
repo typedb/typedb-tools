@@ -8,7 +8,7 @@ use std::{
     fs,
     future::Future,
     io,
-    path::{self, Path, PathBuf},
+    path::{Path, PathBuf},
     process,
     sync::{Arc, Mutex, MutexGuard},
     time::{Duration, Instant},
@@ -21,7 +21,7 @@ use typedb_migration::{Cancellation, Checksums, Migration, PrepareError, Progres
 use crate::{
     ExitCode, VERSION,
     cli::Args,
-    fatal_with,
+    import_command::console_import_command,
     progress::format_duration,
     startup::{Termination, prompt_password_if_missing},
 };
@@ -32,60 +32,41 @@ const ALREADY_EXISTS: &str = "DBC6";
 const IS_BEING_IMPORTED: &str = "DBC8";
 const DUCKDB_SPILL_FILE_PREFIX: &str = "duckdb_temp_";
 const CURRENT_DIRECTORY: &str = ".";
-const CONSOLE_COMMAND: &str = "typedb console";
 
 pub(crate) async fn run_migration(args: &Args) -> ! {
-    let input = MigrationInput::read(args);
-    let exit_code = match migrate(args, &input).await {
+    let exit_code = match migrate(args).await {
         Ok(()) => 0,
         Err(failure) => failure.report(),
     };
     process::exit(exit_code)
 }
 
-async fn migrate(args: &Args, input: &MigrationInput) -> Result<(), Failure> {
+async fn migrate(args: &Args) -> Result<(), Failure> {
+    let input = &MigrationInput::read(args)?;
+    let server = if args.dry_run || args.files_only { None } else { Some(ServerArgs::parse(args)?) };
     let output = Output::prepare(args, input)?;
-    let server = match &output {
-        Output::DataFile(_) if !args.files_only => Some(connect_to_new_database(args, &input.database).await?),
-        Output::DataFile(_) | Output::DryRun { .. } => None,
+    let server = match server {
+        Some(server) => Some(connect_to_new_database(args, server, &input.database).await?),
+        None => None,
     };
-    let mut termination = Termination::listen();
+    let mut interruption = Interruption::listen();
     try_println!("Migrating from DuckDB file '{}'", input.duckdb_path.display());
     let progress = Progress::new();
-    let heartbeat = progress.keep_reporting();
-    let cancellation = Arc::new(Cancellation::default());
-    let migration = prepare(args, input, output.spill_dir(), &cancellation, &mut termination).await?;
-    let import_command = match &output {
-        Output::DryRun { .. } => None,
-        Output::DataFile(data_file) => {
-            Some(console_import_command(args, &input.database, &input.schema_path, &data_file.path))
-        }
-    };
-    let (checksums, elapsed) =
-        convert(migration, input, &output, import_command.as_deref(), &progress, &cancellation, &mut termination)
-            .await?;
-    drop(heartbeat);
+    let _heartbeat = progress.keep_reporting();
+    let migration = prepare(args, input, output.spill_dir(), &mut interruption).await?;
+    let (checksums, elapsed) = convert(migration, input, &output, &progress, &mut interruption).await?;
     print_conversion_counts(&checksums, elapsed);
 
-    let (Output::DataFile(data_file), Some(import_command)) = (output, import_command) else {
+    let Output::DataFile(data_file) = output else {
         try_println!("Nothing was written or loaded (--dry-run).");
         return Ok(());
     };
-    let Some(settings) = server else {
+    let Some(server) = server else {
         try_println!("  Data file:      {}", data_file.path.display());
-        try_println!("Import with: {import_command}");
+        try_println!("Import with: {}", data_file.import_command);
         return Ok(());
     };
-    let kept = |failure: Failure| Failure { kept_hint: Some(kept_hint(&data_file.path, &import_command)), ..failure };
-    let database = &input.database;
-    try_println!("Importing into '{database}' from {} (kept if the import fails)...", data_file.path.display());
-    let started = Instant::now();
-    let import = tokio::spawn(import(settings, database.clone(), input.schema_text.clone(), data_file.path.clone()));
-    let imported = until_terminated(&mut termination, import).await;
-    joined(imported.map_err(|exit_code| kept(Failure::interrupted_import(exit_code)))?).map_err(kept)?;
-    remove_file_if_exists(&data_file.path);
-    try_println!("Imported in {}.", format_duration(started.elapsed()));
-    Ok(())
+    import_data_file(server, input, &data_file, &mut interruption).await
 }
 
 struct MigrationInput {
@@ -97,38 +78,40 @@ struct MigrationInput {
 }
 
 impl MigrationInput {
-    fn read(args: &Args) -> MigrationInput {
+    fn read(args: &Args) -> Result<MigrationInput, Failure> {
         let duckdb_path = PathBuf::from(args.duckdb.as_deref().expect("dispatched on --duckdb"));
-        check_source_file(&duckdb_path);
+        check_source_file(&duckdb_path)?;
         let Some(schema_path) = args.schema_file.clone() else {
-            fatal_with(ExitCode::UserInputError, "--schema-file is required with --duckdb");
+            return Err(Failure::new(ExitCode::UserInputError, "--schema-file is required with --duckdb"));
         };
-        let schema_text = fs::read_to_string(&schema_path).unwrap_or_else(|err| {
-            fatal_with(ExitCode::UserInputError, format!("failed to read schema file '{schema_path}': {err}"))
-        });
-        let database = database_name(args, &duckdb_path);
+        let schema_text = fs::read_to_string(&schema_path).map_err(|err| {
+            Failure::new(ExitCode::UserInputError, format!("failed to read schema file '{schema_path}': {err}"))
+        })?;
+        let database = database_name(args, &duckdb_path)?;
         let original_database = format!("duckdb:{}", duckdb_path.file_name().unwrap_or_default().to_string_lossy());
-        MigrationInput { duckdb_path, schema_path, schema_text, database, original_database }
+        Ok(MigrationInput { duckdb_path, schema_path, schema_text, database, original_database })
     }
 }
 
-fn check_source_file(duckdb_path: &Path) {
-    if !duckdb_path.is_file() {
-        let problem = if duckdb_path.exists() { "is not a file" } else { "does not exist" };
-        fatal_with(ExitCode::UserInputError, format!("DuckDB file '{}' {problem}", duckdb_path.display()));
+fn check_source_file(duckdb_path: &Path) -> Result<(), Failure> {
+    if duckdb_path.is_file() {
+        return Ok(());
     }
+    let problem = if duckdb_path.exists() { "is not a file" } else { "does not exist" };
+    Err(Failure::new(ExitCode::UserInputError, format!("DuckDB file '{}' {problem}", duckdb_path.display())))
 }
 
-fn database_name(args: &Args, duckdb_path: &Path) -> String {
+fn database_name(args: &Args, duckdb_path: &Path) -> Result<String, Failure> {
     let name = args.database.clone().unwrap_or_else(|| {
         let stem = duckdb_path.file_stem().expect("the source was checked to be a file, which has a name");
         stem.to_string_lossy().into_owned()
     });
     if !args.dry_run && !typeql::common::identifier::is_valid_label(&name) {
         let origin = if args.database.is_some() { "" } else { " (taken from the file name; pass --database)" };
-        fatal_with(ExitCode::UserInputError, format!("'{name}' is not a valid TypeDB database name{origin}"));
+        let message = format!("'{name}' is not a valid TypeDB database name{origin}");
+        return Err(Failure::new(ExitCode::UserInputError, message));
     }
-    name
+    Ok(name)
 }
 
 enum Output {
@@ -139,7 +122,18 @@ enum Output {
 struct DataFileOutput {
     path: PathBuf,
     spill_dir: PathBuf,
+    import_command: String,
     _lock: OutputLock,
+}
+
+impl DataFileOutput {
+    fn kept_hint(&self) -> String {
+        format!(
+            "The prepared data file is kept: {}\nImport it without converting again with:\n  {}",
+            self.path.display(),
+            self.import_command
+        )
+    }
 }
 
 impl Output {
@@ -155,14 +149,22 @@ impl Output {
         };
         fs::create_dir_all(&output_dir).map_err(|err| {
             let message = format!("failed to create output directory '{}': {err}", output_dir.display());
-            Failure::new(ExitCode::MigrationError, message)
+            Failure::new(ExitCode::UserInputError, message)
         })?;
         let lock = OutputLock::take(&output_dir, &input.database)?;
         let path = output_data_path(&output_dir, &input.database, &input.duckdb_path, args.overwrite)?;
         let spill_dir = output_dir.join(format!(".{}.tmp", input.database));
         remove_spill_left_behind(&spill_dir)?;
         remove_file_if_exists(&partial_path(&path));
-        Ok(Output::DataFile(DataFileOutput { path, spill_dir, _lock: lock }))
+        let import_command = console_import_command(args, &input.database, Path::new(&input.schema_path), &path);
+        Ok(Output::DataFile(DataFileOutput { path, spill_dir, import_command, _lock: lock }))
+    }
+
+    fn data_file(&self) -> Option<&DataFileOutput> {
+        match self {
+            Output::DryRun { .. } => None,
+            Output::DataFile(data_file) => Some(data_file),
+        }
     }
 
     fn spill_dir(&self) -> &Path {
@@ -271,25 +273,47 @@ impl ConnectionSettings {
     }
 }
 
-async fn connect_to_new_database(args: &Args, database: &str) -> Result<ConnectionSettings, Failure> {
+struct ServerArgs {
+    addresses: Addresses,
+    username: String,
+    options: DriverOptions,
+}
+
+impl ServerArgs {
+    fn parse(args: &Args) -> Result<ServerArgs, Failure> {
+        let input_error = |message: String| Failure::new(ExitCode::UserInputError, message);
+        let Some(addresses) = args.addresses.as_deref() else {
+            return Err(input_error(
+                "--address is required to load into a server (use --files-only to only write the data file)".to_owned(),
+            ));
+        };
+        let Some(username) = args.username.clone() else {
+            return Err(input_error("--username is required to load into a server".to_owned()));
+        };
+        let addresses = parse_addresses(addresses).map_err(input_error)?;
+        let tls_config =
+            build_tls_config(args.tls_disabled.unwrap_or(false), args.tls_root_ca.as_deref().map(Path::new))
+                .map_err(input_error)?;
+        Ok(ServerArgs { addresses, username, options: DriverOptions::new(tls_config) })
+    }
+
+    fn with_password(self, password: &str) -> ConnectionSettings {
+        ConnectionSettings {
+            addresses: self.addresses,
+            credentials: Credentials::new(&self.username, password),
+            options: self.options,
+        }
+    }
+}
+
+async fn connect_to_new_database(
+    args: &Args,
+    server: ServerArgs,
+    database: &str,
+) -> Result<ConnectionSettings, Failure> {
     let input_error = |message: String| Failure::new(ExitCode::UserInputError, message);
-    let Some(addresses) = args.addresses.as_deref() else {
-        return Err(input_error(
-            "--address is required to load into a server (use --files-only to only write the data file)".to_owned(),
-        ));
-    };
-    let Some(username) = args.username.as_deref() else {
-        return Err(input_error("--username is required to load into a server".to_owned()));
-    };
-    let password = prompt_password_if_missing(args, username);
-    let addresses = parse_addresses(addresses).map_err(input_error)?;
-    let tls_config = build_tls_config(args.tls_disabled.unwrap_or(false), args.tls_root_ca.as_deref().map(Path::new))
-        .map_err(input_error)?;
-    let settings = ConnectionSettings {
-        addresses,
-        credentials: Credentials::new(username, &password),
-        options: DriverOptions::new(tls_config),
-    };
+    let password = prompt_password_if_missing(args, &server.username);
+    let settings = server.with_password(&password);
     let timed_out = |_| {
         let message = format!("TypeDB did not answer within {} s", CONNECT_TIMEOUT.as_secs());
         Failure::new(ExitCode::ConnectionError, message)
@@ -330,14 +354,18 @@ impl Failure {
         Failure { exit_code, message: "interrupted; nothing was loaded".to_owned(), kept_hint: None }
     }
 
-    fn interrupted_after_conversion(exit_code: i32, data_path: &Path, import_command: &str) -> Failure {
+    fn interrupted_after_conversion(exit_code: i32) -> Failure {
         let message = "interrupted after the conversion; nothing was loaded".to_owned();
-        Failure { exit_code, message, kept_hint: Some(kept_hint(data_path, import_command)) }
+        Failure { exit_code, message, kept_hint: None }
     }
 
     fn interrupted_import(exit_code: i32) -> Failure {
         let message = "interrupted before the import completed; the server discards a partial import".to_owned();
         Failure { exit_code, message, kept_hint: None }
+    }
+
+    fn keeping(self, data_file: &DataFileOutput) -> Failure {
+        Failure { kept_hint: Some(data_file.kept_hint()), ..self }
     }
 
     fn report(self) -> i32 {
@@ -349,11 +377,10 @@ impl Failure {
     }
 }
 
-async fn until_terminated<T>(termination: &mut Termination, work: impl Future<Output = T>) -> Result<T, i32> {
-    tokio::select! {
-        result = work => Ok(result),
-        exit_code = termination.next_exit_code() => Err(exit_code),
-    }
+// The first interrupt cancels the work and waits for it to stop; a second one exits at once.
+struct Interruption {
+    termination: Termination,
+    cancellation: Arc<Cancellation>,
 }
 
 struct Interrupted<T> {
@@ -361,22 +388,36 @@ struct Interrupted<T> {
     outcome: T,
 }
 
-async fn cancel_on_termination<T: Send + 'static>(
-    termination: &mut Termination,
-    cancellation: &Cancellation,
-    work: impl FnOnce() -> T + Send + 'static,
-) -> Result<T, Interrupted<T>> {
-    let mut task = tokio::task::spawn_blocking(work);
-    let exit_code = tokio::select! {
-        outcome = &mut task => return Ok(joined(outcome)),
-        exit_code = termination.next_exit_code() => exit_code,
-    };
-    cancellation.cancel();
-    tokio::select! {
-        outcome = task => Err(Interrupted { exit_code, outcome: joined(outcome) }),
-        second_exit_code = termination.next_exit_code() => {
-            eprintln!("Forcing exiting...");
-            process::exit(second_exit_code)
+impl Interruption {
+    fn listen() -> Interruption {
+        Interruption { termination: Termination::listen(), cancellation: Arc::new(Cancellation::default()) }
+    }
+
+    fn cancellation(&self) -> Arc<Cancellation> {
+        self.cancellation.clone()
+    }
+
+    async fn run_cancellable<T: Send + 'static>(
+        &mut self,
+        work: impl FnOnce() -> T + Send + 'static,
+    ) -> Result<T, Interrupted<T>> {
+        let mut task = tokio::task::spawn_blocking(work);
+        let exit_code = tokio::select! {
+            outcome = &mut task => return Ok(joined(outcome)),
+            exit_code = self.termination.next_exit_code() => exit_code,
+        };
+        self.cancellation.cancel();
+        eprintln!("\nInterrupt received; stopping. Interrupt again to force exit.");
+        tokio::select! {
+            outcome = task => Err(Interrupted { exit_code, outcome: joined(outcome) }),
+            never = self.termination.force_exit_on_next() => never,
+        }
+    }
+
+    async fn until_interrupted<T>(&mut self, work: impl Future<Output = T>) -> Result<T, i32> {
+        tokio::select! {
+            result = work => Ok(result),
+            exit_code = self.termination.next_exit_code() => Err(exit_code),
         }
     }
 }
@@ -389,18 +430,18 @@ async fn prepare(
     args: &Args,
     input: &MigrationInput,
     spill_dir: &Path,
-    cancellation: &Arc<Cancellation>,
-    termination: &mut Termination,
+    interruption: &mut Interruption,
 ) -> Result<Migration, Failure> {
     let (source, schema_text) = (input.duckdb_path.clone(), input.schema_text.clone());
-    let (spill_dir, memory_limit, task_cancellation) =
-        (spill_dir.to_path_buf(), args.memory_limit.clone(), cancellation.clone());
+    let (spill_dir, memory_limit, cancellation) =
+        (spill_dir.to_path_buf(), args.memory_limit.clone(), interruption.cancellation());
     let started = Instant::now();
-    let prepared = cancel_on_termination(termination, cancellation, move || {
-        Migration::prepare(&source, &schema_text, &spill_dir, memory_limit.as_deref(), task_cancellation)
-    })
-    .await
-    .map_err(|interrupted| Failure::interrupted(interrupted.exit_code))?;
+    let prepared = interruption
+        .run_cancellable(move || {
+            Migration::prepare(&source, &schema_text, &spill_dir, memory_limit.as_deref(), cancellation)
+        })
+        .await
+        .map_err(|interrupted| Failure::interrupted(interrupted.exit_code))?;
     match prepared {
         Ok(migration) => {
             print_mapping(&migration.describe_mapping());
@@ -431,31 +472,26 @@ async fn convert(
     migration: Migration,
     input: &MigrationInput,
     output: &Output,
-    import_command: Option<&str>,
     progress: &Progress,
-    cancellation: &Cancellation,
-    termination: &mut Termination,
+    interruption: &mut Interruption,
 ) -> Result<(Checksums, Duration), Failure> {
-    let data_path = match output {
-        Output::DryRun { .. } => None,
-        Output::DataFile(data_file) => Some(data_file.path.clone()),
-    };
+    let data_path = output.data_file().map(|data_file| data_file.path.clone());
     let (original_database, progress) = (input.original_database.clone(), progress.clone());
-    let data_file = data_path.clone();
-    let converted = cancel_on_termination(termination, cancellation, move || {
-        let started = Instant::now();
-        let checksums = match &data_file {
-            None => migration.run(io::sink(), VERSION.trim(), &original_database, &progress),
-            Some(path) => write_data_file(&migration, path, &original_database, &progress),
-        };
-        drop(migration);
-        checksums.map(|checksums| (checksums, started.elapsed()))
-    })
-    .await;
-    match (converted, data_path.zip(import_command)) {
+    let converted = interruption
+        .run_cancellable(move || {
+            let started = Instant::now();
+            let checksums = match &data_path {
+                None => migration.run(io::sink(), VERSION.trim(), &original_database, &progress),
+                Some(path) => write_data_file(&migration, path, &original_database, &progress),
+            };
+            drop(migration);
+            checksums.map(|checksums| (checksums, started.elapsed()))
+        })
+        .await;
+    match (converted, output.data_file()) {
         (Ok(converted), _) => converted.map_err(|message| Failure::new(ExitCode::MigrationError, message)),
-        (Err(Interrupted { exit_code, outcome: Ok(_) }), Some((path, import_command))) => {
-            Err(Failure::interrupted_after_conversion(exit_code, &path, import_command))
+        (Err(Interrupted { exit_code, outcome: Ok(_) }), Some(data_file)) => {
+            Err(Failure::interrupted_after_conversion(exit_code).keeping(data_file))
         }
         (Err(Interrupted { exit_code, .. }), _) => Err(Failure::interrupted(exit_code)),
     }
@@ -546,13 +582,34 @@ impl Drop for Heartbeat {
     }
 }
 
+async fn import_data_file(
+    server: ConnectionSettings,
+    input: &MigrationInput,
+    data_file: &DataFileOutput,
+    interruption: &mut Interruption,
+) -> Result<(), Failure> {
+    let database = &input.database;
+    try_println!("Importing into '{database}' from {} (kept if the import fails)...", data_file.path.display());
+    let started = Instant::now();
+    // Spawned, as the driver's import does not yield while it sends the file.
+    let import = tokio::spawn(import(server, database.clone(), input.schema_text.clone(), data_file.path.clone()));
+    let imported = match interruption.until_interrupted(import).await {
+        Ok(imported) => joined(imported),
+        Err(exit_code) => Err(Failure::interrupted_import(exit_code)),
+    };
+    imported.map_err(|failure| failure.keeping(data_file))?;
+    remove_file_if_exists(&data_file.path);
+    try_println!("Imported in {}.", format_duration(started.elapsed()));
+    Ok(())
+}
+
 async fn import(
-    settings: ConnectionSettings,
+    server: ConnectionSettings,
     database: String,
     schema: String,
     data_path: PathBuf,
 ) -> Result<(), Failure> {
-    let imported = match settings.connect().await {
+    let imported = match server.connect().await {
         Ok(driver) => driver.databases().import_from_file(&database, &schema, &data_path).await,
         Err(err) => Err(err),
     };
@@ -568,33 +625,6 @@ async fn import(
         };
         Failure::new(code, format!("import into '{database}' failed: {cause}"))
     })
-}
-
-fn kept_hint(data_path: &Path, import_command: &str) -> String {
-    format!(
-        "The prepared data file is kept: {}\nImport it without converting again with:\n  {import_command}",
-        data_path.display()
-    )
-}
-
-// Paths are made absolute so that the command can be run from anywhere.
-fn console_import_command(args: &Args, database: &str, schema_path: &str, data_path: &Path) -> String {
-    let mut command = String::from(CONSOLE_COMMAND);
-    if let Some(addresses) = &args.addresses {
-        command += &format!(" --address {addresses}");
-    }
-    if let Some(username) = &args.username {
-        command += &format!(" --username {username}");
-    }
-    if args.tls_disabled.unwrap_or(false) {
-        command += " --tls-disabled";
-    }
-    if let Some(root_ca) = &args.tls_root_ca {
-        command += &format!(" --tls-root-ca {root_ca}");
-    }
-    let schema_path = path::absolute(schema_path).unwrap_or_else(|_| PathBuf::from(schema_path));
-    let data_path = path::absolute(data_path).unwrap_or_else(|_| data_path.to_path_buf());
-    format!("{command} --command=\"database import {database} {} {}\"", schema_path.display(), data_path.display())
 }
 
 fn print_mapping(lines: &[String]) {

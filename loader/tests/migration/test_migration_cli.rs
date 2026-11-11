@@ -330,7 +330,6 @@ mod signals_and_concurrency {
             line.clear();
             assert!(stdout.read_line(&mut line)? > 0, "the loader ended before the checks began");
         }
-        std::thread::sleep(Duration::from_millis(500));
         assert!(Command::new("kill").args(["-TERM", &loader.id().to_string()]).status()?.success());
         let mut rest = String::new();
         stdout.read_to_string(&mut rest)?;

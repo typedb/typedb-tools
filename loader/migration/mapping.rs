@@ -691,10 +691,12 @@ fn element_type_problem(
     match element_type {
         ColumnType::Unsupported { hint } => Some(format!("has unsupported type {duckdb_type}: {hint}")),
         ColumnType::List(_) => Some("is a nested list, which has no TypeDB mapping".to_owned()),
-        ColumnType::Decimal { scale, .. } if *scale > DECIMAL_FRACTIONAL_DIGITS => Some(format!(
-            "has DECIMAL scale {scale}, beyond TypeDB's {DECIMAL_FRACTIONAL_DIGITS} fractional digits; DuckDB would \
-             round the values when reading them"
-        )),
+        ColumnType::Decimal { scale, .. } if value_type == ValueType::Decimal && *scale > DECIMAL_FRACTIONAL_DIGITS => {
+            Some(format!(
+                "has DECIMAL scale {scale}, beyond TypeDB's {DECIMAL_FRACTIONAL_DIGITS} fractional digits; DuckDB \
+                 would round the values when reading them"
+            ))
+        }
         _ if !can_populate(element_type, value_type) => {
             let reason = match element_type {
                 ColumnType::Varchar | ColumnType::ReadAsVarchar => "the loader never parses text into values",
@@ -837,10 +839,13 @@ fn parse_directive(comment: Option<&str>) -> Option<(String, &str)> {
     Some((keyword.to_ascii_lowercase(), argument.trim()))
 }
 
+// The prefix is a word of its own: `@typedb-team` starts an ordinary comment.
 fn strip_directive_prefix(comment: &str) -> Option<&str> {
     let comment = comment.trim();
     let prefix = comment.get(..DIRECTIVE_PREFIX.len())?;
-    prefix.eq_ignore_ascii_case(DIRECTIVE_PREFIX).then(|| comment[DIRECTIVE_PREFIX.len()..].trim())
+    let rest = &comment[DIRECTIVE_PREFIX.len()..];
+    let is_directive = prefix.eq_ignore_ascii_case(DIRECTIVE_PREFIX) && !rest.starts_with(|c: char| !c.is_whitespace());
+    is_directive.then(|| rest.trim())
 }
 
 fn parse_relation_directive(argument: &str) -> Result<TableDirective, String> {
@@ -856,4 +861,19 @@ fn parse_relation_directive(argument: &str) -> Result<TableDirective, String> {
         role_bindings.push(RoleBinding { role: role.trim().to_owned(), column: column.trim().to_owned() });
     }
     Ok(TableDirective::Relation { label, role_bindings })
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn a_directive_starts_with_the_prefix_as_a_word() {
+        assert_eq!(parse_directive(Some(" @TypeDB  Skip ")), Some(("skip".to_owned(), "")));
+        assert_eq!(parse_directive(Some("@typedb owns full-name")), Some(("owns".to_owned(), "full-name")));
+        assert_eq!(parse_directive(Some("@typedb")), Some((String::new(), "")));
+        assert_eq!(parse_directive(Some("@typedbskip")), None);
+        assert_eq!(parse_directive(Some("@typedb-team owns this column")), None);
+        assert_eq!(parse_directive(Some("loaded nightly")), None);
+    }
 }

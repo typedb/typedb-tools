@@ -222,6 +222,8 @@ fn open_duckdb(path: &Path, spill_dir: &Path) -> Result<Connection, PrepareError
         .and_then(|config| config.with(setting::AUTOINSTALL_KNOWN_EXTENSIONS, "false"))
         .and_then(|config| config.with(setting::AUTOLOAD_KNOWN_EXTENSIONS, "false"))
         .and_then(|config| config.with(setting::TEMP_DIRECTORY, spill_dir.to_string_lossy()))
+        // A vector of long strings can exceed the 2 GiB that 32-bit offsets address.
+        .and_then(|config| config.with(setting::ARROW_LARGE_BUFFER_SIZE, "true"))
         // No scan depends on the order of its rows; preserving it would keep DuckDB from spilling.
         .and_then(|config| config.with(setting::PRESERVE_INSERTION_ORDER, "false"))
         .and_then(|config| Connection::open_with_flags(path, config))

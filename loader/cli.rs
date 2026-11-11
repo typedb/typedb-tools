@@ -76,6 +76,7 @@ pub struct Args {
     pub query: Option<String>,
 
     /// Name of the database to load data into.
+    /// With --duckdb: the database to create, which must not exist yet. Default: the DuckDB file's stem.
     #[arg(long, visible_alias = "db", value_name = "database")]
     pub database: Option<String>,
 
@@ -138,6 +139,7 @@ pub struct Args {
 
     /// Path to a TypeQL schema file to run in a schema transaction before data loading.
     /// Ignored (with a warning) when resuming.
+    /// With --duckdb: required; the schema the tables are mapped onto and the database is created with.
     #[arg(long = "schema-file", value_name = "path to schema file (.tql)")]
     pub schema_file: Option<String>,
 

@@ -7,7 +7,7 @@
 use std::fmt;
 
 use duckdb::arrow::{
-    array::{Array, AsArray, BooleanArray, Date32Array, Decimal128Array, Float64Array, Int64Array, StringArray},
+    array::{Array, AsArray, BooleanArray, Date32Array, Decimal128Array, Float64Array, Int64Array, LargeStringArray},
     datatypes::{DataType, TimeUnit},
 };
 use typedb_cli_common::constants::{
@@ -30,6 +30,8 @@ pub(crate) const MIN_EPOCH_DAYS: i64 = -95_746_129 - EPOCH_DAYS_FROM_CE as i64;
 pub(crate) const MAX_EPOCH_DAYS: i64 = 95_745_399 - EPOCH_DAYS_FROM_CE as i64;
 pub(crate) const MIN_EPOCH_SECONDS: i64 = -8_334_601_228_800;
 pub(crate) const MAX_EPOCH_SECONDS: i64 = 8_210_266_876_799;
+// The months of chrono's years, which bound a TypeDB duration.
+pub(crate) const MAX_DURATION_MONTHS: u64 = 524_286 * MONTHS_IN_YEAR;
 // DuckDB prints UTC instants for TIMESTAMPTZ, and intervals as `[N year(s)] [N month(s)] [N day(s)] [-]H:MM:SS[.f]`.
 const TIMESTAMPTZ_TIMEZONE: &str = "UTC";
 const INTERVAL_YEAR: &str = "year";
@@ -120,7 +122,7 @@ impl<'a> ProjectedColumn<'a> {
         let (column, cells) = match &self.values {
             ProjectedValues::List { elements } if self.array.is_null(row) => (&**elements, 0..0),
             ProjectedValues::List { elements } => {
-                let offsets = self.array.as_list::<i32>().value_offsets();
+                let offsets = self.array.as_list::<i64>().value_offsets();
                 (&**elements, offsets[row] as usize..offsets[row + 1] as usize)
             }
             _ => (self, row..row + 1),
@@ -159,8 +161,8 @@ enum ProjectedValues<'a> {
     Integer(&'a Int64Array),
     Double(&'a Float64Array),
     Decimal(&'a Decimal128Array),
-    String(&'a StringArray),
-    Duration(&'a StringArray),
+    String(&'a LargeStringArray),
+    Duration(&'a LargeStringArray),
     Date(&'a Date32Array),
     Datetime { unit: TimeUnit, values: &'a [i64] },
     DatetimeTz { unit: TimeUnit, values: &'a [i64] },
@@ -170,15 +172,15 @@ enum ProjectedValues<'a> {
 impl<'a> ProjectedValues<'a> {
     fn of(array: &'a dyn Array, value_type: ValueType) -> Result<ProjectedValues<'a>, String> {
         Ok(match (array.data_type(), value_type) {
-            (DataType::List(_), _) => ProjectedValues::List {
-                elements: Box::new(ProjectedColumn::of(array.as_list::<i32>().values().as_ref(), value_type)?),
+            (DataType::LargeList(_), _) => ProjectedValues::List {
+                elements: Box::new(ProjectedColumn::of(array.as_list::<i64>().values().as_ref(), value_type)?),
             },
             (DataType::Boolean, ValueType::Boolean) => ProjectedValues::Boolean(array.as_boolean()),
             (DataType::Int64, ValueType::Integer) => ProjectedValues::Integer(array.as_primitive()),
             (DataType::Float64, ValueType::Double) => ProjectedValues::Double(array.as_primitive()),
             (DataType::Decimal128(_, _), ValueType::Decimal) => ProjectedValues::Decimal(array.as_primitive()),
-            (DataType::Utf8, ValueType::String) => ProjectedValues::String(array.as_string()),
-            (DataType::Utf8, ValueType::Duration) => ProjectedValues::Duration(array.as_string()),
+            (DataType::LargeUtf8, ValueType::String) => ProjectedValues::String(array.as_string()),
+            (DataType::LargeUtf8, ValueType::Duration) => ProjectedValues::Duration(array.as_string()),
             (DataType::Date32, ValueType::Date) => ProjectedValues::Date(array.as_primitive()),
             (&DataType::Timestamp(unit, _), ValueType::Datetime) => {
                 ProjectedValues::Datetime { unit, values: timestamp_values(array, unit) }
@@ -255,6 +257,9 @@ fn duration(text: &str) -> Result<TypeDBValue, String> {
     if months < 0 || days < 0 || micros < 0 {
         return Err(format!("negative INTERVAL '{text}' cannot be a TypeDB duration"));
     }
+    if months as u64 > MAX_DURATION_MONTHS {
+        return Err(format!("INTERVAL '{text}' has more months than TypeDB's duration range"));
+    }
     let nanos = u64::try_from(micros)
         .ok()
         .and_then(|micros| micros.checked_mul(NANOS_IN_MICRO))
@@ -294,7 +299,7 @@ fn timestamp_parts(unit: TimeUnit, raw: i64) -> Result<(i64, u32), String> {
 
 #[cfg(test)]
 mod test {
-    use duckdb::arrow::array::{ListArray, TimestampNanosecondArray, UInt64Array};
+    use duckdb::arrow::array::{LargeListArray, TimestampNanosecondArray, UInt64Array};
 
     use super::*;
 
@@ -376,7 +381,7 @@ mod test {
 
     #[test]
     fn lists_yield_their_elements_without_nulls() {
-        let list = ListArray::from_iter_primitive::<duckdb::arrow::datatypes::Int64Type, _, _>(vec![
+        let list = LargeListArray::from_iter_primitive::<duckdb::arrow::datatypes::Int64Type, _, _>(vec![
             Some(vec![Some(1), None, Some(3)]),
             None,
         ]);

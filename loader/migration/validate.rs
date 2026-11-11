@@ -15,7 +15,7 @@ use crate::{
     mapping::{MappingPlan, OwnershipColumn, RoleColumn, TableKind, TableMapping},
     schema::ValueType,
     sql::{self, IID_COLUMN, ROWID_COLUMN, value_condition},
-    value::{MAX_EPOCH_DAYS, MAX_EPOCH_SECONDS, MIN_EPOCH_DAYS, MIN_EPOCH_SECONDS},
+    value::{MAX_DURATION_MONTHS, MAX_EPOCH_DAYS, MAX_EPOCH_SECONDS, MIN_EPOCH_DAYS, MIN_EPOCH_SECONDS},
 };
 
 const EXAMPLES: usize = 3;
@@ -183,7 +183,8 @@ impl DataChecker<'_> {
             IdOrder::NotDense => return self.findings.error(format!(
                 "{subject}: the {IID_COLUMN}s of '{}' are not dense in row order, so the references cannot be checked; \
                  declare the column a FOREIGN KEY to '{}'({IID_COLUMN}), or number the rows of '{}' in order, as \
-                 `row_number() OVER ()` does",
+                 `row_number() OVER ()` does (rows deleted from a table leave gaps in its row order: copy it with \
+                 CREATE TABLE ... AS SELECT)",
                 player_table.name, player_table.name, player_table.name
             )),
         };
@@ -240,8 +241,8 @@ impl DataChecker<'_> {
                 ),
             ),
             ColumnType::Interval => (
-                "hold an interval with a negative part or a time part beyond TypeDB's duration range",
-                value_condition::interval_negative_or_beyond(u64::MAX / NANOS_IN_MICRO),
+                "hold an interval with a negative part, or with months or a time part beyond TypeDB's duration range",
+                value_condition::interval_negative_or_beyond(MAX_DURATION_MONTHS, u64::MAX / NANOS_IN_MICRO),
             ),
             ColumnType::Boolean
             | ColumnType::Integer { .. }

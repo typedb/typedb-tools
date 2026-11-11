@@ -29,14 +29,13 @@ pub(crate) fn install_shutdown_handler() -> Arc<AtomicBool> {
         termination.next_exit_code().await;
         shutdown_signal.store(true, Ordering::SeqCst);
         eprintln!("\nInterrupt received; finishing in-flight batches. Interrupt again to force exit.");
-        let exit_code = termination.next_exit_code().await;
-        eprintln!("Forcing exiting...");
-        std::process::exit(exit_code);
+        termination.force_exit_on_next().await
     });
     shutdown
 }
 
-// SIGINT and SIGTERM alike, as the exit code a shell reports for each. Once listening, none is missed.
+// SIGINT and SIGTERM alike (Ctrl+C on Windows), as the exit code a shell reports for each. Once listening, none is
+// missed.
 #[cfg(unix)]
 pub(crate) struct Termination {
     interrupt: tokio::signal::unix::Signal,
@@ -62,18 +61,30 @@ impl Termination {
     }
 }
 
-#[cfg(not(unix))]
-pub(crate) struct Termination;
+#[cfg(windows)]
+pub(crate) struct Termination {
+    interrupt: tokio::signal::windows::CtrlC,
+}
 
-#[cfg(not(unix))]
+#[cfg(windows)]
 impl Termination {
     pub(crate) fn listen() -> Self {
-        Self
+        Self { interrupt: tokio::signal::windows::ctrl_c().expect("failed to install the Ctrl+C handler") }
     }
 
     pub(crate) async fn next_exit_code(&mut self) -> i32 {
-        tokio::signal::ctrl_c().await.expect("failed to listen for Ctrl+C");
-        SIGINT_EXIT_CODE
+        match self.interrupt.recv().await {
+            Some(()) => SIGINT_EXIT_CODE,
+            None => std::future::pending().await,
+        }
+    }
+}
+
+impl Termination {
+    pub(crate) async fn force_exit_on_next(&mut self) -> ! {
+        let exit_code = self.next_exit_code().await;
+        eprintln!("\nForcing shutdown...");
+        std::process::exit(exit_code)
     }
 }
 
@@ -95,5 +106,9 @@ pub(crate) fn load_resume_checkpoint(args: &Args) -> Option<Checkpoint> {
 /// Returns the password supplied via --password, falling back to an interactive prompt that
 /// echoes the username so the user knows which credential is being requested.
 pub(crate) fn prompt_password_if_missing(args: &Args, username: &str) -> String {
-    args.password.clone().unwrap_or_else(|| rpassword::prompt_password(format!("password for '{username}': ")).unwrap())
+    args.password.clone().unwrap_or_else(|| {
+        rpassword::prompt_password(format!("password for '{username}': ")).unwrap_or_else(|err| {
+            fatal_with(ExitCode::UserInputError, format!("failed to read the password ({err}); pass --password"))
+        })
+    })
 }

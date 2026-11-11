@@ -8,11 +8,12 @@ use std::{
     env,
     error::Error,
     fs,
+    net::TcpStream,
     path::{Path, PathBuf},
     process::Child,
     sync::OnceLock,
     thread::sleep,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use typedb_binary_runner::runner::TypeDBBinaryRunner;
@@ -32,6 +33,7 @@ const QUERY_FRIENDSHIP_PATH_VAR: &str = "QUERY_FRIENDSHIP_PATH";
 const DATA_FRIENDSHIPS_PATH_VAR: &str = "DATA_FRIENDSHIPS_PATH";
 
 const SERVER_ADDRESS: &str = "localhost:1729";
+const SERVER_STARTUP_TIMEOUT: Duration = Duration::from_secs(60);
 const ADMIN_USERNAME: &str = "admin";
 const ADMIN_PASSWORD: &str = "password";
 
@@ -49,7 +51,7 @@ fn loader_loads_clean_csv() -> Result<(), Box<dyn Error>> {
     let schema_path = env::var(SCHEMA_PATH_VAR)?;
     let query_path = env::var(QUERY_PATH_VAR)?;
     let data_path_string = env::var(DATA_PATH_VAR)?;
-    let data_path = stage_data_file(&data_path_string)?;
+    let data_path = stage_data_file(database, &data_path_string)?;
     let data_path_str = data_path.to_string_lossy().into_owned();
 
     let loader_runner = TypeDBBinaryRunner::new(TYPEDB_LOADER_ARCHIVE_VAR, TYPEDB_LOADER_SUBCOMMAND)
@@ -99,7 +101,7 @@ fn loader_writes_rejects_for_bad_rows() -> Result<(), Box<dyn Error>> {
     let schema_path = env::var(SCHEMA_PATH_VAR)?;
     let query_path = env::var(QUERY_PATH_VAR)?;
     let data_path_string = env::var(DATA_WITH_REJECTS_PATH_VAR)?;
-    let data_path = stage_data_file(&data_path_string)?;
+    let data_path = stage_data_file(database, &data_path_string)?;
     let data_path_str = data_path.to_string_lossy().into_owned();
 
     let loader_runner = TypeDBBinaryRunner::new(TYPEDB_LOADER_ARCHIVE_VAR, TYPEDB_LOADER_SUBCOMMAND)
@@ -151,9 +153,9 @@ fn loader_loads_relation_match_insert() -> Result<(), Box<dyn Error>> {
     let schema_path = env::var(SCHEMA_WITH_FRIENDSHIPS_PATH_VAR)?;
     let people_query_path = env::var(QUERY_PATH_VAR)?;
     let friendship_query_path = env::var(QUERY_FRIENDSHIP_PATH_VAR)?;
-    let people_data = stage_data_file(&env::var(DATA_PATH_VAR)?)?;
+    let people_data = stage_data_file(database, &env::var(DATA_PATH_VAR)?)?;
     let people_data_str = people_data.to_string_lossy().into_owned();
-    let friendships_data = stage_data_file(&env::var(DATA_FRIENDSHIPS_PATH_VAR)?)?;
+    let friendships_data = stage_data_file(database, &env::var(DATA_FRIENDSHIPS_PATH_VAR)?)?;
     let friendships_data_str = friendships_data.to_string_lossy().into_owned();
 
     let loader_runner = TypeDBBinaryRunner::new(TYPEDB_LOADER_ARCHIVE_VAR, TYPEDB_LOADER_SUBCOMMAND)
@@ -290,17 +292,26 @@ fn ensure_typedb_server() {
         // note: run in development mode to avoid polluting analytics data when using tagged releases
         let args = ["--server.address", "0.0.0.0:1729", "--development-mode.enabled", "true"];
         let child: Child = runner.run(&args).expect("Failed to spawn child server process.");
-        sleep(Duration::from_secs(5));
+        await_server();
         Box::leak(Box::new((runner, child)));
     });
 }
 
+fn await_server() {
+    let deadline = Instant::now() + SERVER_STARTUP_TIMEOUT;
+    while TcpStream::connect(SERVER_ADDRESS).is_err() {
+        assert!(Instant::now() < deadline, "the server did not start listening on {SERVER_ADDRESS}");
+        sleep(Duration::from_millis(100));
+    }
+}
+
 // Copies the read-only Bazel runfile to a temp dir so the rejects sibling files can be written
-// next to it without polluting the source tree.
-fn stage_data_file(source: &str) -> Result<PathBuf, Box<dyn Error>> {
+// next to it without polluting the source tree. The dir is the test's own: tests run in parallel
+// and stage the same files.
+fn stage_data_file(database: &str, source: &str) -> Result<PathBuf, Box<dyn Error>> {
     let source_path = Path::new(source);
     let file_name = source_path.file_name().ok_or_else(|| format!("source data path has no file name: {source}"))?;
-    let staged_dir = env::temp_dir().join(format!("typedb-loader-test-{}", std::process::id()));
+    let staged_dir = env::temp_dir().join(format!("typedb-loader-test-{}", std::process::id())).join(database);
     fs::create_dir_all(&staged_dir)?;
     let staged = staged_dir.join(file_name);
     fs::copy(source_path, &staged)?;
