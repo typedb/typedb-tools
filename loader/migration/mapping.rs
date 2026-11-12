@@ -50,7 +50,9 @@ pub(crate) struct MappingPlan {
 
 impl MappingPlan {
     pub(crate) fn describe(&self) -> Vec<String> {
-        self.tables.iter().map(TableMapping::describe).collect()
+        let shares_type =
+            |table: &TableMapping| self.tables.iter().filter(|other| other.type_label == table.type_label).count() > 1;
+        self.tables.iter().map(|table| table.describe(shares_type(table))).collect()
     }
 }
 
@@ -72,9 +74,9 @@ impl TableMapping {
         }
     }
 
-    fn describe(&self) -> String {
+    fn describe(&self, shares_type: bool) -> String {
         let checked = |is_declared: bool| if is_declared { "declared" } else { "checked by the loader" };
-        let are_ids_declared = self.id_guarantees.is_unique && self.id_guarantees.is_not_null;
+        let are_ids_declared = self.id_guarantees.is_unique && self.id_guarantees.is_not_null && !shares_type;
         let (kind, roles, references) = match &self.kind {
             TableKind::Entity => (ObjectKind::Entity.name(), String::new(), String::new()),
             TableKind::Relation { roles } => {
@@ -845,12 +847,13 @@ fn parse_directive(comment: Option<&str>) -> Option<(String, &str)> {
     Some((keyword.to_ascii_lowercase(), argument.trim()))
 }
 
-// The prefix is a word of its own: `@typedb-team` starts an ordinary comment.
+// The prefix is a word of its own: `@typedb-team` starts an ordinary comment, `@typedb:skip` a malformed directive.
 fn strip_directive_prefix(comment: &str) -> Option<&str> {
     let comment = comment.trim();
     let prefix = comment.get(..DIRECTIVE_PREFIX.len())?;
     let rest = &comment[DIRECTIVE_PREFIX.len()..];
-    let is_directive = prefix.eq_ignore_ascii_case(DIRECTIVE_PREFIX) && !rest.starts_with(|c: char| !c.is_whitespace());
+    let is_word_continued = rest.starts_with(|c: char| c.is_alphanumeric() || c == '-' || c == '_');
+    let is_directive = prefix.eq_ignore_ascii_case(DIRECTIVE_PREFIX) && !is_word_continued;
     is_directive.then(|| rest.trim())
 }
 
@@ -880,6 +883,7 @@ mod test {
         assert_eq!(parse_directive(Some("@typedb")), Some((String::new(), "")));
         assert_eq!(parse_directive(Some("@typedbskip")), None);
         assert_eq!(parse_directive(Some("@typedb-team owns this column")), None);
+        assert_eq!(parse_directive(Some("@typedb:skip")), Some((":skip".to_owned(), "")));
         assert_eq!(parse_directive(Some("loaded nightly")), None);
     }
 }

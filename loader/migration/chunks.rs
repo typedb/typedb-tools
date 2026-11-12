@@ -39,7 +39,7 @@ pub(crate) fn encode_in_order<Encoded: Send>(
     let work = Arc::new(Mutex::new(work));
     let (results_sender, results) =
         mpsc::sync_channel::<mpsc::Receiver<Result<Encoded, String>>>(chunks_in_flight(workers));
-    // Set when reading fails or is cancelled: the chunks in flight are dropped rather than encoded and written.
+    // Set when reading or writing fails or is cancelled: the chunks in flight are dropped, not encoded and written.
     let is_abandoned = AtomicBool::new(false);
     let is_abandoned = &is_abandoned;
     thread::scope(|scope| {
@@ -61,7 +61,12 @@ pub(crate) fn encode_in_order<Encoded: Send>(
                 if is_abandoned.load(Ordering::Relaxed) {
                     break;
                 }
-                write(result_receiver.recv().map_err(|_| "an encoder panicked".to_owned())??)?;
+                let encoded = result_receiver.recv().map_err(|_| "an encoder panicked".to_owned());
+                let written = encoded.and_then(|encoded| write(encoded?));
+                if written.is_err() {
+                    is_abandoned.store(true, Ordering::Relaxed);
+                    return written;
+                }
             }
             Ok(())
         });
