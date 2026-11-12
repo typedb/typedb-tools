@@ -22,7 +22,9 @@ use crate::{
 mod checkpoint;
 mod cli;
 mod csv_reader;
+mod import_command;
 mod load;
+mod migrate;
 mod output;
 mod params;
 mod progress;
@@ -32,9 +34,19 @@ mod rejects;
 mod setup;
 mod startup;
 
+pub(crate) const VERSION: &str = include_str!("../VERSION");
+
 #[tokio::main]
 async fn main() {
     let args = Args::parse();
+    if args.duckdb.is_some() {
+        migrate::run_migration(&args).await;
+    } else {
+        run_load_command(args).await;
+    }
+}
+
+async fn run_load_command(args: Args) {
     let shutdown = install_shutdown_handler();
 
     let resume_checkpoint = load_resume_checkpoint(&args);
@@ -78,6 +90,7 @@ pub(crate) enum ExitCode {
     GeneralError = 1,
     UserInputError = 2,
     ConnectionError = 3,
+    MigrationError = 4,
 }
 
 pub(crate) fn fatal(message: impl AsRef<str>) -> ! {
@@ -85,6 +98,6 @@ pub(crate) fn fatal(message: impl AsRef<str>) -> ! {
 }
 
 pub(crate) fn fatal_with(code: ExitCode, message: impl AsRef<str>) -> ! {
-    eprintln!("error: {}", message.as_ref());
+    typedb_cli_common::println_error!("{}", message.as_ref());
     exit(code as i32);
 }

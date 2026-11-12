@@ -12,6 +12,7 @@ on:
   pull_request:
     paths:
       - 'loader/**'
+      - 'common/**'
       - 'tool/connect/**'
       - 'tool/runner/**'
       - 'Cargo.toml'
@@ -23,16 +24,33 @@ on:
       - 'deployment.bzl'
       - '.bazelversion'
       - '.github/workflows/test-loader.yml'
+  workflow_dispatch:
 
 permissions:
   contents: read
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   unit-tests:
-    name: Loader unit tests
-    runs-on: ubuntu-22.04
+    name: Loader unit tests (${{ matrix.platform }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { platform: linux-x86_64, runner: ubuntu-22.04 }
+          - { platform: mac-arm64, runner: macos-26 }
+          - { platform: mac-x86_64, runner: macos-26-intel }
+    env:
+      CARGO_BAZEL_GENERATOR_URL: https://repo.typedb.com/public/public-tools/raw/versions/0.0.0/cargo-bazel-${{ matrix.platform }}
     steps:
       - uses: actions/checkout@v4
+      # Bazel's git_repository deletes .git right after a fetch, which races git's detached background maintenance.
+      - run: git config --global maintenance.auto false && git config --global gc.auto 0
       - uses: bazel-contrib/setup-bazel@0.15.0
         with:
           bazelisk-cache: true
@@ -41,13 +59,28 @@ jobs:
           google-credentials: ${{ secrets.BAZEL_CACHE_CREDENTIAL_JSON }}
           bazelrc: |
             build --remote_cache https://storage.googleapis.com/typedb-engineers-bazel-remote-cache-europe-west1
+            build --remote_upload_local_results=${{ secrets.BAZEL_CACHE_CREDENTIAL_JSON != '' }}
       - run: bazel test //loader:loader-unit-tests --test_output=streamed
+      - run: bazel test //loader/migration:unit-tests //loader/migration:test-migration --test_output=streamed
+      - run: bazel test //loader/tests/migration:test-migration-cli --test_output=streamed
 
   assembly-tests:
-    name: Loader assembly tests
-    runs-on: ubuntu-22.04
+    name: Loader assembly tests (${{ matrix.platform }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { platform: linux-x86_64, runner: ubuntu-22.04 }
+          - { platform: mac-arm64, runner: macos-26 }
+          - { platform: mac-x86_64, runner: macos-26-intel }
+    env:
+      CARGO_BAZEL_GENERATOR_URL: https://repo.typedb.com/public/public-tools/raw/versions/0.0.0/cargo-bazel-${{ matrix.platform }}
     steps:
       - uses: actions/checkout@v4
+      # Bazel's git_repository deletes .git right after a fetch, which races git's detached background maintenance.
+      - run: git config --global maintenance.auto false && git config --global gc.auto 0
       - uses: bazel-contrib/setup-bazel@0.15.0
         with:
           bazelisk-cache: true
@@ -56,7 +89,5 @@ jobs:
           google-credentials: ${{ secrets.BAZEL_CACHE_CREDENTIAL_JSON }}
           bazelrc: |
             build --remote_cache https://storage.googleapis.com/typedb-engineers-bazel-remote-cache-europe-west1
-      - name: test loader assembly
-        env:
-          CARGO_BAZEL_GENERATOR_URL: https://repo.typedb.com/public/public-tools/raw/versions/0.0.0/cargo-bazel-linux-x86_64
-        run: bazel test //loader/tests/assembly:test-loader --test_output=streamed
+            build --remote_upload_local_results=${{ secrets.BAZEL_CACHE_CREDENTIAL_JSON != '' }}
+      - run: bazel test //loader/tests/assembly:test-loader --test_output=streamed

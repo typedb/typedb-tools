@@ -4,20 +4,80 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 
-use clap::Parser;
+use clap::{ArgGroup, Parser};
 
 pub const USERNAME_VALUE_NAME: &str = "username";
 
+const CSV_OPTIONS: [&str; 14] = [
+    "query",
+    "data",
+    "header",
+    "no_header",
+    "null_values",
+    "max_rows",
+    "batch_rows",
+    "parallel_batches",
+    "stop_on_error",
+    "no_stop_on_error",
+    "max_rejects",
+    "create_db",
+    "no_checkpoint",
+    "resume",
+];
+
 #[derive(Parser, Debug)]
-#[command(author, about)]
+#[command(author, about, group = ArgGroup::new("migration_options").multiple(true).conflicts_with_all(CSV_OPTIONS))]
 pub struct Args {
+    /// Migrate a DuckDB database instead of loading a CSV: its tables are mapped onto `--schema-file`,
+    /// converted and imported into a new `--database`.
+    #[arg(long, value_name = "path to DuckDB file", help_heading = "Migration", group = "migration_options")]
+    pub duckdb: Option<String>,
+
+    /// With --duckdb: write `<database>.data.typedb` into `--output-dir` without importing it.
+    #[arg(
+        long = "files-only",
+        default_value = "false",
+        help_heading = "Migration",
+        requires = "duckdb",
+        group = "migration_options"
+    )]
+    pub files_only: bool,
+
+    /// With --duckdb: map and convert the database, printing the mapping and the counts, without
+    /// writing or loading anything.
+    #[arg(
+        long = "dry-run",
+        default_value = "false",
+        help_heading = "Migration",
+        requires = "duckdb",
+        conflicts_with_all = ["files_only", "output_dir"],
+        group = "migration_options"
+    )]
+    pub dry_run: bool,
+
+    /// With --duckdb: the memory DuckDB may use before it spills to disk, such as `8GB` or `512MiB`.
+    /// Default: half of the memory DuckDB detects (the machine's, or a container's limit).
+    #[arg(
+        long = "memory-limit",
+        value_name = "size",
+        help_heading = "Migration",
+        requires = "duckdb",
+        group = "migration_options"
+    )]
+    pub memory_limit: Option<String>,
+
+    /// With --duckdb: replace an existing data file instead of refusing.
+    #[arg(long, default_value = "false", help_heading = "Migration", requires = "duckdb", group = "migration_options")]
+    pub overwrite: bool,
+
     /// Path to a TypeQL query file used as the loading template.
     /// File path can be absolute or relative to the current directory.
     #[arg(long, value_name = "path to query file (.tql)")]
     pub query: Option<String>,
 
     /// Name of the database to load data into.
-    #[arg(long, value_name = "database")]
+    /// With --duckdb: the database to create, which must not exist yet. Default: the DuckDB file's stem.
+    #[arg(long, visible_alias = "db", value_name = "database")]
     pub database: Option<String>,
 
     /// Path to the data file to load.
@@ -79,6 +139,7 @@ pub struct Args {
 
     /// Path to a TypeQL schema file to run in a schema transaction before data loading.
     /// Ignored (with a warning) when resuming.
+    /// With --duckdb: required; the schema the tables are mapped onto and the database is created with.
     #[arg(long = "schema-file", value_name = "path to schema file (.tql)")]
     pub schema_file: Option<String>,
 
@@ -109,9 +170,10 @@ pub struct Args {
     #[arg(long = "tls-root-ca", value_name = "path")]
     pub tls_root_ca: Option<String>,
 
-    /// Directory to write the loader's output into: `rejects.csv`, `rejects.log`, and
-    /// `checkpoint.json`. Created if it does not already exist.
-    /// Defaults to `loader_<data-file-stem>_progress` next to the data file.
+    /// Directory to write the loader's output into, created if it does not already exist.
+    /// From a CSV: `rejects.csv`, `rejects.log` and `checkpoint.json`, by default in
+    /// `loader_<data-file-stem>_progress` next to the data file.
+    /// With --duckdb: `<database>.data.typedb`, by default next to the DuckDB file.
     #[arg(long = "output-dir", value_name = "path to output directory")]
     pub output_dir: Option<String>,
 
@@ -124,4 +186,43 @@ pub struct Args {
     /// overridden on the command line.
     #[arg(long = "resume", value_name = "path to previous output directory")]
     pub resume: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::{CommandFactory, error::ErrorKind};
+
+    use super::{Args, CSV_OPTIONS};
+
+    #[test]
+    fn every_csv_option_conflicts_with_migration_options() {
+        let shared = [
+            "database",
+            "schema_file",
+            "addresses",
+            "username",
+            "password",
+            "tls_disabled",
+            "tls_root_ca",
+            "output_dir",
+        ];
+        let mut command = Args::command();
+        command.build(); // the group learns its members here
+        let group = command.get_groups().find(|group| group.get_id() == "migration_options").unwrap();
+        let migration: Vec<&str> = group.get_args().map(|id| id.as_str()).collect();
+        for arg in command.get_arguments().filter(|arg| arg.get_long() != Some("help")) {
+            let id = arg.get_id().as_str();
+            if shared.contains(&id) || migration.contains(&id) {
+                continue;
+            }
+            assert!(CSV_OPTIONS.contains(&id), "'{id}' is in neither list; add it to CSV_OPTIONS or to this test");
+            let option = format!("--{}", arg.get_long().unwrap());
+            let mut argv = vec!["typedb-loader", "--duckdb", "x.duckdb", &option];
+            if arg.get_action().takes_values() && arg.get_num_args().is_none_or(|range| range.min_values() > 0) {
+                argv.push("1");
+            }
+            let err = Args::command().try_get_matches_from(&argv).expect_err(&format!("{option} was accepted"));
+            assert_eq!(err.kind(), ErrorKind::ArgumentConflict, "{option}: {err}");
+        }
+    }
 }

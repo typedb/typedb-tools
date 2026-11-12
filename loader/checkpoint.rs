@@ -13,6 +13,7 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use typedb_cli_common::constants::MB;
 use typedb_driver::TypeDBDriver;
 
 use crate::{
@@ -237,7 +238,7 @@ impl CheckpointWriter {
 /// How many bytes of the data file to hash for the checkpoint integrity check. Hashing the whole
 /// file would dominate startup time on multi-GB inputs; the prefix plus the file's total length
 /// is enough to catch any realistic accidental change (truncation, prepend, header edit, swap).
-pub(crate) const HASH_PREFIX_BYTES: u64 = 64 * 1024 * 1024;
+pub(crate) const HASH_PREFIX_BYTES: u64 = 64 * MB;
 
 /// Hashes the first `HASH_PREFIX_BYTES` of the file and combines the result with the file's total
 /// length so that two files sharing a prefix but differing in size produce different hashes.
@@ -283,9 +284,9 @@ pub(crate) fn initialize_checkpoint(
         let hashes = hashes.as_ref().expect("resume requires checkpointing, which always produces hashes");
         let warnings = resume_warnings(params, prior, hashes);
         if !warnings.is_empty() {
-            eprintln!("\nResume warnings:");
+            eprintln!();
             for w in &warnings {
-                eprintln!("  - {w}");
+                typedb_cli_common::println_warning!("{w}");
             }
             if !confirm("Continue anyway?") {
                 fatal_with(ExitCode::UserInputError, "aborted: resume cancelled by user");

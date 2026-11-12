@@ -14,24 +14,78 @@ use std::{
 
 use crate::{ExitCode, checkpoint::Checkpoint, cli::Args, fatal, fatal_with, output::CHECKPOINT_FILENAME};
 
-/// Installs a Ctrl+C handler. First interrupt flips the returned flag so the main loop can
-/// drain in-flight batches and write a final checkpoint; second interrupt force-exits with 130.
+// What a shell reports for a process ended by the signal: 128 and the signal's number.
+const SIGINT_EXIT_CODE: i32 = 130;
+#[cfg(unix)]
+const SIGTERM_EXIT_CODE: i32 = 143;
+
+/// Installs the interrupt handler. The first interrupt flips the returned flag so the main loop can
+/// drain in-flight batches and write a final checkpoint; a second interrupt force-exits.
 pub(crate) fn install_shutdown_handler() -> Arc<AtomicBool> {
     let shutdown = Arc::new(AtomicBool::new(false));
+    let mut termination = Termination::listen();
     let shutdown_signal = shutdown.clone();
     tokio::spawn(async move {
-        if tokio::signal::ctrl_c().await.is_err() {
-            return;
-        }
+        termination.next_exit_code().await;
         shutdown_signal.store(true, Ordering::SeqCst);
-        eprintln!("\nInterrupt received; finishing in-flight batches. Press Ctrl+C again to force exit.");
-        if tokio::signal::ctrl_c().await.is_err() {
-            return;
-        }
-        eprintln!("Force-exiting.");
-        std::process::exit(130);
+        eprintln!("\nInterrupt received; finishing in-flight batches. Interrupt again to force exit.");
+        termination.force_exit_on_next().await
     });
     shutdown
+}
+
+// SIGINT and SIGTERM alike (Ctrl+C on Windows), as the exit code a shell reports for each. Once listening, none is
+// missed.
+#[cfg(unix)]
+pub(crate) struct Termination {
+    interrupt: tokio::signal::unix::Signal,
+    terminate: tokio::signal::unix::Signal,
+}
+
+#[cfg(unix)]
+impl Termination {
+    pub(crate) fn listen() -> Self {
+        use tokio::signal::unix::{SignalKind, signal};
+        Self {
+            interrupt: signal(SignalKind::interrupt()).expect("failed to install the SIGINT handler"),
+            terminate: signal(SignalKind::terminate()).expect("failed to install the SIGTERM handler"),
+        }
+    }
+
+    pub(crate) async fn next_exit_code(&mut self) -> i32 {
+        tokio::select! {
+            Some(()) = self.interrupt.recv() => SIGINT_EXIT_CODE,
+            Some(()) = self.terminate.recv() => SIGTERM_EXIT_CODE,
+            else => std::future::pending().await,
+        }
+    }
+}
+
+#[cfg(windows)]
+pub(crate) struct Termination {
+    interrupt: tokio::signal::windows::CtrlC,
+}
+
+#[cfg(windows)]
+impl Termination {
+    pub(crate) fn listen() -> Self {
+        Self { interrupt: tokio::signal::windows::ctrl_c().expect("failed to install the Ctrl+C handler") }
+    }
+
+    pub(crate) async fn next_exit_code(&mut self) -> i32 {
+        match self.interrupt.recv().await {
+            Some(()) => SIGINT_EXIT_CODE,
+            None => std::future::pending().await,
+        }
+    }
+}
+
+impl Termination {
+    pub(crate) async fn force_exit_on_next(&mut self) -> ! {
+        let exit_code = self.next_exit_code().await;
+        eprintln!("\nForcing shutdown...");
+        std::process::exit(exit_code)
+    }
 }
 
 /// Loads the prior checkpoint from --resume. Exits on conflict with --output-dir
@@ -52,5 +106,9 @@ pub(crate) fn load_resume_checkpoint(args: &Args) -> Option<Checkpoint> {
 /// Returns the password supplied via --password, falling back to an interactive prompt that
 /// echoes the username so the user knows which credential is being requested.
 pub(crate) fn prompt_password_if_missing(args: &Args, username: &str) -> String {
-    args.password.clone().unwrap_or_else(|| rpassword::prompt_password(format!("password for '{username}': ")).unwrap())
+    args.password.clone().unwrap_or_else(|| {
+        rpassword::prompt_password(format!("password for '{username}': ")).unwrap_or_else(|err| {
+            fatal_with(ExitCode::UserInputError, format!("failed to read the password ({err}); pass --password"))
+        })
+    })
 }
