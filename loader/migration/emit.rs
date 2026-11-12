@@ -508,7 +508,9 @@ fn compress(bytes: &[u8]) -> Result<Vec<u8>, String> {
     let compress_error = |err: std::io::Error| format!("failed to compress the output: {err}");
     let mut compressor = zstd::bulk::Compressor::new(COMPRESSION_LEVEL).map_err(compress_error)?;
     compressor.set_parameter(zstd::zstd_safe::CParameter::ChecksumFlag(true)).map_err(compress_error)?;
-    compressor.compress(bytes).map_err(compress_error)
+    let mut compressed = compressor.compress(bytes).map_err(compress_error)?;
+    compressed.shrink_to_fit();
+    Ok(compressed)
 }
 
 fn add_checksums(total: &mut Checksums, chunk: &Checksums) {

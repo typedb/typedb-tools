@@ -433,6 +433,7 @@ fn structure_and_mapping_errors_name_the_table_and_the_fix() -> Result<(), Box<d
             "table 'person': column 'x' cannot be a relation: relations are tables",
         ),
         ("COLUMN person.x IS '@typedb own x'", "table 'person': column 'x': unrecognised directive '@typedb own x'"),
+        ("COLUMN person.x IS '@typedb:skip'", "table 'person': column 'x': unrecognised directive '@typedb:skip'"),
     ];
     for (comment, fragment) in directives {
         check(&format!("CREATE TABLE person (_iid UBIGINT PRIMARY KEY, x INTEGER); COMMENT ON {comment}"), fragment)?;
@@ -1147,6 +1148,26 @@ fn instances_spanning_many_chunks_keep_their_iid() -> Result<(), Box<dyn Error>>
             );
         }
     }
+    Ok(())
+}
+
+#[test]
+fn ids_of_tables_sharing_a_type_are_reported_as_checked() -> Result<(), Box<dyn Error>> {
+    let dir = scratch(
+        "shared-type-summary",
+        "define\n  entity person;\n  entity company;\n",
+        "CREATE TABLE person (_iid UBIGINT PRIMARY KEY);
+         CREATE TABLE staff (_iid UBIGINT PRIMARY KEY);
+         COMMENT ON TABLE staff IS '@typedb entity person';
+         CREATE TABLE company (_iid UBIGINT PRIMARY KEY);",
+    )?;
+    let summary = prepare(&dir).map_err(|err| format!("{err:?}"))?.describe_mapping();
+    let ids = |table: &str| {
+        let line = summary.iter().find(|line| line.contains(&format!("table '{table}'"))).expect("a line per table");
+        line.rsplit_once("; ").expect("the guarantees come last").1.to_owned()
+    };
+    assert_eq!([ids("person"), ids("staff")], ["ids checked by the loader)", "ids checked by the loader)"]);
+    assert_eq!(ids("company"), "ids declared)");
     Ok(())
 }
 
