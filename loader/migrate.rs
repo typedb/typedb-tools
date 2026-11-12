@@ -30,6 +30,7 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
 const ALREADY_EXISTS: &str = "DBC6";
 const IS_BEING_IMPORTED: &str = "DBC8";
+const INTERNAL_DATABASE_PREFIX: &str = "_";
 const DUCKDB_SPILL_FILE_PREFIX: &str = "duckdb_temp_";
 const CURRENT_DIRECTORY: &str = ".";
 
@@ -106,7 +107,8 @@ fn database_name(args: &Args, duckdb_path: &Path) -> Result<String, Failure> {
         let stem = duckdb_path.file_stem().expect("the source was checked to be a file, which has a name");
         stem.to_string_lossy().into_owned()
     });
-    if !args.dry_run && !typeql::common::identifier::is_valid_label(&name) {
+    let is_valid = typeql::common::identifier::is_valid_label(&name) && !name.starts_with(INTERNAL_DATABASE_PREFIX);
+    if !args.dry_run && !is_valid {
         let origin = if args.database.is_some() { "" } else { " (taken from the file name; pass --database)" };
         let message = format!("'{name}' is not a valid TypeDB database name{origin}");
         return Err(Failure::new(ExitCode::UserInputError, message));

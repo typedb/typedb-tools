@@ -417,6 +417,10 @@ fn structure_and_mapping_errors_name_the_table_and_the_fix() -> Result<(), Box<d
             "CREATE TABLE stranger (_iid UBIGINT PRIMARY KEY)",
             "table 'stranger' has no matching entity or relation type",
         ),
+        (
+            "CREATE TABLE person (_iid UBIGINT PRIMARY KEY, photo BLOB)",
+            "table 'person': column 'photo' has unsupported type BLOB",
+        ),
     ];
     for (sql, fragment) in tables {
         check(sql, fragment)?;
@@ -499,7 +503,7 @@ fn every_column_type_feeds_attributes_and_ownerships_alike() -> Result<(), Box<d
             "ratio=Some(Double(1.0))",
             "ratio=Some(Double(2.0))",
             "seen=Some(DatetimeTz(DatetimeTz { datetime: Some(Datetime { seconds: 1577829600, nanos: 0 }), \
-             timezone: Some(Named(\"UTC\")) }))",
+             timezone: Some(Offset(0)) }))",
         ]
     );
     let ownerships: usize = items
@@ -1168,6 +1172,23 @@ fn ids_of_tables_sharing_a_type_are_reported_as_checked() -> Result<(), Box<dyn 
     };
     assert_eq!([ids("person"), ids("staff")], ["ids checked by the loader)", "ids checked by the loader)"]);
     assert_eq!(ids("company"), "ids declared)");
+    Ok(())
+}
+
+#[test]
+fn references_declared_for_some_columns_are_reported_as_both() -> Result<(), Box<dyn Error>> {
+    let dir = scratch(
+        "mixed-references",
+        "define\n  entity person, plays pair:member;\n  relation pair, relates member;\n",
+        "CREATE TABLE person (_iid UBIGINT PRIMARY KEY);
+         CREATE TABLE pair (_iid UBIGINT PRIMARY KEY, a UBIGINT REFERENCES person(_iid), b UBIGINT);
+         COMMENT ON COLUMN pair.b IS '@typedb references person';",
+    )?;
+    let summary = prepare(&dir).map_err(|err| format!("{err:?}"))?.describe_mapping();
+    assert!(
+        summary.iter().any(|line| line.ends_with("; ids declared, references declared and checked by the loader)")),
+        "{summary:#?}"
+    );
     Ok(())
 }
 

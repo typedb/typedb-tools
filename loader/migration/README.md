@@ -30,8 +30,8 @@ CREATE TABLE company AS SELECT id::UBIGINT AS _iid, name FROM src.company;
 
 Copied tables carry no keys. Either create the tables with their keys and insert into them, or mark each role column
 `@typedb references <table>` and number the referenced table's rows with `row_number() OVER ()`
-([Keys](#keys-are-optional)). A non-negative integer primary key, declared as one, can serve as `_iid`, and the
-foreign key columns then already hold `_iid` values.
+([Keys](#keys-are-optional)). A non-negative integer primary key can serve as `_iid` once it and the
+columns referencing it are cast to `UBIGINT`.
 
 ## DuckDB versions
 
@@ -108,7 +108,8 @@ define
   relation mentorship, relates mentor, relates student;
 ```
 
-Directives are DuckDB comments, kept in the file:
+Directives are DuckDB comments, kept in the file. A directive is the whole comment. A role that takes several columns
+is listed once per column: `(signer = org_id, signer = charity_id)`.
 
 | Directive | On | Effect |
 |---|---|---|
@@ -129,7 +130,7 @@ Directives are DuckDB comments, kept in the file:
 | `VARCHAR`, `ENUM`, `UUID`, `JSON` | `string` | compared byte-wise whatever the collation: `'Bob'` and `'BOB'` are two values |
 | `DATE` | `date` | finite, years -262143 to 262142 |
 | `TIMESTAMP`, `_S`, `_MS`, `_NS` | `datetime` | exact to the nanosecond, finite |
-| `TIMESTAMPTZ`, `TIMESTAMPTZ_NS` | `datetime-tz` | as `datetime`, in UTC: DuckDB stores the instant, not the zone |
+| `TIMESTAMPTZ`, `TIMESTAMPTZ_NS` | `datetime-tz` | as `datetime`, at offset zero (`2024-02-29T12:00:00Z`): DuckDB stores the instant, not the zone |
 | `INTERVAL` | `duration` | months, days and nanoseconds kept apart (`1 month` and `30 days` are two values). No negative parts, at most 6291432 months (524286 years), and a time part below 2^64 ns (584 years) |
 | `BLOB`, `TIME`, `STRUCT`, `MAP`, `UNION`, `UHUGEINT`, fixed-size `ARRAY`, nested lists, others | | refused |
 
@@ -148,7 +149,8 @@ mapping summary says which are declared and which are checked.
 Without a `FOREIGN KEY`, the `_iid`s of the referenced table must be dense in row order, `first, first + 1, ...`, as
 `row_number() OVER ()` numbers the rows while DuckDB preserves insertion order (its default). One scan then proves
 them unique, and every reference is checked against their range. Other ids of a referenced table are refused, and
-so is a table that had rows deleted, whose row order keeps the gaps: copy it with `CREATE TABLE ... AS SELECT`. The
+so is a table that had rows deleted or updated, which leaves gaps or moves rows: copy it with
+`CREATE TABLE ... AS SELECT`. The
 ids of a table that no such column references may be anything: their uniqueness takes a GROUP BY, which spills to
 disk on large data.
 
@@ -188,7 +190,9 @@ written, and every error is reported, each data violation with a count and a few
 | an interval has no negative part, at most 6291432 months, and a time part below 2^64 ns | `INTERVAL` columns | |
 
 The schema's constraints (`@card`, `@key`, `@unique`, `@regex`, `@values`, `@range`) are the server's to enforce at
-import. Equal values are one attribute, and a player named twice in a role is one player.
+import, and so is the schema itself: `--dry-run` reads it but does not prove that the server accepts it. A violation
+names the instance by its iid, whose last eight bytes are the row's `_iid`. Equal values are one attribute, and a
+player named twice in a role is one player.
 
 ## Ids
 
@@ -201,10 +205,13 @@ referencing them.
 
 DuckDB gets half of the memory it detects (the machine's, or the container's limit) unless `--memory-limit` sets
 another limit (`8GB`, `512MiB`, at least 512 MiB). It runs a thread per 64 MB of the limit, up to one per core, and
-spills what does not fit. The conversion needs one to two GB more for its own buffers.
+spills what does not fit. The conversion needs one to two GB more for its own buffers. Two things do not spill: a
+single value, so a column of multi-megabyte strings or lists needs a limit of several times the largest value, and a
+row, which is converted as a whole, at about 300 bytes per element of its `LIST` columns.
 
 The output directory needs room for the data file and for DuckDB's spill. `--dry-run` spills into the system's
-temporary directory (`TMPDIR`), as `.typedb-loader.<process id>.tmp`, which a killed dry run leaves behind. With
+temporary directory (`TMPDIR`), as `.typedb-loader.<process id>.tmp`, which a killed or force-stopped dry run leaves
+behind. With
 `--overwrite` the old file stays until the new one replaces it.
 
 ## The data file and the import
@@ -223,11 +230,13 @@ which stays, makes a second one fail at once, and the next run removes what a ru
 
 The import starts once the file is complete, over a fresh connection. A successful import removes the file. A failed
 import keeps it, and the loader prints the `typedb console` command that imports it, quoted for the shell. The
-console reads each path as one word, so the command works only for paths without spaces.
+console reads each path as one word, so the command works only for paths without spaces. When the data was at
+fault, fix it and run the loader again with `--overwrite`.
 
 Ctrl+C or SIGTERM stops the run. An interrupted conversion removes what it wrote. An interrupted import keeps the
-data file, and the server discards the partial import. A second interrupt exits at once, and the next run removes
-what it left.
+data file, and the server discards the partial import, which on a large one takes it a while: until then it refuses
+another import of that database. A second interrupt exits at once, and the next run removes what it left in the
+output directory.
 
 | Exit code | Meaning |
 |---|---|

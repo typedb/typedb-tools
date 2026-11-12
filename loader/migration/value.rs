@@ -32,8 +32,7 @@ pub(crate) const MIN_EPOCH_SECONDS: i64 = -8_334_601_228_800;
 pub(crate) const MAX_EPOCH_SECONDS: i64 = 8_210_266_876_799;
 // The months of chrono's years, which bound a TypeDB duration.
 pub(crate) const MAX_DURATION_MONTHS: u64 = 524_286 * MONTHS_IN_YEAR;
-// DuckDB prints UTC instants for TIMESTAMPTZ, and intervals as `[N year(s)] [N month(s)] [N day(s)] [-]H:MM:SS[.f]`.
-const TIMESTAMPTZ_TIMEZONE: &str = "UTC";
+// DuckDB prints intervals as `[N year(s)] [N month(s)] [N day(s)] [-]H:MM:SS[.f]`.
 const INTERVAL_YEAR: &str = "year";
 const INTERVAL_MONTH: &str = "month";
 const INTERVAL_DAY: &str = "day";
@@ -68,7 +67,7 @@ impl TypeDBValue {
             TypeDBValue::Datetime { seconds, nanos } => ProtoValue::Datetime(proto_value::Datetime { seconds, nanos }),
             TypeDBValue::DatetimeTz { seconds, nanos } => ProtoValue::DatetimeTz(proto_value::DatetimeTz {
                 datetime: Some(proto_value::Datetime { seconds, nanos }),
-                timezone: Some(proto_value::datetime_tz::Timezone::Named(TIMESTAMPTZ_TIMEZONE.to_owned())),
+                timezone: Some(proto_value::datetime_tz::Timezone::Offset(0)),
             }),
             TypeDBValue::Duration { months, days, nanos } => {
                 ProtoValue::Duration(proto_value::Duration { months, days, nanos })
