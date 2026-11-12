@@ -178,7 +178,9 @@ impl<'a> ProjectedValues<'a> {
             (DataType::Boolean, ValueType::Boolean) => ProjectedValues::Boolean(array.as_boolean()),
             (DataType::Int64, ValueType::Integer) => ProjectedValues::Integer(array.as_primitive()),
             (DataType::Float64, ValueType::Double) => ProjectedValues::Double(array.as_primitive()),
-            (DataType::Decimal128(_, _), ValueType::Decimal) => ProjectedValues::Decimal(array.as_primitive()),
+            (&DataType::Decimal128(_, scale), ValueType::Decimal) if scale == DECIMAL_FRACTIONAL_DIGITS as i8 => {
+                ProjectedValues::Decimal(array.as_primitive())
+            }
             (DataType::LargeUtf8, ValueType::String) => ProjectedValues::String(array.as_string()),
             (DataType::LargeUtf8, ValueType::Duration) => ProjectedValues::Duration(array.as_string()),
             (DataType::Date32, ValueType::Date) => ProjectedValues::Date(array.as_primitive()),

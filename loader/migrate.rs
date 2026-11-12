@@ -463,7 +463,7 @@ async fn prepare(
             let message = format!("validation failed with {} error(s); nothing was written", errors.len());
             Err(Failure::new(ExitCode::UserInputError, message))
         }
-        Err(PrepareError::Cancelled) => Err(Failure::new(ExitCode::GeneralError, "the checks were cancelled")),
+        Err(PrepareError::Cancelled) => unreachable!("only an interrupt cancels the checks, and it is reported above"),
     }
 }
 
@@ -481,7 +481,7 @@ async fn convert(
         .run_cancellable(move || {
             let started = Instant::now();
             let checksums = match &data_path {
-                None => migration.run(io::sink(), VERSION.trim(), &original_database, &progress),
+                None => migration.convert(io::sink(), VERSION.trim(), &original_database, &progress),
                 Some(path) => write_data_file(&migration, path, &original_database, &progress),
             };
             drop(migration);
@@ -511,7 +511,7 @@ fn write_data_file(
         .open(&partial_path)
         .map_err(|err| format!("failed to create '{}': {err}", partial_path.display()))?;
     let partial = PartialFile(partial_path);
-    let checksums = migration.run(&mut file, VERSION.trim(), original_database, progress)?;
+    let checksums = migration.convert(&mut file, VERSION.trim(), original_database, progress)?;
     file.sync_all().map_err(|err| format!("failed to write '{}': {err}", partial.0.display()))?;
     fs::rename(&partial.0, path)
         .map_err(|err| format!("failed to move the data file into '{}': {err}", path.display()))?;
