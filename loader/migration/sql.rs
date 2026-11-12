@@ -37,13 +37,13 @@ pub(crate) mod catalog {
          UNION ALL SELECT 'view ' || schema_name || '.' || view_name FROM duckdb_views() \
          WHERE NOT internal AND NOT temporary ORDER BY 1";
 
-    pub(crate) const TABLE_COLUMNS: &str = "SELECT c.column_name, c.data_type, c.comment, i.is_generated = 'ALWAYS' \
-         FROM duckdb_columns() c JOIN system.information_schema.columns i ON i.table_schema = c.schema_name \
-         AND i.table_name = c.table_name AND i.column_name = c.column_name \
-         WHERE c.schema_name = 'main' AND c.table_name = ? ORDER BY c.column_index";
+    pub(crate) const MAIN_COLUMNS: &str = "SELECT c.table_name, c.column_name, c.data_type, c.comment, \
+         i.is_generated = 'ALWAYS' FROM duckdb_columns() c JOIN system.information_schema.columns i \
+         ON i.table_schema = c.schema_name AND i.table_name = c.table_name AND i.column_name = c.column_name \
+         WHERE c.schema_name = 'main' AND NOT c.internal ORDER BY c.table_name, c.column_index";
 
-    pub(crate) const TABLE_CONSTRAINTS: &str = "SELECT constraint_type, constraint_column_names, referenced_table, \
-         referenced_column_names FROM duckdb_constraints() WHERE schema_name = 'main' AND table_name = ?";
+    pub(crate) const MAIN_CONSTRAINTS: &str = "SELECT table_name, constraint_type, constraint_column_names, \
+         referenced_table, referenced_column_names FROM duckdb_constraints() WHERE schema_name = 'main'";
 }
 
 pub(crate) mod setting {

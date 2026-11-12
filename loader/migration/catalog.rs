@@ -4,7 +4,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use duckdb::{
     Connection,
@@ -25,11 +25,11 @@ pub(crate) struct Catalog {
 impl Catalog {
     pub(crate) fn read(connection: &Connection) -> Result<Catalog, String> {
         let mut tables = read_main_tables(connection).map_err(|err| format!("failed to list tables: {err}"))?;
-        for table in &mut tables {
-            read_columns(connection, table)
-                .and_then(|()| read_constraints(connection, table))
-                .map_err(|err| format!("failed to read table '{}': {err}", table.name))?;
-        }
+        let indices: HashMap<String, usize> =
+            tables.iter().enumerate().map(|(index, table)| (table.name.clone(), index)).collect();
+        read_columns(connection, &mut tables, &indices)
+            .and_then(|()| read_constraints(connection, &mut tables, &indices))
+            .map_err(|err| format!("failed to read the tables' columns and constraints: {err}"))?;
         let ignored_tables_and_views = read_ignored_tables_and_views(connection)
             .map_err(|err| format!("failed to list schemas and views: {err}"))?;
         Ok(Catalog { tables, ignored_tables_and_views })
@@ -191,37 +191,44 @@ fn read_main_tables(connection: &Connection) -> duckdb::Result<Vec<Table>> {
     tables.collect()
 }
 
-fn read_columns(connection: &Connection, table: &mut Table) -> duckdb::Result<()> {
-    let mut statement = connection.prepare(sql::catalog::TABLE_COLUMNS)?;
-    let mut rows = statement.query([&table.name])?;
+fn read_columns(connection: &Connection, tables: &mut [Table], indices: &HashMap<String, usize>) -> duckdb::Result<()> {
+    let mut statement = connection.prepare(sql::catalog::MAIN_COLUMNS)?;
+    let mut rows = statement.query([])?;
     while let Some(row) = rows.next()? {
-        let name: String = row.get(0)?;
-        let duckdb_type: String = row.get(1)?;
-        table.columns.push(Column {
+        let Some(&index) = indices.get(&row.get::<_, String>(0)?) else { continue };
+        let name: String = row.get(1)?;
+        let duckdb_type: String = row.get(2)?;
+        tables[index].columns.push(Column {
             // DuckDB resolves names case-insensitively, so `_IID` is the id column too.
             name: if name.eq_ignore_ascii_case(IID_COLUMN) { IID_COLUMN.to_owned() } else { name },
             column_type: ColumnType::parse(&duckdb_type),
             duckdb_type,
-            comment: row.get(2)?,
-            is_generated: row.get(3)?,
+            comment: row.get(3)?,
+            is_generated: row.get(4)?,
         });
     }
     Ok(())
 }
 
-fn read_constraints(connection: &Connection, table: &mut Table) -> duckdb::Result<()> {
-    let mut statement = connection.prepare(sql::catalog::TABLE_CONSTRAINTS)?;
-    let mut rows = statement.query([&table.name])?;
+fn read_constraints(
+    connection: &Connection,
+    tables: &mut [Table],
+    indices: &HashMap<String, usize>,
+) -> duckdb::Result<()> {
+    let mut statement = connection.prepare(sql::catalog::MAIN_CONSTRAINTS)?;
+    let mut rows = statement.query([])?;
     while let Some(row) = rows.next()? {
-        let constraint_type: String = row.get(0)?;
-        let columns = text_list(row.get_ref(1)?).into_iter().map(|name| table.declared_column_name(name)).collect();
+        let Some(&index) = indices.get(&row.get::<_, String>(0)?) else { continue };
+        let table = &mut tables[index];
+        let constraint_type: String = row.get(1)?;
+        let columns = text_list(row.get_ref(2)?).into_iter().map(|name| table.declared_column_name(name)).collect();
         match constraint_type.as_str() {
             "PRIMARY KEY" => table.primary_key = columns,
             "UNIQUE" => table.unique_column_sets.push(columns),
             "NOT NULL" => table.not_null_columns.extend(columns),
             "FOREIGN KEY" => {
-                let referenced_table = row.get(2)?;
-                let referenced_columns = text_list(row.get_ref(3)?);
+                let referenced_table = row.get(3)?;
+                let referenced_columns = text_list(row.get_ref(4)?);
                 table.foreign_keys.push(ForeignKey { columns, referenced_table, referenced_columns });
             }
             _ => {}
@@ -326,12 +333,8 @@ mod test {
                 declared.join(", ")
             ))
             .unwrap();
-        let mut found = Vec::new();
-        for name in ["t", "u"] {
-            let mut table = Table::without_columns(name.to_owned(), None);
-            read_columns(&connection, &mut table).unwrap();
-            found.extend(table.columns);
-        }
+        let tables = Catalog::read(&connection).unwrap().tables;
+        let found: Vec<Column> = tables.into_iter().flat_map(|table| table.columns).collect();
         let expected = types
             .iter()
             .filter(|(_, declared, _)| !declared.is_empty())

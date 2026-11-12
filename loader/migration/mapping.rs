@@ -29,7 +29,7 @@ const RELATION_IS_A_TABLE: &str = "relations are tables; stage the relation as i
 pub(crate) fn resolve(catalog: &Catalog, schema: &Schema, findings: &mut Findings) -> MappingPlan {
     for ignored in &catalog.ignored_tables_and_views {
         findings.warning(format!(
-            "{ignored} is not loaded: only tables of the 'main' schema are read (materialise a view as a table)"
+            "{ignored} is not loaded: only tables of the 'main' schema are read (copy it into 'main' as a table)"
         ));
     }
     let targets = table_targets(catalog, schema, findings);
@@ -80,8 +80,12 @@ impl TableMapping {
         let (kind, roles, references) = match &self.kind {
             TableKind::Entity => (ObjectKind::Entity.name(), String::new(), String::new()),
             TableKind::Relation { roles } => {
-                let are_references_declared = roles.iter().all(|role| role.is_reference_declared);
-                let references = format!(", references {}", checked(are_references_declared));
+                let references = match roles.iter().filter(|role| role.is_reference_declared).count() {
+                    declared if declared == roles.len() => checked(true),
+                    0 => checked(false),
+                    _ => "declared and checked by the loader",
+                };
+                let references = format!(", references {references}");
                 (ObjectKind::Relation.name(), format!(", {} role column(s)", roles.len()), references)
             }
         };
@@ -223,8 +227,8 @@ fn directive_implied_by_name(table: &Table, schema: &Schema, findings: &mut Find
         Some((label, ObjectKind::Relation)) => Some(TableDirective::Relation { label, role_bindings: Vec::new() }),
         None => {
             findings.error(format!(
-                "table '{}' has no matching entity or relation type in the TypeDB schema \
-                 (add the type, or mark the table '@typedb skip')",
+                "table '{}' has no matching entity or relation type in the TypeDB schema (add the type, or mark the \
+                 table '@typedb skip' / '@typedb entity <label>' / '@typedb relation <label>')",
                 table.name
             ));
             None
@@ -533,6 +537,16 @@ impl<'a, 'f> TableMapper<'a, 'f> {
     fn bind_ownership(&mut self, column: &Column, named_attribute: Option<&str>) {
         let (target, schema) = (self.target, self.schema);
         let (table_name, owner) = (&target.table.name, &target.object.label);
+        let (element_type, is_list) = match &column.column_type {
+            ColumnType::List(element) => (element.as_ref(), true),
+            other => (other, false),
+        };
+        if let ColumnType::Unsupported { hint } = element_type {
+            return self.findings.error(format!(
+                "table '{table_name}': column '{}' has unsupported type {}: {hint}",
+                column.name, column.duckdb_type
+            ));
+        }
         let attribute_label = match named_attribute {
             Some(label) => label.to_owned(),
             None => {
@@ -597,10 +611,6 @@ impl<'a, 'f> TableMapper<'a, 'f> {
                     column.name
                 ));
             }
-        };
-        let (element_type, is_list) = match &column.column_type {
-            ColumnType::List(element) => (element.as_ref(), true),
-            other => (other, false),
         };
         if let Some(problem) = element_type_problem(column, element_type, value_type, &attribute_label) {
             return self.findings.error(format!("table '{table_name}': column '{}' {problem}", column.name));
@@ -694,7 +704,6 @@ fn element_type_problem(
 ) -> Option<String> {
     let duckdb_type = &column.duckdb_type;
     match element_type {
-        ColumnType::Unsupported { hint } => Some(format!("has unsupported type {duckdb_type}: {hint}")),
         ColumnType::List(_) => Some("is a nested list, which has no TypeDB mapping".to_owned()),
         ColumnType::Decimal { scale, .. } if value_type == ValueType::Decimal && *scale > DECIMAL_FRACTIONAL_DIGITS => {
             Some(format!(

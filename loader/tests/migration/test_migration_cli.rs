@@ -167,14 +167,17 @@ fn files_of_other_formats_point_to_staging_them() -> Result<(), Box<dyn Error>> 
 fn invalid_database_names_fail_before_converting() -> Result<(), Box<dyn Error>> {
     let dir = setup("name")?;
     let out = dir.join("out").to_string_lossy().into_owned();
-    let output = Command::new(loader_binary())
-        .args(["--duckdb", &dir.join("fixture.duckdb").to_string_lossy(), "--schema-file"])
-        .arg(dir.join("schema.tql"))
-        .args(["--database", "my data", "--files-only", "--output-dir", &out])
-        .output()?;
-    assert_eq!(output.status.code(), Some(2), "user-input error exit code expected");
-    assert!(String::from_utf8_lossy(&output.stderr).contains("'my data' is not a valid TypeDB database name"));
-    assert!(!dir.join("out").exists(), "nothing is written for an invalid name");
+    for name in ["my data", "_internal"] {
+        let output = Command::new(loader_binary())
+            .args(["--duckdb", &dir.join("fixture.duckdb").to_string_lossy(), "--schema-file"])
+            .arg(dir.join("schema.tql"))
+            .args(["--database", name, "--files-only", "--output-dir", &out])
+            .output()?;
+        assert_eq!(output.status.code(), Some(2), "user-input error exit code expected");
+        let expected = format!("'{name}' is not a valid TypeDB database name");
+        assert!(String::from_utf8_lossy(&output.stderr).contains(&expected));
+        assert!(!dir.join("out").exists(), "nothing is written for an invalid name");
+    }
 
     let _ = fs::remove_dir_all(&dir);
     Ok(())

@@ -183,7 +183,7 @@ impl DataChecker<'_> {
             IdOrder::NotDense => return self.findings.error(format!(
                 "{subject}: the {IID_COLUMN}s of '{}' are not dense in row order, so the references cannot be checked; \
                  declare the column a FOREIGN KEY to '{}'({IID_COLUMN}), or number the rows of '{}' in order, as \
-                 `row_number() OVER ()` does (rows deleted from a table leave gaps in its row order: copy it with \
+                 `row_number() OVER ()` does (deleted or updated rows leave gaps in a table's row order: copy it with \
                  CREATE TABLE ... AS SELECT)",
                 player_table.name, player_table.name, player_table.name
             )),
