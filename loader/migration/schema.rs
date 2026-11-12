@@ -51,15 +51,16 @@ impl Schema {
         self.objects.iter().find(|object| object.label == label && object.kind == kind)
     }
 
-    pub(crate) fn value_type(&self, attribute: &AttributeType) -> Option<ValueType> {
+    pub(crate) fn value_type<'a>(&'a self, attribute: &'a AttributeType) -> Option<&'a AttributeValueType> {
         let supertype = |attribute: &AttributeType| self.attribute(attribute.supertype.as_deref()?);
         std::iter::successors(Some(attribute), |attribute| supertype(attribute))
             .take(self.attributes.len())
-            .find_map(|attribute| attribute.value_type)
+            .find_map(|attribute| attribute.value_type.as_ref())
     }
 
-    pub(crate) fn owns(&self, object: &ObjectType, attribute: &str) -> bool {
-        self.object_and_supertypes(object).any(|object| object.owns.iter().any(|owned| owned == attribute))
+    pub(crate) fn owns<'a>(&'a self, object: &'a ObjectType, attribute: &str) -> Option<&'a Owns> {
+        self.object_and_supertypes(object)
+            .find_map(|object| object.owns.iter().find(|owns| owns.attribute == attribute))
     }
 
     pub(crate) fn plays<'a>(&'a self, object: &'a ObjectType) -> impl Iterator<Item = &'a Plays> {
@@ -175,7 +176,7 @@ pub(crate) struct AttributeType {
     pub(crate) label: String,
     pub(crate) is_abstract: bool,
     pub(crate) supertype: Option<String>,
-    pub(crate) value_type: Option<ValueType>,
+    pub(crate) value_type: Option<AttributeValueType>,
 }
 
 impl AttributeType {
@@ -186,9 +187,7 @@ impl AttributeType {
     fn apply(&mut self, capability: Capability) -> Result<(), String> {
         match capability.base {
             CapabilityBase::Sub(sub) => self.supertype = Some(sub.supertype_label.ident.to_string()),
-            CapabilityBase::ValueType(value_type) => {
-                self.value_type = Some(parse_value_type(&value_type.value_type, &self.label)?)
-            }
+            CapabilityBase::ValueType(value_type) => self.value_type = Some(parse_value_type(&value_type.value_type)),
             other => {
                 return Err(format!("attribute '{}' cannot declare '{other}' (only sub and value)", self.label));
             }
@@ -198,12 +197,18 @@ impl AttributeType {
 }
 
 #[derive(Debug)]
+pub(crate) enum AttributeValueType {
+    Builtin(ValueType),
+    Struct(String),
+}
+
+#[derive(Debug)]
 pub(crate) struct ObjectType {
     pub(crate) label: String,
     pub(crate) kind: ObjectKind,
     pub(crate) is_abstract: bool,
     pub(crate) supertype: Option<String>,
-    pub(crate) owns: Vec<String>,
+    pub(crate) owns: Vec<Owns>,
     pub(crate) plays: Vec<Plays>,
     pub(crate) roles: Vec<RoleType>,
 }
@@ -225,35 +230,29 @@ impl ObjectType {
         match capability.base {
             CapabilityBase::Sub(sub) => self.supertype = Some(sub.supertype_label.ident.to_string()),
             CapabilityBase::Owns(owns) => {
-                let attribute = type_ref_label(&owns.owned).ok_or_else(|| {
-                    format!(
-                        "'{} owns {}': the loader writes unordered ownerships, so it cannot load ordered ones",
-                        self.label, owns.owned
-                    )
-                })?;
-                self.owns.push(attribute);
+                let (attribute, is_ordered) = label_and_ordering(&owns.owned)
+                    .ok_or_else(|| format!("'{} owns {}' names no attribute type", self.label, owns.owned))?;
+                self.owns.push(Owns { attribute, is_ordered });
             }
             CapabilityBase::Plays(plays) => self
                 .plays
                 .push(Plays { relation: plays.role.scope.ident.to_string(), role: plays.role.name.ident.to_string() }),
             CapabilityBase::Relates(relates) if self.kind == ObjectKind::Relation => {
-                let role = type_ref_label(&relates.related).ok_or_else(|| {
-                    format!(
-                        "'{} relates {}': the loader writes unordered role players, so it cannot load ordered ones",
-                        self.label, relates.related
-                    )
-                })?;
-                let specialises = relates.specialised.as_ref().and_then(type_ref_label);
+                let (role, is_ordered) = label_and_ordering(&relates.related)
+                    .ok_or_else(|| format!("'{} relates {}' names no role", self.label, relates.related))?;
+                let specialises =
+                    relates.specialised.as_ref().and_then(label_and_ordering).map(|(specialised, _)| specialised);
                 let is_abstract =
                     capability.annotations.iter().any(|annotation| matches!(annotation, Annotation::Abstract(_)));
                 match self.roles.iter_mut().find(|declared| declared.label == role) {
                     Some(declared) => {
                         declared.is_abstract |= is_abstract;
+                        declared.is_ordered |= is_ordered;
                         declared.specialises = specialises.or(declared.specialises.take());
                     }
                     None => {
                         let relation = self.label.clone();
-                        self.roles.push(RoleType { label: role, relation, specialises, is_abstract });
+                        self.roles.push(RoleType { label: role, relation, specialises, is_abstract, is_ordered });
                     }
                 }
             }
@@ -280,6 +279,12 @@ impl ObjectKind {
     }
 }
 
+#[derive(Debug)]
+pub(crate) struct Owns {
+    pub(crate) attribute: String,
+    pub(crate) is_ordered: bool,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct Plays {
     pub(crate) relation: String,
@@ -293,6 +298,7 @@ pub(crate) struct RoleType {
     pub(crate) relation: String,
     pub(crate) specialises: Option<String>,
     pub(crate) is_abstract: bool,
+    pub(crate) is_ordered: bool,
 }
 
 impl RoleType {
@@ -344,17 +350,21 @@ fn type_declarations(schema_text: &str) -> Result<Vec<TypeDeclaration>, String> 
     Ok(declarations.collect())
 }
 
-fn type_ref_label(type_ref: &TypeRefAny) -> Option<String> {
+fn label_and_ordering(type_ref: &TypeRefAny) -> Option<(String, bool)> {
+    let (type_ref, is_ordered) = match type_ref {
+        TypeRefAny::Type(type_ref) => (type_ref, false),
+        TypeRefAny::List(list) => (&list.inner, true),
+    };
     match type_ref {
-        TypeRefAny::Type(TypeRef::Label(label)) => Some(label.ident.to_string()),
-        TypeRefAny::Type(TypeRef::Scoped(scoped)) => Some(scoped.name.ident.to_string()),
-        _ => None,
+        TypeRef::Label(label) => Some((label.ident.to_string(), is_ordered)),
+        TypeRef::Scoped(scoped) => Some((scoped.name.ident.to_string(), is_ordered)),
+        TypeRef::Variable(_) => None,
     }
 }
 
-fn parse_value_type(named: &NamedType, attribute: &str) -> Result<ValueType, String> {
+fn parse_value_type(named: &NamedType) -> AttributeValueType {
     match named {
-        NamedType::BuiltinValueType(builtin) => Ok(match builtin.token {
+        NamedType::BuiltinValueType(builtin) => AttributeValueType::Builtin(match builtin.token {
             token::ValueType::Boolean => ValueType::Boolean,
             token::ValueType::Integer => ValueType::Integer,
             token::ValueType::Double => ValueType::Double,
@@ -365,9 +375,6 @@ fn parse_value_type(named: &NamedType, attribute: &str) -> Result<ValueType, Str
             token::ValueType::DateTimeTZ => ValueType::DatetimeTz,
             token::ValueType::Duration => ValueType::Duration,
         }),
-        NamedType::Label(label) => {
-            let label = &label.ident;
-            Err(format!("attribute '{attribute}' has struct value type '{label}', which the loader cannot load"))
-        }
+        NamedType::Label(label) => AttributeValueType::Struct(label.ident.to_string()),
     }
 }

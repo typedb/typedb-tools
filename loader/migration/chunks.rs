@@ -5,7 +5,11 @@
  */
 
 use std::{
-    sync::{Arc, Mutex, mpsc},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    },
     thread,
 };
 
@@ -35,6 +39,9 @@ pub(crate) fn encode_in_order<Encoded: Send>(
     let work = Arc::new(Mutex::new(work));
     let (results_sender, results) =
         mpsc::sync_channel::<mpsc::Receiver<Result<Encoded, String>>>(chunks_in_flight(workers));
+    // Set when reading fails or is cancelled: the chunks in flight are dropped rather than encoded and written.
+    let is_abandoned = AtomicBool::new(false);
+    let is_abandoned = &is_abandoned;
     thread::scope(|scope| {
         for _ in 0..workers {
             let work = work.clone();
@@ -42,13 +49,18 @@ pub(crate) fn encode_in_order<Encoded: Send>(
                 loop {
                     let received = work.lock().expect("no worker panics while it takes work").recv();
                     let Ok((batches, result_sender)) = received else { return };
-                    let _ = result_sender.send(encode(&batches));
+                    if !is_abandoned.load(Ordering::Relaxed) {
+                        let _ = result_sender.send(encode(&batches));
+                    }
                 }
             });
         }
         drop(work);
         let writer = scope.spawn(move || -> Result<(), String> {
             for result_receiver in results {
+                if is_abandoned.load(Ordering::Relaxed) {
+                    break;
+                }
                 write(result_receiver.recv().map_err(|_| "an encoder panicked".to_owned())??)?;
             }
             Ok(())
@@ -58,6 +70,7 @@ pub(crate) fn encode_in_order<Encoded: Send>(
             let batches = match chunk {
                 Ok(batches) => batches,
                 Err(err) => {
+                    is_abandoned.store(true, Ordering::Relaxed);
                     read_error = Some(err);
                     break;
                 }

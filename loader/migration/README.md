@@ -74,6 +74,10 @@ Every mapped table has a column `_iid UBIGINT`: the row's instance id, unique wi
   one table, so a role open to subtypes takes a column per table. Subtypes inherit ownerships and roles.
 - **Several tables may map to one type** with a directive. Their `_iid`s must differ.
 - **A reference on an entity table** has no TypeDB form. Stage the relation as its own table and skip the column.
+- **A `FOREIGN KEY` to any other column**, or of several columns, constrains values and names no instances. Its
+  columns are ordinary columns: `country_code VARCHAR REFERENCES country(code)` loads as the attribute.
+- **Ordered ownerships and roles (`owns tag[]`, `relates member[]`) and struct-valued attributes** are not loaded.
+  The schema may declare them, and a column that maps to one is refused: skip it.
 - **`_iid` is not data.** It is not queryable after the import. Keep the ids you query by as ordinary columns, such
   as `owns id @key`.
 
@@ -156,12 +160,13 @@ hundreds of millions of rows and more, stage without keys.
 Before converting anything, the loader checks the source in three steps. Any error stops the run with nothing
 written, and every error is reported, each data violation with a count and a few examples.
 
-1. **Structure.** Every mapped table has an `_iid UBIGINT` column that is neither generated, a `FOREIGN KEY`, nor
-   under a directive. Every mapped column has a supported type (see [Type conversions](#type-conversions)) and is not
-   generated. Directives are well-formed and name columns and tables that exist.
+1. **Structure.** Every mapped table has an `_iid UBIGINT` column that is neither generated, a `FOREIGN KEY` to
+   another `_iid`, nor under a directive. Every mapped column has a supported type (see
+   [Type conversions](#type-conversions)) and is not generated. Directives are well-formed and name columns and
+   tables that exist.
 2. **Mapping.** Every table and column has a counterpart in the schema, or is skipped; every role column names its
    players' table, and the role is unambiguous; value types are compatible; abstract types and roles have no tables
-   or columns; ordered (list) ownerships and roles, and struct-valued attributes, are refused.
+   or columns, and no column maps to an ordered ownership or role or to a struct-valued attribute.
 3. **Data**, with one DuckDB query per check:
 
 | Check | Runs on | Unless |

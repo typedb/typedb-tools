@@ -11,7 +11,7 @@ use duckdb::{
     types::{Value, ValueRef},
 };
 
-use crate::sql::{self, ROWID_COLUMN, duckdb_type};
+use crate::sql::{self, IID_COLUMN, ROWID_COLUMN, duckdb_type};
 
 const DUCKDB_DEFAULT_DECIMAL_PRECISION: u8 = 18;
 const DUCKDB_DEFAULT_DECIMAL_SCALE: u8 = 3;
@@ -56,8 +56,11 @@ impl Table {
         self.columns.iter().any(|column| column.name.eq_ignore_ascii_case(ROWID_COLUMN))
     }
 
-    pub(crate) fn foreign_key_of(&self, column: &str) -> Option<&ForeignKey> {
-        self.foreign_keys.iter().find(|foreign_key| foreign_key.columns.iter().any(|name| name == column))
+    pub(crate) fn instance_references_of<'a>(&'a self, column: &'a str) -> impl Iterator<Item = &'a ForeignKey> {
+        self.foreign_keys.iter().filter(move |foreign_key| {
+            foreign_key.columns == [column]
+                && matches!(&foreign_key.referenced_columns[..], [referenced] if referenced.eq_ignore_ascii_case(IID_COLUMN))
+        })
     }
 
     // Constraints and directives spell a column's name freely, and DuckDB resolves names case-insensitively.
@@ -192,9 +195,11 @@ fn read_columns(connection: &Connection, table: &mut Table) -> duckdb::Result<()
     let mut statement = connection.prepare(sql::catalog::TABLE_COLUMNS)?;
     let mut rows = statement.query([&table.name])?;
     while let Some(row) = rows.next()? {
+        let name: String = row.get(0)?;
         let duckdb_type: String = row.get(1)?;
         table.columns.push(Column {
-            name: row.get(0)?,
+            // DuckDB resolves names case-insensitively, so `_IID` is the id column too.
+            name: if name.eq_ignore_ascii_case(IID_COLUMN) { IID_COLUMN.to_owned() } else { name },
             column_type: ColumnType::parse(&duckdb_type),
             duckdb_type,
             comment: row.get(2)?,

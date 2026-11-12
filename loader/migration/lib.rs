@@ -75,7 +75,7 @@ impl Migration {
     }
 
     // The loader stands in for the server in the header: they release in lockstep.
-    pub fn run(
+    pub fn convert(
         &self,
         output: impl Write + Send,
         typedb_version: &str,

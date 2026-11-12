@@ -122,7 +122,7 @@ fn validation_errors(dir: &Scratch) -> Vec<String> {
 fn run(dir: &Scratch) -> Result<Vec<u8>, Box<dyn Error>> {
     let migration = prepare(dir).map_err(|err| format!("validation failed: {err:?}"))?;
     let mut output = Vec::new();
-    migration.run(&mut output, "3.0.0-test", "duckdb:fixture.duckdb", &Silent)?;
+    migration.convert(&mut output, "3.0.0-test", "duckdb:fixture.duckdb", &Silent)?;
     Ok(output)
 }
 
@@ -386,7 +386,7 @@ fn decimals_of_any_scale_feed_one_double_attribute() -> Result<(), Box<dyn Error
 
 #[test]
 fn structure_and_mapping_errors_name_the_table_and_the_fix() -> Result<(), Box<dyn Error>> {
-    let schema = "define\n  entity person;\n";
+    let schema = "define\n  attribute amount value decimal;\n  entity person, owns amount;\n";
     let check = |sql: &str, fragment: &str| -> Result<(), Box<dyn Error>> {
         let dir = scratch("structure", schema, sql)?;
         assert_error(&validation_errors(&dir), &[fragment]);
@@ -396,6 +396,11 @@ fn structure_and_mapping_errors_name_the_table_and_the_fix() -> Result<(), Box<d
         (
             "CREATE TABLE person (_iid UBIGINT PRIMARY KEY, mystery VARCHAR)",
             "column 'mystery' has no matching attribute",
+        ),
+        (
+            "CREATE TABLE person (_iid UBIGINT PRIMARY KEY, amount DOUBLE)",
+            "column 'amount' (DOUBLE) cannot populate attribute 'amount' (value type 'decimal'): the types are \
+             incompatible; stage the column as DECIMAL(38,19)",
         ),
         ("CREATE TABLE person (id BIGINT PRIMARY KEY)", "table 'person' has no _iid column"),
         ("CREATE TABLE person (_iid BIGINT PRIMARY KEY)", "table 'person': _iid must be UBIGINT"),
@@ -655,14 +660,69 @@ fn relations_may_play_in_relations_streamed_before_them() -> Result<(), Box<dyn 
 }
 
 #[test]
-fn composite_foreign_keys_cannot_bind_roles() -> Result<(), Box<dyn Error>> {
+fn foreign_keys_to_other_columns_are_ordinary_columns() -> Result<(), Box<dyn Error>> {
+    let schema = "define\n  attribute code value string;\n  attribute country-code value string;\n  \
+                  attribute a value integer;\n  attribute b value integer;\n  \
+                  entity country, owns code, plays residence:place;\n  entity node, owns a, owns b;\n  \
+                  entity person, owns country-code, owns a, owns b, plays residence:resident;\n  \
+                  relation residence, relates place, relates resident;\n";
+    let tables = "CREATE TABLE country (_iid UBIGINT PRIMARY KEY, code VARCHAR UNIQUE);
+         CREATE TABLE node (_iid UBIGINT PRIMARY KEY, a INTEGER, b INTEGER, UNIQUE (a, b));
+         CREATE TABLE person (_iid UBIGINT PRIMARY KEY, country_code VARCHAR REFERENCES country(code), a INTEGER,
+                              b INTEGER, FOREIGN KEY (a, b) REFERENCES node(a, b));
+         INSERT INTO country VALUES (1, 'NL'); INSERT INTO node VALUES (1, 2, 3);
+         INSERT INTO person VALUES (1, 'NL', 2, 3);";
+    let residence = "CREATE TABLE residence (_iid UBIGINT PRIMARY KEY, place VARCHAR REFERENCES country(code),
+                                 resident UBIGINT REFERENCES person(_iid));";
+
+    let items = convert(&scratch("value-fk", schema, tables)?)?;
+    let mut attributes: Vec<&str> = items
+        .iter()
+        .filter_map(|item| match item {
+            item::Item::Attribute(attribute) => Some(attribute.label.as_str()),
+            _ => None,
+        })
+        .collect();
+    attributes.sort_unstable();
+    assert_eq!(attributes, ["a", "b", "code", "country-code"]);
+
+    let errors = validation_errors(&scratch("value-fk-unbound", schema, &format!("{tables} {residence}"))?);
+    assert_error(&errors, &["table 'residence': column 'place' has no matching attribute"]);
+
+    let bound = "COMMENT ON TABLE residence IS '@typedb relation residence (place = place)';";
+    let errors = validation_errors(&scratch("value-fk-bound", schema, &format!("{tables} {residence} {bound}"))?);
+    assert_error(&errors, &["column 'place' is bound to role 'place' but names no players' table"]);
+    Ok(())
+}
+
+#[test]
+fn ordered_capabilities_and_structs_are_refused_where_a_column_maps_to_them() -> Result<(), Box<dyn Error>> {
+    let schema = "define\n  struct point: x value integer;\n  attribute location value point;\n  \
+                  attribute tag value string;\n  attribute name value string;\n  \
+                  entity person, owns name, owns tag[], owns location, plays queue:member, plays team:member;\n  \
+                  relation queue, relates member[];\n  relation team, relates member;\n";
     let dir = scratch(
-        "composite-fk",
-        "define\n  attribute a value integer;\n  entity node, plays link:tip;\n  relation link, relates tip, owns a;\n",
-        "CREATE TABLE node (_iid UBIGINT PRIMARY KEY, a INTEGER, b INTEGER, UNIQUE (a, b));
-         CREATE TABLE link (_iid UBIGINT PRIMARY KEY, a INTEGER, b INTEGER, FOREIGN KEY (a, b) REFERENCES node(a, b));",
+        "ordered-unused",
+        schema,
+        "CREATE TABLE person (_iid UBIGINT PRIMARY KEY, name VARCHAR, tag VARCHAR[], location VARCHAR);
+         CREATE TABLE team (_iid UBIGINT PRIMARY KEY, member UBIGINT REFERENCES person(_iid));
+         COMMENT ON COLUMN person.tag IS '@typedb skip'; COMMENT ON COLUMN person.location IS '@typedb skip';
+         INSERT INTO person VALUES (1, 'Ada', ['x'], 'here'); INSERT INTO team VALUES (1, 1);",
     )?;
-    assert_error(&validation_errors(&dir), &["column 'a' is part of the composite FOREIGN KEY [\"a\", \"b\"]"]);
+    let items = convert(&dir)?;
+    assert_eq!(items.iter().filter(|item| matches!(item, item::Item::Attribute(_))).count(), 1);
+    assert_eq!(items.iter().filter(|item| matches!(item, item::Item::Relation(_))).count(), 1);
+
+    let dir = scratch(
+        "ordered-used",
+        schema,
+        "CREATE TABLE person (_iid UBIGINT PRIMARY KEY, name VARCHAR, tag VARCHAR[], location VARCHAR);
+         CREATE TABLE queue (_iid UBIGINT PRIMARY KEY, member UBIGINT REFERENCES person(_iid));",
+    )?;
+    let errors = validation_errors(&dir);
+    assert_error(&errors, &["column 'tag' maps to attribute 'tag', which type 'person' owns ordered ('owns tag[]')"]);
+    assert_error(&errors, &["column 'location' maps to attribute 'location', whose value type is the struct 'point'"]);
+    assert_error(&errors, &["table 'queue': column 'member' fills role 'queue:member', which is ordered"]);
     Ok(())
 }
 
@@ -1433,6 +1493,28 @@ fn foreign_keys_are_matched_as_duckdb_resolves_them() -> Result<(), Box<dyn Erro
 }
 
 #[test]
+fn the_id_column_is_spelt_in_any_case() -> Result<(), Box<dyn Error>> {
+    let dir = scratch(
+        "id-case",
+        "define\n  entity person, plays link:tip;\n  relation link, relates tip;\n",
+        "CREATE TABLE person (_IID UBIGINT);
+         CREATE TABLE link (_Iid UBIGINT PRIMARY KEY, a UBIGINT);
+         COMMENT ON COLUMN link.a IS '@typedb references person';
+         INSERT INTO person VALUES (1), (2);
+         INSERT INTO link VALUES (7, 1), (8, 2);",
+    )?;
+    let items = convert(&dir)?;
+    let entities = items.iter().filter(|item| matches!(item, item::Item::Entity(_))).count();
+    let players: Vec<usize> = items
+        .iter()
+        .filter_map(|item| if let item::Item::Relation(relation) = item { Some(relation) } else { None })
+        .map(|relation| relation.roles.iter().map(|role| role.players.len()).sum())
+        .collect();
+    assert_eq!((entities, players), (2, vec![1, 1]));
+    Ok(())
+}
+
+#[test]
 fn role_inference_does_not_depend_on_column_order() -> Result<(), Box<dyn Error>> {
     let schema = "define\n  entity person, plays r:a, plays r:b;\n  entity company, plays r:b;\n  \
                   relation r, relates a, relates b;\n";
@@ -1539,9 +1621,9 @@ fn an_output_error_ends_a_large_conversion() -> Result<(), Box<dyn Error>> {
     }
     let (sender, receiver) = mpsc::channel();
     thread::spawn(move || {
-        let result = prepare(&dir)
-            .map_err(|err| format!("{err:?}"))
-            .and_then(|migration| migration.run(Failing, "3.0.0-test", "duckdb:fixture.duckdb", &Silent).map(|_| ()));
+        let result = prepare(&dir).map_err(|err| format!("{err:?}")).and_then(|migration| {
+            migration.convert(Failing, "3.0.0-test", "duckdb:fixture.duckdb", &Silent).map(|_| ())
+        });
         let _ = sender.send(result);
     });
     let result = receiver.recv_timeout(Duration::from_secs(120)).expect("the conversion must end, not hang");
