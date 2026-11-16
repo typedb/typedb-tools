@@ -43,6 +43,9 @@ Every mapped table has a column `_id UBIGINT`: the row's id, unique within its t
 how rows refer to each other, and it is not data: it cannot be queried after the import. Keep the ids you query by
 as ordinary columns, such as `owns id @key`.
 
+The name `_id` is reserved for this in every table. A source column that happens to be called `_id` and holds
+something else, such as MongoDB's document id, is renamed when staging: `SELECT _id AS mongo_id, ...`.
+
 - **An entity type is a table.** Its columns are the attributes it owns, and `NULL` is no ownership. A `LIST` column
   is a multi-valued attribute: repeated elements are one ownership, `NULL` elements none.
 - **A relation type is a table** with one column per role, holding the players' `_id`s. The comment

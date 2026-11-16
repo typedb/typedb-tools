@@ -18,8 +18,10 @@ const ENTITY_DIRECTIVE: &str = ObjectKind::Entity.name();
 const RELATION_DIRECTIVE: &str = ObjectKind::Relation.name();
 const OWNS_DIRECTIVE: &str = "owns";
 const REFERENCES_DIRECTIVE: &str = "references";
-const ID_CONTRACT: &str = "add `_id UBIGINT`, unique and not null, holding the row's instance id (unsigned 64-bit; \
-     see Ids in the loader's README)";
+const ID_CONTRACT: &str = "add `_id UBIGINT`, the row's id, unique within its type and not null (see Mapping in the \
+     loader's README)";
+const ID_IS_RESERVED: &str = "_id is reserved for the row's id, an unsigned 64-bit number: cast it, or rename a \
+     source column that only shares the name (see Mapping in the loader's README)";
 const GENERATED_COLUMN: &str = "is generated, and DuckDB computes it anew on every read, so the checks and the \
      conversion could see different values; materialise it when staging (CREATE TABLE ... AS SELECT ...), or mark it \
      '@typedb skip'";
@@ -251,7 +253,7 @@ fn instance_id_guarantees(table: &Table, findings: &mut Findings) -> Option<Decl
     }
     if column.column_type != ColumnType::INSTANCE_ID {
         findings.error(format!(
-            "table '{}': {ID_COLUMN} must be UBIGINT (an instance id is unsigned 64-bit), found {}: {ID_CONTRACT}",
+            "table '{}': {ID_COLUMN} must be UBIGINT, found {}: {ID_IS_RESERVED}",
             table.name, column.duckdb_type
         ));
         return None;
