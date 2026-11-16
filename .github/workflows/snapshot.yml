@@ -134,6 +134,12 @@ jobs:
           google-credentials: ${{ secrets.BAZEL_CACHE_CREDENTIAL_JSON }}
           bazelrc: |
             build --remote_cache https://storage.googleapis.com/typedb-engineers-bazel-remote-cache-europe-west1
+      # Default GCC 7 does not support DuckDB compilation
+      - name: Install GCC 10
+        if: matrix.target.container != null
+        run: |
+          yum install -y gcc10 gcc10-c++
+          echo "CC=gcc10-gcc" >> "$GITHUB_ENV"
       - name: Deploy snapshot
         shell: bash
         env:
