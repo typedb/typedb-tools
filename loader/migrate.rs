@@ -32,6 +32,8 @@ const ALREADY_EXISTS: &str = "DBC6";
 const IS_BEING_IMPORTED: &str = "DBC8";
 const INTERNAL_DATABASE_PREFIX: &str = "_";
 const DUCKDB_SPILL_FILE_PREFIX: &str = "duckdb_temp_";
+const DUCKDB_SPILL_LIMIT_SETTING: &str = "max_temp_directory_size";
+const DUCKDB_OUT_OF_MEMORY: &str = "Out of Memory Error";
 const CURRENT_DIRECTORY: &str = ".";
 
 pub(crate) async fn run_migration(args: &Args) -> ! {
@@ -54,7 +56,7 @@ async fn migrate(args: &Args) -> Result<(), Failure> {
     try_println!("Migrating from DuckDB file '{}'", input.duckdb_path.display());
     let progress = Progress::new();
     let _heartbeat = progress.keep_reporting();
-    let migration = prepare(args, input, output.spill_dir(), &mut interruption).await?;
+    let migration = prepare(args, input, &output, &mut interruption).await?;
     let (checksums, elapsed) = convert(migration, input, &output, &progress, &mut interruption).await?;
     print_conversion_counts(&checksums, elapsed);
 
@@ -140,11 +142,6 @@ impl DataFileOutput {
 
 impl Output {
     fn prepare(args: &Args, input: &MigrationInput) -> Result<Output, Failure> {
-        if args.dry_run {
-            let spill_dir = std::env::temp_dir().join(format!(".typedb-loader.{}.tmp", process::id()));
-            remove_spill_left_behind(&spill_dir)?;
-            return Ok(Output::DryRun { spill_dir });
-        }
         let output_dir = match args.output_dir.as_deref() {
             Some(dir) => PathBuf::from(if dir.is_empty() { CURRENT_DIRECTORY } else { dir }),
             None => default_output_dir(&input.duckdb_path),
@@ -153,6 +150,12 @@ impl Output {
             let message = format!("failed to create output directory '{}': {err}", output_dir.display());
             Failure::new(ExitCode::UserInputError, message)
         })?;
+        if args.dry_run {
+            let spill_dir = output_dir.join(format!(".typedb-loader.{}.tmp", process::id()));
+            remove_spill_left_behind(&spill_dir)?;
+            check_is_writable(&output_dir, &spill_dir)?;
+            return Ok(Output::DryRun { spill_dir });
+        }
         let lock = OutputLock::take(&output_dir, &input.database)?;
         let path = output_data_path(&output_dir, &input.database, &input.duckdb_path, args.overwrite)?;
         let spill_dir = output_dir.join(format!(".{}.tmp", input.database));
@@ -172,6 +175,21 @@ impl Output {
     fn spill_dir(&self) -> &Path {
         match self {
             Output::DryRun { spill_dir } | Output::DataFile(DataFileOutput { spill_dir, .. }) => spill_dir,
+        }
+    }
+
+    fn resource_hint(&self, duckdb_error: &str) -> Option<String> {
+        if duckdb_error.contains(DUCKDB_SPILL_LIMIT_SETTING) {
+            let output_dir = self.spill_dir().parent().unwrap_or(Path::new(CURRENT_DIRECTORY));
+            Some(format!(
+                "DuckDB has no room left to spill into '{}': free space there, or choose another directory with \
+                 --output-dir",
+                output_dir.display()
+            ))
+        } else if duckdb_error.contains(DUCKDB_OUT_OF_MEMORY) {
+            Some("DuckDB cannot hold this data within its memory limit: raise it with --memory-limit".to_owned())
+        } else {
+            None
         }
     }
 }
@@ -234,6 +252,16 @@ fn output_data_path(
         return Err(input_error("already exists; pass --overwrite to replace it"));
     }
     Ok(path)
+}
+
+fn check_is_writable(output_dir: &Path, spill_dir: &Path) -> Result<(), Failure> {
+    fs::create_dir(spill_dir).and_then(|()| fs::remove_dir(spill_dir)).map_err(|err| {
+        let message = format!(
+            "failed to write into '{}': {err} (DuckDB spills next to the DuckDB file, or in --output-dir)",
+            output_dir.display()
+        );
+        Failure::new(ExitCode::UserInputError, message)
+    })
 }
 
 fn remove_spill_left_behind(spill_dir: &Path) -> Result<(), Failure> {
@@ -344,36 +372,40 @@ async fn is_new_database(settings: &ConnectionSettings, database: &str) -> Resul
 struct Failure {
     exit_code: i32,
     message: String,
-    kept_hint: Option<String>,
+    hint: Option<String>,
 }
 
 impl Failure {
     fn new(code: ExitCode, message: impl Into<String>) -> Failure {
-        Failure { exit_code: code as i32, message: message.into(), kept_hint: None }
+        Failure { exit_code: code as i32, message: message.into(), hint: None }
     }
 
     fn interrupted(exit_code: i32) -> Failure {
-        Failure { exit_code, message: "interrupted; nothing was loaded".to_owned(), kept_hint: None }
+        Failure { exit_code, message: "interrupted; nothing was loaded".to_owned(), hint: None }
     }
 
     fn interrupted_after_conversion(exit_code: i32) -> Failure {
         let message = "interrupted after the conversion; nothing was loaded".to_owned();
-        Failure { exit_code, message, kept_hint: None }
+        Failure { exit_code, message, hint: None }
     }
 
     fn interrupted_import(exit_code: i32) -> Failure {
         let message = "interrupted before the import completed; the server discards a partial import".to_owned();
-        Failure { exit_code, message, kept_hint: None }
+        Failure { exit_code, message, hint: None }
     }
 
     fn keeping(self, data_file: &DataFileOutput) -> Failure {
-        Failure { kept_hint: Some(data_file.kept_hint()), ..self }
+        Failure { hint: Some(data_file.kept_hint()), ..self }
+    }
+
+    fn hinting(self, hint: Option<String>) -> Failure {
+        Failure { hint, ..self }
     }
 
     fn report(self) -> i32 {
         println_error!("{}", self.message);
-        if let Some(kept_hint) = self.kept_hint {
-            try_println!("{kept_hint}");
+        if let Some(hint) = self.hint {
+            try_println!("{hint}");
         }
         self.exit_code
     }
@@ -431,12 +463,12 @@ fn joined<T>(outcome: Result<T, tokio::task::JoinError>) -> T {
 async fn prepare(
     args: &Args,
     input: &MigrationInput,
-    spill_dir: &Path,
+    output: &Output,
     interruption: &mut Interruption,
 ) -> Result<Migration, Failure> {
     let (source, schema_text) = (input.duckdb_path.clone(), input.schema_text.clone());
     let (spill_dir, memory_limit, cancellation) =
-        (spill_dir.to_path_buf(), args.memory_limit.clone(), interruption.cancellation());
+        (output.spill_dir().to_path_buf(), args.memory_limit.clone(), interruption.cancellation());
     let started = Instant::now();
     let prepared = interruption
         .run_cancellable(move || {
@@ -463,7 +495,8 @@ async fn prepare(
                 println_error!("{error}");
             }
             let message = format!("validation failed with {} error(s); nothing was written", errors.len());
-            Err(Failure::new(ExitCode::UserInputError, message))
+            let hint = errors.iter().find_map(|error| output.resource_hint(error));
+            Err(Failure::new(ExitCode::UserInputError, message).hinting(hint))
         }
         Err(PrepareError::Cancelled) => unreachable!("only an interrupt cancels the checks, and it is reported above"),
     }
@@ -491,7 +524,10 @@ async fn convert(
         })
         .await;
     match (converted, output.data_file()) {
-        (Ok(converted), _) => converted.map_err(|message| Failure::new(ExitCode::MigrationError, message)),
+        (Ok(converted), _) => converted.map_err(|message| {
+            let hint = output.resource_hint(&message);
+            Failure::new(ExitCode::MigrationError, message).hinting(hint)
+        }),
         (Err(Interrupted { exit_code, outcome: Ok(_) }), Some(data_file)) => {
             Err(Failure::interrupted_after_conversion(exit_code).keeping(data_file))
         }

@@ -209,9 +209,8 @@ spills what does not fit. The conversion needs one to two GB more for its own bu
 single value, so a column of multi-megabyte strings or lists needs a limit of several times the largest value, and a
 row, which is converted as a whole, at about 300 bytes per element of its `LIST` columns.
 
-The output directory needs room for the data file and for DuckDB's spill. `--dry-run` spills into the system's
-temporary directory (`TMPDIR`), as `.typedb-loader.<process id>.tmp`, which a killed or force-stopped dry run leaves
-behind. With
+The output directory needs room for the data file and for DuckDB's spill. `--dry-run` writes no data file but spills
+there too, as `.typedb-loader.<process id>.tmp`, which a killed or force-stopped dry run leaves behind. With
 `--overwrite` the old file stays until the new one replaces it.
 
 ## The data file and the import

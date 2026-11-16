@@ -44,13 +44,13 @@ pub struct Args {
     pub files_only: bool,
 
     /// With --duckdb: map and convert the database, printing the mapping and the counts, without
-    /// writing or loading anything.
+    /// writing or loading anything. DuckDB spills into the output directory while it runs.
     #[arg(
         long = "dry-run",
         default_value = "false",
         help_heading = "Migration",
         requires = "duckdb",
-        conflicts_with_all = ["files_only", "output_dir"],
+        conflicts_with = "files_only",
         group = "migration_options"
     )]
     pub dry_run: bool,
@@ -173,7 +173,8 @@ pub struct Args {
     /// Directory to write the loader's output into, created if it does not already exist.
     /// From a CSV: `rejects.csv`, `rejects.log` and `checkpoint.json`, by default in
     /// `loader_<data-file-stem>_progress` next to the data file.
-    /// With --duckdb: `<database>.data.typedb`, by default next to the DuckDB file.
+    /// With --duckdb: `<database>.data.typedb` and what DuckDB spills, by default next to the
+    /// DuckDB file.
     #[arg(long = "output-dir", value_name = "path to output directory")]
     pub output_dir: Option<String>,
 

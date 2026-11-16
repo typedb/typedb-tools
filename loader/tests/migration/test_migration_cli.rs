@@ -129,6 +129,10 @@ fn dry_run_writes_nothing() -> Result<(), Box<dyn Error>> {
     let output = run_loader(&dir, &["--dry-run"]);
     assert!(output.status.success());
     assert_eq!(file_names(&dir)?, ["fixture.duckdb", "schema.tql"], "--dry-run wrote next to the DuckDB file");
+    let out = dir.join("out");
+    let output = run_loader(&dir, &["--dry-run", "--output-dir", &out.to_string_lossy()]);
+    assert!(output.status.success());
+    assert!(file_names(&out)?.is_empty(), "--dry-run left its spill in the output directory");
     let output = run_loader(&dir, &["--dry-run", "--files-only"]);
     assert!(String::from_utf8_lossy(&output.stderr).contains("cannot be used with"), "clap conflict expected");
 
