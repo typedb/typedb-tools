@@ -1,6 +1,6 @@
 ## Distribution
 
-Download from TypeDB Package Repository: https://cloudsmith.io/~typedb/repos/public-release/packages/?q=name:^typeql-check+version:3.15.0-rc3
+Download from TypeDB Package Repository: https://cloudsmith.io/~typedb/repos/public-release/packages/?q=name:^typeql-check+version:3.15.0
 
 
 ## New Features
@@ -13,5 +13,5 @@ Download from TypeDB Package Repository: https://cloudsmith.io/~typedb/repos/pub
 
 
 ## Other Improvements
-
+  
     
