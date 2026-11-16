@@ -234,8 +234,8 @@ fn loader_imports_a_duckdb_database() -> Result<(), Box<dyn Error>> {
     fs::create_dir_all(&dir)?;
     let duckdb_path = dir.join("people.duckdb");
     duckdb::Connection::open(&duckdb_path)?.execute_batch(
-        "CREATE TABLE person (_iid UBIGINT PRIMARY KEY, name VARCHAR NOT NULL, nickname VARCHAR[]);
-         CREATE TABLE friendship (_iid UBIGINT, a UBIGINT, b UBIGINT);
+        "CREATE TABLE person (_id UBIGINT PRIMARY KEY, name VARCHAR NOT NULL, nickname VARCHAR[]);
+         CREATE TABLE friendship (_id UBIGINT, a UBIGINT, b UBIGINT);
          COMMENT ON TABLE friendship IS '@typedb relation friendship (friend = a, friend = b)';
          COMMENT ON COLUMN friendship.a IS '@typedb references person';
          COMMENT ON COLUMN friendship.b IS '@typedb references person';

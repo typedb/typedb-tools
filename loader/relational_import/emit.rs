@@ -24,11 +24,11 @@ use typedb_protocol::migration::{
 };
 
 use crate::{
-    Migration, ProgressListener, ScanProgress,
+    ProgressListener, RelationalImport, ScanProgress,
     chunks::{ChunkReader, encode_in_order},
     mapping::{MappingPlan, OwnershipColumn, TableKind, TableMapping},
     schema::ValueType,
-    sql::{self, IID_COLUMN},
+    sql::{self, ID_COLUMN},
     value::{ProjectedColumn, TypeDBValue},
 };
 
@@ -36,7 +36,7 @@ const COMPRESSION_LEVEL: i32 = 1;
 const OUTPUT_BUFFER: usize = 8 * MB as usize;
 
 pub(crate) fn emit(
-    migration: &Migration,
+    relational_import: &RelationalImport,
     output: impl Write + Send,
     typedb_version: &str,
     original_database: &str,
@@ -45,15 +45,15 @@ pub(crate) fn emit(
     let mut file = DataFile {
         output: BufWriter::with_capacity(OUTPUT_BUFFER, output),
         checksums: Checksums::default(),
-        migration,
+        relational_import,
         progress,
     };
     file.write_item(item::Item::Header(header(typedb_version, original_database)))?;
-    for attribute in AttributeSource::of(&migration.plan) {
+    for attribute in AttributeSource::of(&relational_import.plan) {
         file.write_attribute(&attribute)?;
     }
     let (relations, entities): (Vec<&TableMapping>, Vec<&TableMapping>) =
-        migration.plan.tables.iter().partition(|table| matches!(table.kind, TableKind::Relation { .. }));
+        relational_import.plan.tables.iter().partition(|table| matches!(table.kind, TableKind::Relation { .. }));
     for table in entities.into_iter().chain(relations) {
         file.write_objects(table)?;
     }
@@ -76,7 +76,7 @@ fn header(typedb_version: &str, original_database: &str) -> item::Header {
 struct DataFile<'a, W: Write> {
     output: BufWriter<W>,
     checksums: Checksums,
-    migration: &'a Migration,
+    relational_import: &'a RelationalImport,
     progress: &'a dyn ProgressListener,
 }
 
@@ -91,7 +91,7 @@ impl<W: Write + Send> DataFile<'_, W> {
         let with_context = |err: String| {
             format!("attribute '{}' (from {}): {err}", attribute.label, attribute.column_names.join(", "))
         };
-        let connection = &self.migration.connection;
+        let connection = &self.relational_import.connection;
         let preserve_order =
             |is_preserved| connection.execute_batch(&sql::setting::set_preserve_insertion_order(is_preserved));
         preserve_order(true).map_err(|err| with_context(err.to_string()))?;
@@ -105,11 +105,11 @@ impl<W: Write + Send> DataFile<'_, W> {
 
     fn write_objects(&mut self, table: &TableMapping) -> Result<(), String> {
         let rows: u64 = self
-            .migration
+            .relational_import
             .connection
             .query_row(&sql::scan::row_count(&table.name), [], |row| row.get(0))
             .map_err(|err| format!("failed to count the rows of '{}': {err}", table.name))?;
-        let encoder = ObjectEncoder::new(&self.migration.plan, table);
+        let encoder = ObjectEncoder::new(&self.relational_import.plan, table);
         self.scan(&encoder.query(), &encoder, &format!("table '{}'", table.name), Some(rows))
             .map_err(|err| format!("scan of '{}' failed: {err}", table.name))
     }
@@ -128,9 +128,9 @@ impl<W: Write + Send> DataFile<'_, W> {
         scan: &str,
         total_rows: Option<u64>,
     ) -> Result<(), String> {
-        let migration = self.migration;
-        let statement = migration.connection.prepare(query).map_err(|err| err.to_string())?;
-        let chunks = ChunkReader::start(statement, &migration.cancellation)?;
+        let relational_import = self.relational_import;
+        let statement = relational_import.connection.prepare(query).map_err(|err| err.to_string())?;
+        let chunks = ChunkReader::start(statement, &relational_import.cancellation)?;
         let encode = |batches: &[RecordBatch]| {
             let items = encoder.encode(batches)?;
             let rows = batches.iter().map(|batch| batch.num_rows() as u64).sum();
@@ -138,7 +138,7 @@ impl<W: Write + Send> DataFile<'_, W> {
         };
         let (output, checksums, progress) = (&mut self.output, &mut self.checksums, self.progress);
         let (mut rows, mut encoded_bytes) = (0, 0);
-        encode_in_order(chunks, &encode, encoding_workers(migration), |chunk: CompressedChunk| {
+        encode_in_order(chunks, &encode, encoding_workers(relational_import), |chunk: CompressedChunk| {
             write_bytes(output, &chunk.bytes)?;
             add_checksums(checksums, &chunk.checksums);
             rows += chunk.rows;
@@ -155,9 +155,9 @@ fn write_bytes(output: &mut impl Write, bytes: &[u8]) -> Result<(), String> {
 
 // Each worker holds a chunk in and a chunk out.
 // DuckDB's threads, which the memory limit bounds, bound them too.
-fn encoding_workers(migration: &Migration) -> usize {
+fn encoding_workers(relational_import: &RelationalImport) -> usize {
     let cores = thread::available_parallelism().map(|cores| cores.get()).unwrap_or(1);
-    cores.min(migration.threads)
+    cores.min(relational_import.threads)
 }
 
 trait ChunkEncoder {
@@ -279,7 +279,7 @@ impl<'a> ObjectEncoder<'a> {
     }
 
     fn query(&self) -> String {
-        let projections: Vec<String> = std::iter::once(sql::column_of_scanned_table(IID_COLUMN))
+        let projections: Vec<String> = std::iter::once(sql::column_of_scanned_table(ID_COLUMN))
             .chain(self.table.ownerships.iter().map(OwnershipColumn::object_scan_projection))
             .chain(self.table.roles().iter().map(|role| sql::column_of_scanned_table(&role.column)))
             .collect();
@@ -287,11 +287,11 @@ impl<'a> ObjectEncoder<'a> {
     }
 
     fn encode_row(&self, row: &ScannedRow<'_>, item: &mut ObjectItemBuffer) -> Result<(), String> {
-        item.reset(row.iid());
+        item.reset(row.id());
         row.for_each_owned_value(|ownership, value| item.own(&ownership.attribute, value))?;
-        for (role_player, player_iid) in self.role_players.iter().zip(row.player_iids()) {
-            if let Some(player_iid) = player_iid {
-                item.play(&role_player.role_label, role_player.player_type, player_iid);
+        for (role_player, player_id) in self.role_players.iter().zip(row.player_ids()) {
+            if let Some(player_id) = player_id {
+                item.play(&role_player.role_label, role_player.player_type, player_id);
             }
         }
         Ok(())
@@ -305,7 +305,7 @@ impl ChunkEncoder for ObjectEncoder<'_> {
         for batch in batches {
             let batch = ScannedBatch::of(batch, self.table)?;
             for row in batch.rows() {
-                self.encode_row(&row, &mut item).map_err(|err| format!("{IID_COLUMN} {}: {err}", row.iid()))?;
+                self.encode_row(&row, &mut item).map_err(|err| format!("{ID_COLUMN} {}: {err}", row.id()))?;
                 items.write(&item.message);
             }
         }
@@ -314,9 +314,9 @@ impl ChunkEncoder for ObjectEncoder<'_> {
 }
 
 struct ScannedBatch<'a> {
-    iids: &'a UInt64Array,
+    ids: &'a UInt64Array,
     ownerships: Vec<ScannedOwnership<'a>>,
-    player_iids: Vec<&'a UInt64Array>,
+    player_ids: Vec<&'a UInt64Array>,
 }
 
 struct ScannedOwnership<'a> {
@@ -330,7 +330,7 @@ impl<'a> ScannedBatch<'a> {
             column.as_primitive_opt::<UInt64Type>().ok_or_else(|| format!("column '{name}' was not read as UBIGINT"))
         };
         let mut columns = batch.columns().iter();
-        let iids = instance_ids(columns.next().expect("the scan projects the _iid first"), IID_COLUMN)?;
+        let ids = instance_ids(columns.next().expect("the scan projects the _id first"), ID_COLUMN)?;
         let ownerships = columns
             .by_ref()
             .take(table.ownerships.len())
@@ -339,15 +339,15 @@ impl<'a> ScannedBatch<'a> {
                 Ok(ScannedOwnership { column: ProjectedColumn::of(column.as_ref(), ownership.value_type)?, ownership })
             })
             .collect::<Result<_, String>>()?;
-        let player_iids = columns
+        let player_ids = columns
             .zip(table.roles())
             .map(|(column, role)| instance_ids(column, &role.column))
             .collect::<Result<_, _>>()?;
-        Ok(ScannedBatch { iids, ownerships, player_iids })
+        Ok(ScannedBatch { ids, ownerships, player_ids })
     }
 
     fn rows(&self) -> impl Iterator<Item = ScannedRow<'_>> {
-        (0..self.iids.len()).map(|index| ScannedRow { batch: self, index })
+        (0..self.ids.len()).map(|index| ScannedRow { batch: self, index })
     }
 }
 
@@ -357,8 +357,8 @@ struct ScannedRow<'a> {
 }
 
 impl ScannedRow<'_> {
-    fn iid(&self) -> u64 {
-        self.batch.iids.value(self.index)
+    fn id(&self) -> u64 {
+        self.batch.ids.value(self.index)
     }
 
     fn for_each_owned_value(&self, mut action: impl FnMut(&OwnershipColumn, TypeDBValue)) -> Result<(), String> {
@@ -370,8 +370,8 @@ impl ScannedRow<'_> {
         Ok(())
     }
 
-    fn player_iids(&self) -> impl Iterator<Item = Option<u64>> {
-        self.batch.player_iids.iter().map(|iids| (!iids.is_null(self.index)).then(|| iids.value(self.index)))
+    fn player_ids(&self) -> impl Iterator<Item = Option<u64>> {
+        self.batch.player_ids.iter().map(|ids| (!ids.is_null(self.index)).then(|| ids.value(self.index)))
     }
 }
 
@@ -406,10 +406,10 @@ impl ObjectItemBuffer {
         }
     }
 
-    fn reset(&mut self, iid: u64) {
+    fn reset(&mut self, id: u64) {
         let parts = ObjectParts::of(&mut self.message);
-        write_object_id(parts.globally_unique_id, parts.label, iid);
-        *parts.label_scoped_id = Some(iid);
+        write_object_id(parts.globally_unique_id, parts.label, id);
+        *parts.label_scoped_id = Some(id);
         self.spare_attributes.append(parts.attributes);
         for mut role in parts.roles.into_iter().flat_map(|roles| roles.drain(..)) {
             self.spare_players.append(&mut role.players);

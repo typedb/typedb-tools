@@ -7,7 +7,7 @@ load("@typedb_dependencies//tool/checkstyle:rules.bzl", "checkstyle_test")
 load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test", "rustfmt_test")
 
 rust_library(
-    name = "typedb_migration",
+    name = "typedb_relational_import",
     srcs = glob(["*.rs"]),
     crate_root = "lib.rs",
     deps = [
@@ -21,19 +21,19 @@ rust_library(
         "@crates//:zstd",
     ],
     visibility = ["//visibility:public"],
-    tags = ["crate-name=typedb-migration"],
+    tags = ["crate-name=typedb-relational-import"],
 )
 
 rust_test(
     name = "unit-tests",
-    crate = ":typedb_migration",
+    crate = ":typedb_relational_import",
 )
 
 rust_test(
-    name = "test-migration",
-    srcs = ["tests/migration.rs"],
+    name = "test-relational-import",
+    srcs = ["tests/relational_import.rs"],
     deps = [
-        ":typedb_migration",
+        ":typedb_relational_import",
         "@typedb_protocol//grpc/rust:typedb_protocol",
 
         # External dependencies
@@ -52,6 +52,6 @@ checkstyle_test(
 
 rustfmt_test(
     name = "rustfmt_test",
-    targets = [":typedb_migration"],
+    targets = [":typedb_relational_import"],
     size = "small",
 )

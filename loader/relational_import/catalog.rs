@@ -11,7 +11,7 @@ use duckdb::{
     types::{Value, ValueRef},
 };
 
-use crate::sql::{self, IID_COLUMN, ROWID_COLUMN, duckdb_type};
+use crate::sql::{self, ID_COLUMN, ROWID_COLUMN, duckdb_type};
 
 const DUCKDB_DEFAULT_DECIMAL_PRECISION: u8 = 18;
 const DUCKDB_DEFAULT_DECIMAL_SCALE: u8 = 3;
@@ -59,7 +59,7 @@ impl Table {
     pub(crate) fn instance_references_of<'a>(&'a self, column: &'a str) -> impl Iterator<Item = &'a ForeignKey> {
         self.foreign_keys.iter().filter(move |foreign_key| {
             foreign_key.columns == [column]
-                && matches!(&foreign_key.referenced_columns[..], [referenced] if referenced.eq_ignore_ascii_case(IID_COLUMN))
+                && matches!(&foreign_key.referenced_columns[..], [referenced] if referenced.eq_ignore_ascii_case(ID_COLUMN))
         })
     }
 
@@ -199,8 +199,8 @@ fn read_columns(connection: &Connection, tables: &mut [Table], indices: &HashMap
         let name: String = row.get(1)?;
         let duckdb_type: String = row.get(2)?;
         tables[index].columns.push(Column {
-            // DuckDB resolves names case-insensitively, so `_IID` is the id column too.
-            name: if name.eq_ignore_ascii_case(IID_COLUMN) { IID_COLUMN.to_owned() } else { name },
+            // DuckDB resolves names case-insensitively, so `_ID` is the id column too.
+            name: if name.eq_ignore_ascii_case(ID_COLUMN) { ID_COLUMN.to_owned() } else { name },
             column_type: ColumnType::parse(&duckdb_type),
             duckdb_type,
             comment: row.get(3)?,

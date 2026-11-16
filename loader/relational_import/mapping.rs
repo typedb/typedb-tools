@@ -8,7 +8,7 @@ use crate::{
     Findings,
     catalog::{Catalog, Column, ColumnType, ForeignKey, Table},
     schema::{AttributeValueType, ObjectKind, ObjectType, RoleType, Schema, ValueType},
-    sql::{self, IID_COLUMN, duckdb_type},
+    sql::{self, ID_COLUMN, duckdb_type},
     value::DECIMAL_FRACTIONAL_DIGITS,
 };
 
@@ -18,7 +18,7 @@ const ENTITY_DIRECTIVE: &str = ObjectKind::Entity.name();
 const RELATION_DIRECTIVE: &str = ObjectKind::Relation.name();
 const OWNS_DIRECTIVE: &str = "owns";
 const REFERENCES_DIRECTIVE: &str = "references";
-const IID_CONTRACT: &str = "add `_iid UBIGINT`, unique and not null, holding the row's instance id (unsigned 64-bit; \
+const ID_CONTRACT: &str = "add `_id UBIGINT`, unique and not null, holding the row's instance id (unsigned 64-bit; \
      see Ids in the loader's README)";
 const GENERATED_COLUMN: &str = "is generated, and DuckDB computes it anew on every read, so the checks and the \
      conversion could see different values; materialise it when staging (CREATE TABLE ... AS SELECT ...), or mark it \
@@ -237,13 +237,13 @@ fn directive_implied_by_name(table: &Table, schema: &Schema, findings: &mut Find
 }
 
 fn instance_id_guarantees(table: &Table, findings: &mut Findings) -> Option<DeclaredIdGuarantees> {
-    let Some(column) = table.column(IID_COLUMN) else {
-        findings.error(format!("table '{}' has no {IID_COLUMN} column: {IID_CONTRACT}", table.name));
+    let Some(column) = table.column(ID_COLUMN) else {
+        findings.error(format!("table '{}' has no {ID_COLUMN} column: {ID_CONTRACT}", table.name));
         return None;
     };
-    if table.instance_references_of(IID_COLUMN).next().is_some() {
+    if table.instance_references_of(ID_COLUMN).next().is_some() {
         findings.error(format!(
-            "table '{}': {IID_COLUMN} is a FOREIGN KEY to another {IID_COLUMN}, which cannot stand for an instance of \
+            "table '{}': {ID_COLUMN} is a FOREIGN KEY to another {ID_COLUMN}, which cannot stand for an instance of \
              another table; an instance belongs to one table (see Mapping in the loader's README)",
             table.name
         ));
@@ -251,15 +251,15 @@ fn instance_id_guarantees(table: &Table, findings: &mut Findings) -> Option<Decl
     }
     if column.column_type != ColumnType::INSTANCE_ID {
         findings.error(format!(
-            "table '{}': {IID_COLUMN} must be UBIGINT (an instance id is unsigned 64-bit), found {}: {IID_CONTRACT}",
+            "table '{}': {ID_COLUMN} must be UBIGINT (an instance id is unsigned 64-bit), found {}: {ID_CONTRACT}",
             table.name, column.duckdb_type
         ));
         return None;
     }
-    let is_primary_key = table.primary_key.as_slice() == [IID_COLUMN];
+    let is_primary_key = table.primary_key.as_slice() == [ID_COLUMN];
     Some(DeclaredIdGuarantees {
-        is_unique: is_primary_key || table.unique_column_sets.iter().any(|set| set.as_slice() == [IID_COLUMN]),
-        is_not_null: is_primary_key || table.not_null_columns.contains(IID_COLUMN),
+        is_unique: is_primary_key || table.unique_column_sets.iter().any(|set| set.as_slice() == [ID_COLUMN]),
+        is_not_null: is_primary_key || table.not_null_columns.contains(ID_COLUMN),
     })
 }
 
@@ -333,13 +333,13 @@ impl<'a, 'f> TableMapper<'a, 'f> {
     fn map_column(&mut self, column: &'a Column) {
         let target = self.target;
         let table_name = &target.table.name;
-        if column.name == IID_COLUMN {
+        if column.name == ID_COLUMN {
             if column.is_generated {
-                self.findings.error(format!("table '{table_name}': {IID_COLUMN} {GENERATED_COLUMN}"));
+                self.findings.error(format!("table '{table_name}': {ID_COLUMN} {GENERATED_COLUMN}"));
             }
             if column.comment.as_deref().and_then(strip_directive_prefix).is_some() {
                 self.findings.error(format!(
-                    "table '{table_name}': {IID_COLUMN} holds the instances' ids and takes no directive"
+                    "table '{table_name}': {ID_COLUMN} holds the instances' ids and takes no directive"
                 ));
             }
             return;
@@ -363,7 +363,7 @@ impl<'a, 'f> TableMapper<'a, 'f> {
         match (&directive, binding, reference) {
             (Some(ColumnDirective::Owns(_)), Some(_), _) | (Some(ColumnDirective::Owns(_)), _, Some(_)) => {
                 self.findings.error(format!(
-                    "table '{table_name}': column '{}' holds role players (a FOREIGN KEY to an {IID_COLUMN}, or a bound \
+                    "table '{table_name}': column '{}' holds role players (a FOREIGN KEY to an {ID_COLUMN}, or a bound \
                      column), so it cannot own an attribute",
                     column.name
                 ))
@@ -403,7 +403,7 @@ impl<'a, 'f> TableMapper<'a, 'f> {
         let Some(reference) = reference else {
             return self.findings.error(format!(
                 "table '{table_name}': column '{}' is bound to role '{role}' but names no players' table: declare it a \
-                 FOREIGN KEY to that table's {IID_COLUMN}, or mark it '@typedb references <table>'",
+                 FOREIGN KEY to that table's {ID_COLUMN}, or mark it '@typedb references <table>'",
                 column.name
             ));
         };
@@ -493,7 +493,7 @@ impl<'a, 'f> TableMapper<'a, 'f> {
             PlayerTableReference::Directive(referenced_table) => {
                 if column.column_type != ColumnType::INSTANCE_ID {
                     self.findings.error(format!(
-                        "table '{table_name}': column '{}' references '{referenced_table}' and must hold its {IID_COLUMN} values, so \
+                        "table '{table_name}': column '{}' references '{referenced_table}' and must hold its {ID_COLUMN} values, so \
                          it must be UBIGINT; found {}",
                         column.name, column.duckdb_type
                     ));
@@ -630,7 +630,7 @@ impl<'a, 'f> TableMapper<'a, 'f> {
         for (index, RoleBinding { role, column }) in bindings.iter().enumerate() {
             let problem = if target.table.column(column).is_none() {
                 "which the table does not have"
-            } else if column == IID_COLUMN {
+            } else if column == ID_COLUMN {
                 "which holds the relations' own ids"
             } else if bindings[..index].iter().any(|earlier| earlier.column == *column) {
                 "which the directive already binds; a column holds one role's players"
@@ -674,7 +674,7 @@ fn player_table_reference<'a>(
     let foreign_key = foreign_keys.next();
     if foreign_keys.next().is_some() {
         return Err(format!(
-            "table '{}': column '{}' is in several FOREIGN KEYs to an {IID_COLUMN}, so its players' table is ambiguous",
+            "table '{}': column '{}' is in several FOREIGN KEYs to an {ID_COLUMN}, so its players' table is ambiguous",
             table.name, column.name
         ));
     }

@@ -14,7 +14,7 @@ use crate::{
     catalog::ColumnType,
     mapping::{MappingPlan, OwnershipColumn, RoleColumn, TableKind, TableMapping},
     schema::ValueType,
-    sql::{self, IID_COLUMN, ROWID_COLUMN, value_condition},
+    sql::{self, ID_COLUMN, ROWID_COLUMN, value_condition},
     value::{MAX_DURATION_MONTHS, MAX_EPOCH_DAYS, MAX_EPOCH_SECONDS, MIN_EPOCH_DAYS, MIN_EPOCH_SECONDS},
 };
 
@@ -94,7 +94,7 @@ impl DataChecker<'_> {
             Ok(_) => IdOrder::NotDense,
             Err(_) if self.cancellation.is_cancelled() => IdOrder::Unknown,
             Err(err) => {
-                self.findings.error(format!("table '{}': its {IID_COLUMN}s could not be read: {err}", table.name));
+                self.findings.error(format!("table '{}': its {ID_COLUMN}s could not be read: {err}", table.name));
                 IdOrder::Unknown
             }
         }
@@ -127,9 +127,9 @@ impl DataChecker<'_> {
             let names: Vec<&str> = tables.iter().map(|table| table.name.as_str()).collect();
             self.run(Check {
                 subject,
-                unit: format!("{IID_COLUMN} value(s)"),
-                predicate: format!("appear in more than one row; an {IID_COLUMN} is the instance's id within its type"),
-                example_label: IID_COLUMN,
+                unit: format!("{ID_COLUMN} value(s)"),
+                predicate: format!("appear in more than one row; an {ID_COLUMN} is the instance's id within its type"),
+                example_label: ID_COLUMN,
                 violations: sql::check::repeated_ids(&names),
             });
         }
@@ -140,17 +140,17 @@ impl DataChecker<'_> {
             subject: format!("table '{}'", table.name),
             unit: "row(s)".into(),
             predicate: format!(
-                "have an {IID_COLUMN} of 2^63 or more, beyond TypeDB's instance ids; number the rows, \
+                "have an {ID_COLUMN} of 2^63 or more, beyond TypeDB's instance ids; number the rows, \
                  and the columns referencing them, below that"
             ),
-            example_label: IID_COLUMN,
+            example_label: ID_COLUMN,
             violations: sql::check::ids_at_or_above(&table.name, INSTANCE_ID_BOUND),
         });
         if !table.id_guarantees.is_not_null {
             self.run(Check {
                 subject: format!("table '{}'", table.name),
                 unit: "row(s)".into(),
-                predicate: format!("have no {IID_COLUMN}, which every row needs as its instance id"),
+                predicate: format!("have no {ID_COLUMN}, which every row needs as its instance id"),
                 example_label: ROWID_COLUMN,
                 violations: sql::check::rows_without_id(&table.name),
             });
@@ -163,7 +163,7 @@ impl DataChecker<'_> {
             subject: format!("relation table '{}'", table.name),
             unit: "row(s)".into(),
             predicate: "fill no role (every role column is NULL), and a relation cannot exist without players".into(),
-            example_label: IID_COLUMN,
+            example_label: ID_COLUMN,
             violations: sql::check::rows_without_players(&table.name, &role_columns),
         });
     }
@@ -181,8 +181,8 @@ impl DataChecker<'_> {
             IdOrder::Empty => sql::check::references(&table.name, &role.column),
             IdOrder::Unknown => return,
             IdOrder::NotDense => return self.findings.error(format!(
-                "{subject}: the {IID_COLUMN}s of '{}' are not dense in row order, so the references cannot be checked; \
-                 declare the column a FOREIGN KEY to '{}'({IID_COLUMN}), or number the rows of '{}' in order, as \
+                "{subject}: the {ID_COLUMN}s of '{}' are not dense in row order, so the references cannot be checked; \
+                 declare the column a FOREIGN KEY to '{}'({ID_COLUMN}), or number the rows of '{}' in order, as \
                  `row_number() OVER ()` does (deleted or updated rows leave gaps in a table's row order: copy it with \
                  CREATE TABLE ... AS SELECT)",
                 player_table.name, player_table.name, player_table.name
@@ -191,7 +191,7 @@ impl DataChecker<'_> {
         self.run(Check {
             subject,
             unit: "row(s)".into(),
-            predicate: format!("hold a value that is no {IID_COLUMN} of the referenced table"),
+            predicate: format!("hold a value that is no {ID_COLUMN} of the referenced table"),
             example_label: "value",
             violations,
         });
@@ -256,7 +256,7 @@ impl DataChecker<'_> {
             subject: format!("table '{}': column '{}'", table.name, ownership.column),
             unit: "row(s)".into(),
             predicate: predicate.into(),
-            example_label: IID_COLUMN,
+            example_label: ID_COLUMN,
             violations: sql::check::rows_with_values_where(&table.name, &ownership.unnested_values(), &condition),
         });
     }

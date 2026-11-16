@@ -65,10 +65,10 @@ jobs:
           bazel --output_base=C:/b test --enable_runfiles //loader:loader-unit-tests --test_output=streamed
       - run: |
           call refreshenv
-          bazel --output_base=C:/b test --enable_runfiles //loader/migration:unit-tests //loader/migration:test-migration --test_output=streamed
+          bazel --output_base=C:/b test --enable_runfiles //loader/relational_import:unit-tests //loader/relational_import:test-relational-import --test_output=streamed
       - run: |
           call refreshenv
-          bazel --output_base=C:/b test --enable_runfiles //loader/tests/migration:test-migration-cli --test_output=streamed
+          bazel --output_base=C:/b test --enable_runfiles //loader/tests/relational_import:test-relational-import-cli --test_output=streamed
 
   assembly-tests:
     name: Loader assembly tests (windows-x86_64)

@@ -26,20 +26,25 @@ const CSV_OPTIONS: [&str; 14] = [
 ];
 
 #[derive(Parser, Debug)]
-#[command(author, about, group = ArgGroup::new("migration_options").multiple(true).conflicts_with_all(CSV_OPTIONS))]
+#[command(author, about, group = ArgGroup::new("relational_import_options").multiple(true).conflicts_with_all(CSV_OPTIONS))]
 pub struct Args {
-    /// Migrate a DuckDB database instead of loading a CSV: its tables are mapped onto `--schema-file`,
+    /// Import the tables of a DuckDB database instead of loading a CSV: they are mapped onto `--schema-file`,
     /// converted and imported into a new `--database`.
-    #[arg(long, value_name = "path to DuckDB file", help_heading = "Migration", group = "migration_options")]
+    #[arg(
+        long,
+        value_name = "path to DuckDB file",
+        help_heading = "Relational import",
+        group = "relational_import_options"
+    )]
     pub duckdb: Option<String>,
 
     /// With --duckdb: write `<database>.data.typedb` into `--output-dir` without importing it.
     #[arg(
         long = "files-only",
         default_value = "false",
-        help_heading = "Migration",
+        help_heading = "Relational import",
         requires = "duckdb",
-        group = "migration_options"
+        group = "relational_import_options"
     )]
     pub files_only: bool,
 
@@ -48,10 +53,10 @@ pub struct Args {
     #[arg(
         long = "dry-run",
         default_value = "false",
-        help_heading = "Migration",
+        help_heading = "Relational import",
         requires = "duckdb",
         conflicts_with = "files_only",
-        group = "migration_options"
+        group = "relational_import_options"
     )]
     pub dry_run: bool,
 
@@ -60,14 +65,20 @@ pub struct Args {
     #[arg(
         long = "memory-limit",
         value_name = "size",
-        help_heading = "Migration",
+        help_heading = "Relational import",
         requires = "duckdb",
-        group = "migration_options"
+        group = "relational_import_options"
     )]
     pub memory_limit: Option<String>,
 
     /// With --duckdb: replace an existing data file instead of refusing.
-    #[arg(long, default_value = "false", help_heading = "Migration", requires = "duckdb", group = "migration_options")]
+    #[arg(
+        long,
+        default_value = "false",
+        help_heading = "Relational import",
+        requires = "duckdb",
+        group = "relational_import_options"
+    )]
     pub overwrite: bool,
 
     /// Path to a TypeQL query file used as the loading template.
@@ -196,7 +207,7 @@ mod tests {
     use super::{Args, CSV_OPTIONS};
 
     #[test]
-    fn every_csv_option_conflicts_with_migration_options() {
+    fn every_csv_option_conflicts_with_relational_import_options() {
         let shared = [
             "database",
             "schema_file",
@@ -209,11 +220,11 @@ mod tests {
         ];
         let mut command = Args::command();
         command.build(); // the group learns its members here
-        let group = command.get_groups().find(|group| group.get_id() == "migration_options").unwrap();
-        let migration: Vec<&str> = group.get_args().map(|id| id.as_str()).collect();
+        let group = command.get_groups().find(|group| group.get_id() == "relational_import_options").unwrap();
+        let relational_import: Vec<&str> = group.get_args().map(|id| id.as_str()).collect();
         for arg in command.get_arguments().filter(|arg| arg.get_long() != Some("help")) {
             let id = arg.get_id().as_str();
-            if shared.contains(&id) || migration.contains(&id) {
+            if shared.contains(&id) || relational_import.contains(&id) {
                 continue;
             }
             assert!(CSV_OPTIONS.contains(&id), "'{id}' is in neither list; add it to CSV_OPTIONS or to this test");

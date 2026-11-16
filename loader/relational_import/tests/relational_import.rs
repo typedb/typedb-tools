@@ -16,8 +16,10 @@ use std::{
 
 use duckdb::Connection;
 use prost::Message;
-use typedb_migration::{Cancellation, Checksums, Migration, PrepareError, ProgressListener, ScanProgress};
 use typedb_protocol::migration::{Item, MigrationValue, item, migration_value};
+use typedb_relational_import::{
+    Cancellation, Checksums, PrepareError, ProgressListener, RelationalImport, ScanProgress,
+};
 
 const SCHEMA: &str = r#"define
   attribute name value string;
@@ -44,20 +46,20 @@ const SCHEMA: &str = r#"define
 "#;
 
 const FIXTURE: &str = r#"
-    CREATE TABLE person (_iid UBIGINT PRIMARY KEY, name VARCHAR NOT NULL, age INTEGER, tags VARCHAR[]);
+    CREATE TABLE person (_id UBIGINT PRIMARY KEY, name VARCHAR NOT NULL, age INTEGER, tags VARCHAR[]);
     COMMENT ON COLUMN person.tags IS '@typedb owns tag';
-    CREATE TABLE company (_iid UBIGINT PRIMARY KEY, name VARCHAR NOT NULL);
+    CREATE TABLE company (_id UBIGINT PRIMARY KEY, name VARCHAR NOT NULL);
     CREATE TABLE employment (
-        _iid UBIGINT NOT NULL UNIQUE,
-        person_id UBIGINT NOT NULL REFERENCES person(_iid),
-        company_id UBIGINT NOT NULL REFERENCES company(_iid),
+        _id UBIGINT NOT NULL UNIQUE,
+        person_id UBIGINT NOT NULL REFERENCES person(_id),
+        company_id UBIGINT NOT NULL REFERENCES company(_id),
         salary DECIMAL(12,2),
         PRIMARY KEY (person_id, company_id)
     );
     CREATE TABLE mentorship (
-        _iid UBIGINT PRIMARY KEY,
-        mentor_id UBIGINT NOT NULL REFERENCES person(_iid),
-        student_id UBIGINT NOT NULL REFERENCES person(_iid)
+        _id UBIGINT PRIMARY KEY,
+        mentor_id UBIGINT NOT NULL REFERENCES person(_id),
+        student_id UBIGINT NOT NULL REFERENCES person(_id)
     );
     COMMENT ON TABLE mentorship IS '@typedb relation mentorship (mentor = mentor_id, student = student_id)';
     INSERT INTO person VALUES (1, 'Alice', 30, ['a','b']), (2, 'Bob', NULL, NULL);
@@ -97,17 +99,18 @@ impl ProgressListener for Silent {
 }
 
 fn scratch(test_name: &str, schema: &str, sql: &str) -> Result<Scratch, Box<dyn Error>> {
-    let dir = Scratch(std::env::temp_dir().join(format!("typedb-migration-{test_name}-{}", std::process::id())));
+    let dir =
+        Scratch(std::env::temp_dir().join(format!("typedb-relational-import-{test_name}-{}", std::process::id())));
     fs::create_dir_all(&dir.0)?;
     Connection::open(dir.0.join("fixture.duckdb"))?.execute_batch(sql)?;
     fs::write(dir.0.join("schema.tql"), schema)?;
     Ok(dir)
 }
 
-fn prepare(dir: &Scratch) -> Result<Migration, PrepareError> {
+fn prepare(dir: &Scratch) -> Result<RelationalImport, PrepareError> {
     let schema = fs::read_to_string(dir.0.join("schema.tql")).expect("schema");
     let source = dir.0.join("fixture.duckdb");
-    Migration::prepare(&source, &schema, &dir.0.join("spill"), None, Arc::new(Cancellation::default()))
+    RelationalImport::prepare(&source, &schema, &dir.0.join("spill"), None, Arc::new(Cancellation::default()))
 }
 
 fn validation_errors(dir: &Scratch) -> Vec<String> {
@@ -120,9 +123,9 @@ fn validation_errors(dir: &Scratch) -> Vec<String> {
 }
 
 fn run(dir: &Scratch) -> Result<Vec<u8>, Box<dyn Error>> {
-    let migration = prepare(dir).map_err(|err| format!("validation failed: {err:?}"))?;
+    let relational_import = prepare(dir).map_err(|err| format!("validation failed: {err:?}"))?;
     let mut output = Vec::new();
-    migration.convert(&mut output, "3.0.0-test", "duckdb:fixture.duckdb", &Silent)?;
+    relational_import.convert(&mut output, "3.0.0-test", "duckdb:fixture.duckdb", &Silent)?;
     Ok(output)
 }
 
@@ -311,7 +314,7 @@ fn converts_and_produces_a_well_formed_import_file() -> Result<(), Box<dyn Error
         ["age:30", "name:Acme", "name:Alice", "name:Bob", "salary:50000.2500000000000000000", "tag:a", "tag:b"]
     );
 
-    assert_eq!(canonical(&items), canonical(&convert(&dir)?), "migration output differs between runs");
+    assert_eq!(canonical(&items), canonical(&convert(&dir)?), "relational_import output differs between runs");
 
     Ok(())
 }
@@ -321,10 +324,10 @@ fn foreign_key_column_on_entity_table_is_rejected() -> Result<(), Box<dyn Error>
     let dir = scratch(
         "entity-fk",
         "define\n  entity person;\n  entity pet;\n  entity toy;\n  entity employee sub person;\n",
-        "CREATE TABLE person (_iid UBIGINT PRIMARY KEY);
-         CREATE TABLE pet (_iid UBIGINT PRIMARY KEY, owner_id UBIGINT REFERENCES person(_iid));
-         CREATE TABLE employee (_iid UBIGINT PRIMARY KEY REFERENCES person(_iid));
-         CREATE TABLE toy (_iid UBIGINT PRIMARY KEY, holder_id UBIGINT, FOREIGN KEY (Holder_Id) REFERENCES person(_iid));",
+        "CREATE TABLE person (_id UBIGINT PRIMARY KEY);
+         CREATE TABLE pet (_id UBIGINT PRIMARY KEY, owner_id UBIGINT REFERENCES person(_id));
+         CREATE TABLE employee (_id UBIGINT PRIMARY KEY REFERENCES person(_id));
+         CREATE TABLE toy (_id UBIGINT PRIMARY KEY, holder_id UBIGINT, FOREIGN KEY (Holder_Id) REFERENCES person(_id));",
     )?;
     let errors = validation_errors(&dir);
     assert_error(&errors, &["table 'toy': column 'holder_id' references table 'person'"]);
@@ -332,7 +335,7 @@ fn foreign_key_column_on_entity_table_is_rejected() -> Result<(), Box<dyn Error>
         &errors,
         &["table 'pet': column 'owner_id' references table 'person', which on an entity table", "relations are tables"],
     );
-    assert_error(&errors, &["table 'employee': _iid is a FOREIGN KEY"]);
+    assert_error(&errors, &["table 'employee': _id is a FOREIGN KEY"]);
     Ok(())
 }
 
@@ -342,9 +345,9 @@ fn restated_roles_are_one_role_and_abstract_roles_are_refused() -> Result<(), Bo
         "restated-relates",
         "define\n  entity person, plays friendship:friend;\n  relation friendship, relates friend;\n  \
          friendship relates friend @card(0..2);\n",
-        "CREATE TABLE person (_iid UBIGINT PRIMARY KEY);
-         CREATE TABLE friendship (_iid UBIGINT PRIMARY KEY, a UBIGINT REFERENCES person(_iid),
-             b UBIGINT REFERENCES person(_iid));
+        "CREATE TABLE person (_id UBIGINT PRIMARY KEY);
+         CREATE TABLE friendship (_id UBIGINT PRIMARY KEY, a UBIGINT REFERENCES person(_id),
+             b UBIGINT REFERENCES person(_id));
          INSERT INTO person VALUES (1), (2);
          INSERT INTO friendship VALUES (1, 1, 2);",
     )?;
@@ -358,8 +361,8 @@ fn restated_roles_are_one_role_and_abstract_roles_are_refused() -> Result<(), Bo
     let dir = scratch(
         "abstract-role",
         "define\n  entity person, plays membership:member;\n  relation membership, relates member @abstract;\n",
-        "CREATE TABLE person (_iid UBIGINT PRIMARY KEY);
-         CREATE TABLE membership (_iid UBIGINT PRIMARY KEY, m UBIGINT REFERENCES person(_iid));
+        "CREATE TABLE person (_id UBIGINT PRIMARY KEY);
+         CREATE TABLE membership (_id UBIGINT PRIMARY KEY, m UBIGINT REFERENCES person(_id));
          COMMENT ON TABLE membership IS '@typedb relation membership (member = m)';",
     )?;
     assert_error(&validation_errors(&dir), &["bound to role 'membership:member', which is abstract"]);
@@ -371,7 +374,7 @@ fn decimals_of_any_scale_feed_one_double_attribute() -> Result<(), Box<dyn Error
     let dir = scratch(
         "decimals-to-double",
         "define\n  attribute v, value double;\n  entity t, owns v @card(0..);\n",
-        "CREATE TABLE t (_iid UBIGINT PRIMARY KEY, v DECIMAL(18,18), w DECIMAL(16,1), x DECIMAL(16,0),
+        "CREATE TABLE t (_id UBIGINT PRIMARY KEY, v DECIMAL(18,18), w DECIMAL(16,1), x DECIMAL(16,0),
                          y DECIMAL(38,25));
          COMMENT ON COLUMN t.w IS '@typedb owns v';
          COMMENT ON COLUMN t.x IS '@typedb owns v';
@@ -394,31 +397,28 @@ fn structure_and_mapping_errors_name_the_table_and_the_fix() -> Result<(), Box<d
     };
     let tables = [
         (
-            "CREATE TABLE person (_iid UBIGINT PRIMARY KEY, mystery VARCHAR)",
+            "CREATE TABLE person (_id UBIGINT PRIMARY KEY, mystery VARCHAR)",
             "column 'mystery' has no matching attribute",
         ),
         (
-            "CREATE TABLE person (_iid UBIGINT PRIMARY KEY, amount DOUBLE)",
+            "CREATE TABLE person (_id UBIGINT PRIMARY KEY, amount DOUBLE)",
             "column 'amount' (DOUBLE) cannot populate attribute 'amount' (value type 'decimal'): the types are \
              incompatible; stage the column as DECIMAL(38,19)",
         ),
-        ("CREATE TABLE person (id BIGINT PRIMARY KEY)", "table 'person' has no _iid column"),
-        ("CREATE TABLE person (_iid BIGINT PRIMARY KEY)", "table 'person': _iid must be UBIGINT"),
+        ("CREATE TABLE person (id BIGINT PRIMARY KEY)", "table 'person' has no _id column"),
+        ("CREATE TABLE person (_id BIGINT PRIMARY KEY)", "table 'person': _id must be UBIGINT"),
         (
-            "CREATE TABLE person (_iid UBIGINT); INSERT INTO person VALUES (1), (NULL), (NULL)",
-            "table 'person': 2 row(s) have no _iid, which every row needs as its instance id, e.g. rowid 1, 2",
+            "CREATE TABLE person (_id UBIGINT); INSERT INTO person VALUES (1), (NULL), (NULL)",
+            "table 'person': 2 row(s) have no _id, which every row needs as its instance id, e.g. rowid 1, 2",
         ),
         (
-            "CREATE TABLE person (_iid UBIGINT NOT NULL); INSERT INTO person VALUES (1), (2), (2), (3), (3), (3)",
-            "table 'person': 2 _iid value(s) appear in more than one row; an _iid is the instance's id within its \
-             type, e.g. _iid 2, 3",
+            "CREATE TABLE person (_id UBIGINT NOT NULL); INSERT INTO person VALUES (1), (2), (2), (3), (3), (3)",
+            "table 'person': 2 _id value(s) appear in more than one row; an _id is the instance's id within its \
+             type, e.g. _id 2, 3",
         ),
+        ("CREATE TABLE stranger (_id UBIGINT PRIMARY KEY)", "table 'stranger' has no matching entity or relation type"),
         (
-            "CREATE TABLE stranger (_iid UBIGINT PRIMARY KEY)",
-            "table 'stranger' has no matching entity or relation type",
-        ),
-        (
-            "CREATE TABLE person (_iid UBIGINT PRIMARY KEY, photo BLOB)",
+            "CREATE TABLE person (_id UBIGINT PRIMARY KEY, photo BLOB)",
             "table 'person': column 'photo' has unsupported type BLOB",
         ),
     ];
@@ -428,10 +428,7 @@ fn structure_and_mapping_errors_name_the_table_and_the_fix() -> Result<(), Box<d
     let directives = [
         ("TABLE person IS '@typedb entity'", "table 'person': unrecognised directive '@typedb entity'"),
         ("TABLE person IS '@typedb relation person (a'", "malformed @typedb relation directive: missing closing ')'"),
-        (
-            "COLUMN person._iid IS '@typedb skip'",
-            "table 'person': _iid holds the instances' ids and takes no directive",
-        ),
+        ("COLUMN person._id IS '@typedb skip'", "table 'person': _id holds the instances' ids and takes no directive"),
         (
             "COLUMN person.x IS '@typedb relation boss'",
             "table 'person': column 'x' cannot be a relation: relations are tables",
@@ -440,7 +437,7 @@ fn structure_and_mapping_errors_name_the_table_and_the_fix() -> Result<(), Box<d
         ("COLUMN person.x IS '@typedb:skip'", "table 'person': column 'x': unrecognised directive '@typedb:skip'"),
     ];
     for (comment, fragment) in directives {
-        check(&format!("CREATE TABLE person (_iid UBIGINT PRIMARY KEY, x INTEGER); COMMENT ON {comment}"), fragment)?;
+        check(&format!("CREATE TABLE person (_id UBIGINT PRIMARY KEY, x INTEGER); COMMENT ON {comment}"), fragment)?;
     }
     Ok(())
 }
@@ -450,7 +447,7 @@ fn skipped_tables_and_columns_are_not_read() -> Result<(), Box<dyn Error>> {
     let dir = scratch(
         "skip",
         "define\n  attribute name value string;\n  entity person, owns name;\n",
-        "CREATE TABLE person (_iid UBIGINT PRIMARY KEY, name VARCHAR, photo BLOB);
+        "CREATE TABLE person (_id UBIGINT PRIMARY KEY, name VARCHAR, photo BLOB);
          COMMENT ON COLUMN person.photo IS '@typedb skip';
          CREATE TABLE scratch (x INTEGER);
          COMMENT ON TABLE scratch IS '@TypeDB skip';
@@ -468,11 +465,11 @@ fn every_column_type_feeds_attributes_and_ownerships_alike() -> Result<(), Box<d
         "define\n  attribute seen value datetime-tz;\n  attribute amount value decimal;\n  \
          attribute ratio value double;\n  attribute big value integer;\n  attribute flag value boolean;\n  \
          entity reading, owns seen, owns amount @card(0..), owns ratio @card(0..), owns big, owns flag;\n",
-        "CREATE TABLE reading (_iid UBIGINT PRIMARY KEY, seen TIMESTAMPTZ, amounts DECIMAL(10,2)[], ratios INTEGER[],
+        "CREATE TABLE reading (_id UBIGINT PRIMARY KEY, seen TIMESTAMPTZ, amounts DECIMAL(10,2)[], ratios INTEGER[],
                                big HUGEINT, flag BOOLEAN);
          COMMENT ON COLUMN reading.amounts IS '@typedb owns amount';
          COMMENT ON COLUMN reading.ratios IS '@typedb owns ratio';
-         CREATE TABLE old_reading (_iid UBIGINT PRIMARY KEY, amounts BIGINT[], big BIGINT, flag BOOLEAN);
+         CREATE TABLE old_reading (_id UBIGINT PRIMARY KEY, amounts BIGINT[], big BIGINT, flag BOOLEAN);
          COMMENT ON TABLE old_reading IS '@typedb entity reading';
          COMMENT ON COLUMN old_reading.amounts IS '@typedb owns amount';
          INSERT INTO reading VALUES (1, '2020-01-01 00:00:00+02', [1.50, 2.25, 1.5], [1, 2], 9223372036854775807, true);
@@ -520,7 +517,7 @@ fn string_values_are_distinct_byte_wise() -> Result<(), Box<dyn Error>> {
         "collation",
         "define\n  attribute name value string;\n  attribute tag value string;\n  \
          entity person, owns name, owns tag @card(0..);\n",
-        "CREATE TABLE person (_iid UBIGINT PRIMARY KEY, name VARCHAR COLLATE NOCASE, tags UUID[]);
+        "CREATE TABLE person (_id UBIGINT PRIMARY KEY, name VARCHAR COLLATE NOCASE, tags UUID[]);
          COMMENT ON COLUMN person.tags IS '@typedb owns tag';
          INSERT INTO person VALUES
              (1, 'Bob', ['00000000-0000-0000-0000-000000000001', '00000000-0000-0000-0000-000000000002']),
@@ -544,17 +541,17 @@ fn generated_columns_are_refused_unless_skipped() -> Result<(), Box<dyn Error>> 
     let dir = scratch(
         "generated",
         schema,
-        "CREATE TABLE p (_iid UBIGINT AS (seq + 1), seq UBIGINT, token VARCHAR AS (uuid()::VARCHAR));
+        "CREATE TABLE p (_id UBIGINT AS (seq + 1), seq UBIGINT, token VARCHAR AS (uuid()::VARCHAR));
          COMMENT ON COLUMN p.seq IS '@typedb skip'; INSERT INTO p (seq) VALUES (0), (1);",
     )?;
     let errors = validation_errors(&dir);
-    assert_error(&errors, &["table 'p': _iid is generated, and DuckDB computes it anew on every read"]);
+    assert_error(&errors, &["table 'p': _id is generated, and DuckDB computes it anew on every read"]);
     assert_error(&errors, &["table 'p': column 'token' is generated", "materialise it when staging"]);
     let dir = scratch(
         "generated-skipped",
         schema,
-        "CREATE TABLE p (_iid UBIGINT, token VARCHAR, shout VARCHAR AS (upper(token)));
-         COMMENT ON COLUMN p.shout IS '@typedb skip'; INSERT INTO p (_iid, token) VALUES (1, 'a');",
+        "CREATE TABLE p (_id UBIGINT, token VARCHAR, shout VARCHAR AS (upper(token)));
+         COMMENT ON COLUMN p.shout IS '@typedb skip'; INSERT INTO p (_id, token) VALUES (1, 'a');",
     )?;
     convert(&dir)?;
     Ok(())
@@ -567,10 +564,10 @@ fn subtypes_inherit_ownerships_and_roles() -> Result<(), Box<dyn Error>> {
         "define\n  attribute name, value string;\n  attribute code, value string;\n  attribute badge sub code;\n  \
          entity person @abstract, owns name, owns badge, plays employment:employee;\n  entity employee sub person;\n  \
          entity company, plays employment:employer;\n  relation employment, relates employee, relates employer;\n",
-        "CREATE TABLE employee (_iid UBIGINT PRIMARY KEY, name VARCHAR, badge VARCHAR);
-         CREATE TABLE company (_iid UBIGINT PRIMARY KEY);
-         CREATE TABLE employment (_iid UBIGINT PRIMARY KEY, employee_id UBIGINT REFERENCES employee(_iid),
-                                  employer_id UBIGINT REFERENCES company(_iid));
+        "CREATE TABLE employee (_id UBIGINT PRIMARY KEY, name VARCHAR, badge VARCHAR);
+         CREATE TABLE company (_id UBIGINT PRIMARY KEY);
+         CREATE TABLE employment (_id UBIGINT PRIMARY KEY, employee_id UBIGINT REFERENCES employee(_id),
+                                  employer_id UBIGINT REFERENCES company(_id));
          INSERT INTO employee VALUES (1, 'Ann', 'A1');
          INSERT INTO company VALUES (2);
          INSERT INTO employment VALUES (3, 1, 2);",
@@ -608,14 +605,14 @@ fn roles_are_scoped_to_their_declaring_relation(posting: &str) -> Result<(), Box
     let dir = scratch(
         "scoping",
         &schema,
-        "CREATE TABLE person (_iid UBIGINT PRIMARY KEY);
-         CREATE TABLE observer (_iid UBIGINT PRIMARY KEY);
-         CREATE TABLE post (_iid UBIGINT PRIMARY KEY);
+        "CREATE TABLE person (_id UBIGINT PRIMARY KEY);
+         CREATE TABLE observer (_id UBIGINT PRIMARY KEY);
+         CREATE TABLE post (_id UBIGINT PRIMARY KEY);
          CREATE TABLE posting (
-             _iid UBIGINT PRIMARY KEY,
-             author_id UBIGINT NOT NULL REFERENCES person(_iid),
-             witness_id UBIGINT NOT NULL REFERENCES observer(_iid),
-             post_id UBIGINT NOT NULL REFERENCES post(_iid)
+             _id UBIGINT PRIMARY KEY,
+             author_id UBIGINT NOT NULL REFERENCES person(_id),
+             witness_id UBIGINT NOT NULL REFERENCES observer(_id),
+             post_id UBIGINT NOT NULL REFERENCES post(_id)
          );
          INSERT INTO person VALUES (1);
          INSERT INTO observer VALUES (4);
@@ -638,10 +635,10 @@ fn relations_may_play_in_relations_streamed_before_them() -> Result<(), Box<dyn 
     let dir = scratch(
         "forward-reference",
         NESTED,
-        "CREATE TABLE node (_iid UBIGINT PRIMARY KEY, name VARCHAR);
-         CREATE TABLE zbase (_iid UBIGINT PRIMARY KEY, n_id UBIGINT NOT NULL REFERENCES node(_iid));
+        "CREATE TABLE node (_id UBIGINT PRIMARY KEY, name VARCHAR);
+         CREATE TABLE zbase (_id UBIGINT PRIMARY KEY, n_id UBIGINT NOT NULL REFERENCES node(_id));
          COMMENT ON TABLE zbase IS '@typedb relation base';
-         CREATE TABLE aref (_iid UBIGINT PRIMARY KEY, z_id UBIGINT NOT NULL REFERENCES zbase(_iid), name VARCHAR);
+         CREATE TABLE aref (_id UBIGINT PRIMARY KEY, z_id UBIGINT NOT NULL REFERENCES zbase(_id), name VARCHAR);
          COMMENT ON TABLE aref IS '@typedb relation ref (target = z_id)';
          INSERT INTO node VALUES (1, 'n1');
          INSERT INTO zbase VALUES (5, 1);
@@ -671,14 +668,14 @@ fn foreign_keys_to_other_columns_are_ordinary_columns() -> Result<(), Box<dyn Er
                   entity country, owns code, plays residence:place;\n  entity node, owns a, owns b;\n  \
                   entity person, owns country-code, owns a, owns b, plays residence:resident;\n  \
                   relation residence, relates place, relates resident;\n";
-    let tables = "CREATE TABLE country (_iid UBIGINT PRIMARY KEY, code VARCHAR UNIQUE);
-         CREATE TABLE node (_iid UBIGINT PRIMARY KEY, a INTEGER, b INTEGER, UNIQUE (a, b));
-         CREATE TABLE person (_iid UBIGINT PRIMARY KEY, country_code VARCHAR REFERENCES country(code), a INTEGER,
+    let tables = "CREATE TABLE country (_id UBIGINT PRIMARY KEY, code VARCHAR UNIQUE);
+         CREATE TABLE node (_id UBIGINT PRIMARY KEY, a INTEGER, b INTEGER, UNIQUE (a, b));
+         CREATE TABLE person (_id UBIGINT PRIMARY KEY, country_code VARCHAR REFERENCES country(code), a INTEGER,
                               b INTEGER, FOREIGN KEY (a, b) REFERENCES node(a, b));
          INSERT INTO country VALUES (1, 'NL'); INSERT INTO node VALUES (1, 2, 3);
          INSERT INTO person VALUES (1, 'NL', 2, 3);";
-    let residence = "CREATE TABLE residence (_iid UBIGINT PRIMARY KEY, place VARCHAR REFERENCES country(code),
-                                 resident UBIGINT REFERENCES person(_iid));";
+    let residence = "CREATE TABLE residence (_id UBIGINT PRIMARY KEY, place VARCHAR REFERENCES country(code),
+                                 resident UBIGINT REFERENCES person(_id));";
 
     let items = convert(&scratch("value-fk", schema, tables)?)?;
     let mut attributes: Vec<&str> = items
@@ -709,8 +706,8 @@ fn ordered_capabilities_and_structs_are_refused_where_a_column_maps_to_them() ->
     let dir = scratch(
         "ordered-unused",
         schema,
-        "CREATE TABLE person (_iid UBIGINT PRIMARY KEY, name VARCHAR, tag VARCHAR[], location VARCHAR);
-         CREATE TABLE team (_iid UBIGINT PRIMARY KEY, member UBIGINT REFERENCES person(_iid));
+        "CREATE TABLE person (_id UBIGINT PRIMARY KEY, name VARCHAR, tag VARCHAR[], location VARCHAR);
+         CREATE TABLE team (_id UBIGINT PRIMARY KEY, member UBIGINT REFERENCES person(_id));
          COMMENT ON COLUMN person.tag IS '@typedb skip'; COMMENT ON COLUMN person.location IS '@typedb skip';
          INSERT INTO person VALUES (1, 'Ada', ['x'], 'here'); INSERT INTO team VALUES (1, 1);",
     )?;
@@ -721,8 +718,8 @@ fn ordered_capabilities_and_structs_are_refused_where_a_column_maps_to_them() ->
     let dir = scratch(
         "ordered-used",
         schema,
-        "CREATE TABLE person (_iid UBIGINT PRIMARY KEY, name VARCHAR, tag VARCHAR[], location VARCHAR);
-         CREATE TABLE queue (_iid UBIGINT PRIMARY KEY, member UBIGINT REFERENCES person(_iid));",
+        "CREATE TABLE person (_id UBIGINT PRIMARY KEY, name VARCHAR, tag VARCHAR[], location VARCHAR);
+         CREATE TABLE queue (_id UBIGINT PRIMARY KEY, member UBIGINT REFERENCES person(_id));",
     )?;
     let errors = validation_errors(&dir);
     assert_error(&errors, &["column 'tag' maps to attribute 'tag', which type 'person' owns ordered ('owns tag[]')"]);
@@ -736,7 +733,7 @@ fn nanosecond_timestamps_and_date_lists_convert_exactly() -> Result<(), Box<dyn 
     let dir = scratch(
         "nanos",
         EVENTS,
-        "CREATE TABLE event (_iid UBIGINT PRIMARY KEY, happened TIMESTAMP_NS, day DATE[]);
+        "CREATE TABLE event (_id UBIGINT PRIMARY KEY, happened TIMESTAMP_NS, day DATE[]);
          INSERT INTO event VALUES (1, '2020-01-01 00:00:00.000000001', ['2020-01-01', '2020-01-02']),
                                   (2, '2020-01-01 00:00:00.000000002', NULL),
                                   (3, '1969-12-31 23:59:59.999999999', NULL);",
@@ -778,19 +775,19 @@ fn values_typedb_cannot_hold_are_found_before_the_conversion() -> Result<(), Box
     ];
     for (column, value, fragment) in cases {
         let sql = format!(
-            "CREATE TABLE event (_iid UBIGINT PRIMARY KEY, {column}); INSERT INTO event VALUES (2, NULL), (7, {value});"
+            "CREATE TABLE event (_id UBIGINT PRIMARY KEY, {column}); INSERT INTO event VALUES (2, NULL), (7, {value});"
         );
         let dir = scratch("unstorable", EVENTS, &sql)?;
         let attribute = column.split(' ').next().unwrap();
         let context = format!("table 'event': column '{attribute}': 1 row(s) {fragment}");
-        assert_error(&validation_errors(&dir), &[&context, "e.g. _iid 7"]);
+        assert_error(&validation_errors(&dir), &[&context, "e.g. _id 7"]);
     }
 
     // The edges themselves are inside the range, in exact microseconds.
     let dir = scratch(
         "storable-edges",
         EVENTS,
-        "CREATE TABLE event (_iid UBIGINT PRIMARY KEY, happened TIMESTAMP, span INTERVAL);
+        "CREATE TABLE event (_id UBIGINT PRIMARY KEY, happened TIMESTAMP, span INTERVAL);
          INSERT INTO event VALUES
            (1, (DATE '1970-01-01' + 95026236)::TIMESTAMP + INTERVAL '23:59:59.999999', INTERVAL '5124095:34:33.709551'),
            (2, (DATE '1970-01-01' + (-96465292))::TIMESTAMP, INTERVAL '0 seconds');",
@@ -804,19 +801,19 @@ fn decimal_integer_parts_beyond_typedb_are_found_before_the_conversion() -> Resu
     let dir = scratch(
         "decimal-integer-part",
         "define\n  attribute amount value decimal;\n  entity item, owns amount;\n",
-        "CREATE TABLE item (_iid UBIGINT PRIMARY KEY, amount DECIMAL(38,2));
+        "CREATE TABLE item (_id UBIGINT PRIMARY KEY, amount DECIMAL(38,2));
          INSERT INTO item VALUES (1, 99999999999999999999.5), (2, 1.5), (3, 9223372036854775807.99),
                                 (4, -9223372036854775808.00), (5, -9223372036854775808.01);",
     )?;
     let errors = validation_errors(&dir);
     let fragment = "column 'amount': 2 row(s) hold a decimal whose integer part is beyond TypeDB's 64-bit range";
-    assert_error(&errors, &[fragment, "_iid 1, 5"]);
+    assert_error(&errors, &[fragment, "_id 1, 5"]);
 
     // Wide integers and decimals feeding doubles convert when a double holds them exactly.
     let dir = scratch(
         "wide-to-double",
         "define\n  attribute score value double;\n  entity item, owns score @card(0..);\n",
-        "CREATE TABLE item (_iid UBIGINT PRIMARY KEY, big UBIGINT, wide DECIMAL(38,19));
+        "CREATE TABLE item (_id UBIGINT PRIMARY KEY, big UBIGINT, wide DECIMAL(38,19));
          COMMENT ON COLUMN item.big IS '@typedb owns score'; COMMENT ON COLUMN item.wide IS '@typedb owns score';
          INSERT INTO item VALUES (1, 18446744073709551616 - 2048, 4503599627370495.5);",
     )?;
@@ -829,7 +826,7 @@ fn decimal_columns_beyond_typedb_precision_are_rejected() -> Result<(), Box<dyn 
     let dir = scratch(
         "decimal-scale",
         "define\n  attribute amount value decimal;\n  entity item, owns amount;\n",
-        "CREATE TABLE item (_iid UBIGINT PRIMARY KEY, amount DECIMAL(38,20));
+        "CREATE TABLE item (_id UBIGINT PRIMARY KEY, amount DECIMAL(38,20));
          INSERT INTO item VALUES (1, 1.12345678901234567891);",
     )?;
     assert_error(&validation_errors(&dir), &["'amount' has DECIMAL scale 20, beyond TypeDB's 19"]);
@@ -843,7 +840,7 @@ fn decimals_of_different_scales_that_make_one_double_are_refused() -> Result<(),
     let dir = scratch(
         "double-scales",
         schema,
-        "CREATE TABLE thing (_iid UBIGINT, coarse DECIMAL(4,1), fine DECIMAL(38,19));
+        "CREATE TABLE thing (_id UBIGINT, coarse DECIMAL(4,1), fine DECIMAL(38,19));
          COMMENT ON COLUMN thing.coarse IS '@typedb owns d'; COMMENT ON COLUMN thing.fine IS '@typedb owns d';
          INSERT INTO thing VALUES (1, 0.1, NULL), (2, NULL, 0.1000000000000000056);",
     )?;
@@ -856,7 +853,7 @@ fn decimals_of_different_scales_that_make_one_double_are_refused() -> Result<(),
     let dir = scratch(
         "double-scales-exact",
         schema,
-        "CREATE TABLE thing (_iid UBIGINT, coarse DECIMAL(18,1), fine DECIMAL(38,19));
+        "CREATE TABLE thing (_id UBIGINT, coarse DECIMAL(18,1), fine DECIMAL(38,19));
          COMMENT ON COLUMN thing.coarse IS '@typedb owns d'; COMMENT ON COLUMN thing.fine IS '@typedb owns d';
          INSERT INTO thing VALUES (1, 1.5, 1.25), (2, 0.1, 2.0625), (3, 0.5, NULL);",
     )?;
@@ -883,7 +880,7 @@ fn attribute_values_are_written_in_order() -> Result<(), Box<dyn Error>> {
     let dir = scratch(
         "sorted-values",
         "define\n  attribute n value integer;\n  entity thing, owns n;\n",
-        "CREATE TABLE thing (_iid UBIGINT, n BIGINT);
+        "CREATE TABLE thing (_id UBIGINT, n BIGINT);
          INSERT INTO thing SELECT i, hash(i) % 1000000000 FROM range(300000) t(i);",
     )?;
     let values: Vec<i64> = convert(&dir)?
@@ -906,23 +903,23 @@ fn integers_and_decimals_feeding_doubles_must_be_exact() -> Result<(), Box<dyn E
     let dir = scratch(
         "inexact-double",
         EVENTS,
-        "CREATE TABLE event (_iid UBIGINT PRIMARY KEY, score BIGINT);
-         CREATE TABLE reading (_iid UBIGINT PRIMARY KEY, score DECIMAL(20,3));
+        "CREATE TABLE event (_id UBIGINT PRIMARY KEY, score BIGINT);
+         CREATE TABLE reading (_id UBIGINT PRIMARY KEY, score DECIMAL(20,3));
          COMMENT ON TABLE reading IS '@typedb entity event';
          INSERT INTO event VALUES (1, 9007199254740993), (2, 9007199254740992);
          INSERT INTO reading VALUES (3, 0.1), (4, 12345678901234567.125);",
     )?;
     let errors = validation_errors(&dir);
-    assert_error(&errors, &["table 'event': column 'score': 1 row(s) hold a value that a double cannot", "_iid 1"]);
-    assert_error(&errors, &["table 'reading': column 'score': 1 row(s) hold a value that a double cannot", "_iid 4"]);
+    assert_error(&errors, &["table 'event': column 'score': 1 row(s) hold a value that a double cannot", "_id 1"]);
+    assert_error(&errors, &["table 'reading': column 'score': 1 row(s) hold a value that a double cannot", "_id 4"]);
     assert_eq!(errors.len(), 2, "{errors:#?}");
 
     // A decimal reads exactly at its own scale: 0.1 is the double nearest to it.
     let dir = scratch(
         "exact-double",
         EVENTS,
-        "CREATE TABLE event (_iid UBIGINT PRIMARY KEY, score BIGINT);
-         CREATE TABLE reading (_iid UBIGINT PRIMARY KEY, score DECIMAL(20,3));
+        "CREATE TABLE event (_id UBIGINT PRIMARY KEY, score BIGINT);
+         CREATE TABLE reading (_id UBIGINT PRIMARY KEY, score DECIMAL(20,3));
          COMMENT ON TABLE reading IS '@typedb entity event';
          INSERT INTO event VALUES (2, 9007199254740992);
          INSERT INTO reading VALUES (3, 0.1);",
@@ -949,7 +946,7 @@ fn schema_constraints_are_left_to_the_server() -> Result<(), Box<dyn Error>> {
         "define\n  attribute code @abstract, value string @regex(\"^[A-Z]+$\");\n  attribute country-code sub code;\n  \
          attribute level value integer @values(1, 2) @range(1..2);\n  \
          entity place, owns country-code @key, owns level @card(2..);\n",
-        "CREATE TABLE place (_iid UBIGINT PRIMARY KEY, country_code VARCHAR, level INTEGER);
+        "CREATE TABLE place (_id UBIGINT PRIMARY KEY, country_code VARCHAR, level INTEGER);
          INSERT INTO place VALUES (1, 'gb', 3), (2, 'gb', NULL);",
     )?;
     convert(&dir)?;
@@ -962,7 +959,7 @@ fn abstract_attributes_cannot_be_populated() -> Result<(), Box<dyn Error>> {
         "abstract-attribute",
         "define\n  attribute code @abstract, value string;\n  attribute country-code sub code;\n  \
          entity place, owns code;\n",
-        "CREATE TABLE place (_iid UBIGINT PRIMARY KEY, code VARCHAR);",
+        "CREATE TABLE place (_id UBIGINT PRIMARY KEY, code VARCHAR);",
     )?;
     assert_error(&validation_errors(&dir), &["'code'", "abstract"]);
     Ok(())
@@ -973,7 +970,7 @@ fn reserved_keywords_are_refused_as_labels() -> Result<(), Box<dyn Error>> {
     let dir = scratch(
         "reserved-labels",
         "define\n  entity person, plays edge:from;\n  relation edge, relates from;\n",
-        "CREATE TABLE person (_iid UBIGINT PRIMARY KEY);",
+        "CREATE TABLE person (_id UBIGINT PRIMARY KEY);",
     )?;
     let Err(PrepareError::Setup(message)) = prepare(&dir) else { panic!("a reserved keyword was accepted as a label") };
     assert!(message.contains("'from' is a reserved TypeQL keyword"), "{message}");
@@ -986,9 +983,9 @@ fn exact_names_win_over_dashed_readings() -> Result<(), Box<dyn Error>> {
         "exact-names",
         "define\n  attribute a-b value string;\n  attribute a_b value string;\n  entity t, owns a-b, owns a_b;\n  \
          entity t_x;\n  entity t-x;\n  relation u-v, relates part;\n  entity u_v;\n",
-        "CREATE TABLE t (_iid UBIGINT PRIMARY KEY, a_b VARCHAR);
-         CREATE TABLE t_x (_iid UBIGINT PRIMARY KEY);
-         CREATE TABLE u_v (_iid UBIGINT PRIMARY KEY);
+        "CREATE TABLE t (_id UBIGINT PRIMARY KEY, a_b VARCHAR);
+         CREATE TABLE t_x (_id UBIGINT PRIMARY KEY);
+         CREATE TABLE u_v (_id UBIGINT PRIMARY KEY);
          INSERT INTO t VALUES (1, 'v'); INSERT INTO t_x VALUES (1); INSERT INTO u_v VALUES (1);",
     )?;
     let items = convert(&dir)?;
@@ -1009,7 +1006,7 @@ fn a_label_names_one_type() -> Result<(), Box<dyn Error>> {
     let dir = scratch(
         "two-kinds",
         "define\n  entity thing;\n  relation thing, relates part;\n",
-        "CREATE TABLE thing (_iid UBIGINT PRIMARY KEY);",
+        "CREATE TABLE thing (_id UBIGINT PRIMARY KEY);",
     )?;
     let Err(PrepareError::Setup(message)) = prepare(&dir) else { panic!("a label was accepted for two types") };
     assert!(message.contains("'thing' is declared as more than one kind of type"), "{message}");
@@ -1017,21 +1014,21 @@ fn a_label_names_one_type() -> Result<(), Box<dyn Error>> {
 }
 
 #[test]
-fn instances_are_numbered_by_their_iid() -> Result<(), Box<dyn Error>> {
+fn instances_are_numbered_by_their_id() -> Result<(), Box<dyn Error>> {
     let dir = scratch(
         "numbering",
         "define\n  attribute name value string;\n  entity person, owns name, plays knows:friend;\n  \
          relation knows, owns name, relates friend @card(1..), plays knows:friend;\n",
-        "CREATE TABLE person (_iid UBIGINT PRIMARY KEY, name VARCHAR);
-         CREATE TABLE contractor (_iid UBIGINT PRIMARY KEY, name VARCHAR);
+        "CREATE TABLE person (_id UBIGINT PRIMARY KEY, name VARCHAR);
+         CREATE TABLE contractor (_id UBIGINT PRIMARY KEY, name VARCHAR);
          COMMENT ON TABLE contractor IS '@typedb entity person';
-         CREATE TABLE knows (_iid UBIGINT PRIMARY KEY, name VARCHAR, a UBIGINT REFERENCES person(_iid),
-                             b UBIGINT REFERENCES contractor(_iid), c UBIGINT REFERENCES knows(_iid));
+         CREATE TABLE knows (_id UBIGINT PRIMARY KEY, name VARCHAR, a UBIGINT REFERENCES person(_id),
+                             b UBIGINT REFERENCES contractor(_id), c UBIGINT REFERENCES knows(_id));
          COMMENT ON TABLE knows IS '@typedb relation knows (friend = a)';
-         CREATE TABLE alumni (_iid UBIGINT PRIMARY KEY, name VARCHAR);
+         CREATE TABLE alumni (_id UBIGINT PRIMARY KEY, name VARCHAR);
          COMMENT ON TABLE alumni IS '@typedb entity person';
-         CREATE TABLE aknows (_iid UBIGINT PRIMARY KEY, name VARCHAR, a UBIGINT REFERENCES person(_iid),
-                              c UBIGINT REFERENCES knows(_iid));
+         CREATE TABLE aknows (_id UBIGINT PRIMARY KEY, name VARCHAR, a UBIGINT REFERENCES person(_id),
+                              c UBIGINT REFERENCES knows(_id));
          COMMENT ON TABLE aknows IS '@typedb relation knows (friend = a)';
          INSERT INTO person VALUES (1000, 'Ann'), (5, 'Bob');
          INSERT INTO contractor VALUES (20, 'Dee'), (7, 'Cid');
@@ -1052,7 +1049,7 @@ fn instances_are_numbered_by_their_iid() -> Result<(), Box<dyn Error>> {
         };
         names.insert(id.clone(), owned[0].globally_unique_id.trim_start_matches("name:").to_owned());
     }
-    // An instance's number is its _iid, whichever of its type's tables it comes from.
+    // An instance's number is its _id, whichever of its type's tables it comes from.
     let expected = [("person:7", "Cid"), ("person:20", "Dee"), ("person:5", "Bob"), ("person:1000", "Ann")];
     let relations = [("knows:1", "ak"), ("knows:3", "k3"), ("knows:7", "k7"), ("knows:9", "k9")];
     for (id, name) in expected.into_iter().chain(relations) {
@@ -1074,36 +1071,33 @@ fn instances_are_numbered_by_their_iid() -> Result<(), Box<dyn Error>> {
 }
 
 #[test]
-fn iids_must_fit_typedb_and_differ_within_a_type() -> Result<(), Box<dyn Error>> {
+fn ids_must_fit_typedb_and_differ_within_a_type() -> Result<(), Box<dyn Error>> {
     let schema = "define\n  entity person;\n";
     let dir = scratch(
         "wide-ids",
         schema,
-        "CREATE TABLE person (_iid UBIGINT);
+        "CREATE TABLE person (_id UBIGINT);
          INSERT INTO person VALUES (0), (9223372036854775808), (18446744073709551615);",
     )?;
     assert_error(
         &validation_errors(&dir),
-        &[
-            "table 'person': 2 row(s) have an _iid of 2^63 or more",
-            "e.g. _iid 9223372036854775808, 18446744073709551615",
-        ],
+        &["table 'person': 2 row(s) have an _id of 2^63 or more", "e.g. _id 9223372036854775808, 18446744073709551615"],
     );
     let dir = scratch(
         "shared-ids",
         schema,
-        "CREATE TABLE person (_iid UBIGINT); INSERT INTO person VALUES (1), (2), (3);
-         CREATE TABLE staff (_iid UBIGINT); INSERT INTO staff VALUES (3), (4), (1);
+        "CREATE TABLE person (_id UBIGINT); INSERT INTO person VALUES (1), (2), (3);
+         CREATE TABLE staff (_id UBIGINT); INSERT INTO staff VALUES (3), (4), (1);
          COMMENT ON TABLE staff IS '@typedb entity person';",
     )?;
     assert_error(
         &validation_errors(&dir),
-        &["tables 'person', 'staff' mapped to 'person': 2 _iid value(s) appear in more than one row", "1, 3"],
+        &["tables 'person', 'staff' mapped to 'person': 2 _id value(s) appear in more than one row", "1, 3"],
     );
     let at_the_limit = scratch(
         "ids-at-the-limit",
         schema,
-        "CREATE TABLE person (_iid UBIGINT); INSERT INTO person VALUES (5), (9223372036854775807);",
+        "CREATE TABLE person (_id UBIGINT); INSERT INTO person VALUES (5), (9223372036854775807);",
     )?;
     let items = convert(&at_the_limit)?;
     let mut ids: Vec<u64> = items
@@ -1116,19 +1110,19 @@ fn iids_must_fit_typedb_and_differ_within_a_type() -> Result<(), Box<dyn Error>>
 }
 
 #[test]
-fn instances_spanning_many_chunks_keep_their_iid() -> Result<(), Box<dyn Error>> {
+fn instances_spanning_many_chunks_keep_their_id() -> Result<(), Box<dyn Error>> {
     let dir = scratch(
         "many-chunks",
         "define\n  attribute age value integer;\n  entity person, owns age, plays knows:friend;\n  \
          relation knows, relates friend;\n",
-        "CREATE TABLE person (_iid UBIGINT PRIMARY KEY, age BIGINT);
-         CREATE TABLE knows (_iid UBIGINT PRIMARY KEY, friend_id UBIGINT REFERENCES person(_iid));
+        "CREATE TABLE person (_id UBIGINT PRIMARY KEY, age BIGINT);
+         CREATE TABLE knows (_id UBIGINT PRIMARY KEY, friend_id UBIGINT REFERENCES person(_id));
          INSERT INTO person SELECT 1000000 - 3 * i, 1000000 - 3 * i FROM range(100000) t(i);
          INSERT INTO knows SELECT i, 1000000 - 3 * i FROM range(100000) t(i);",
     )?;
     let items = convert(&dir)?;
     assert_file_guarantees(&items);
-    // A person's id is its _iid, which is also its age.
+    // A person's id is its _id, which is also its age.
     let age_of_person: HashMap<u64, &str> = items
         .iter()
         .filter_map(|item| match item {
@@ -1143,12 +1137,12 @@ fn instances_spanning_many_chunks_keep_their_iid() -> Result<(), Box<dyn Error>>
     assert_eq!(age_of_person[&1_000_000], "age:1000000");
     for item in &items {
         if let item::Item::Relation(relation) = item {
-            let friend_iid = 1_000_000 - 3 * relation.label_scoped_id.unwrap();
+            let friend_id = 1_000_000 - 3 * relation.label_scoped_id.unwrap();
             let player = &relation.roles[0].players[0];
-            assert_eq!(player.label_scoped_id.as_ref().unwrap().label_scoped_id, friend_iid);
+            assert_eq!(player.label_scoped_id.as_ref().unwrap().label_scoped_id, friend_id);
             assert_eq!(
                 age_of_person[&player.label_scoped_id.as_ref().unwrap().label_scoped_id],
-                format!("age:{friend_iid}")
+                format!("age:{friend_id}")
             );
         }
     }
@@ -1160,10 +1154,10 @@ fn ids_of_tables_sharing_a_type_are_reported_as_checked() -> Result<(), Box<dyn 
     let dir = scratch(
         "shared-type-summary",
         "define\n  entity person;\n  entity company;\n",
-        "CREATE TABLE person (_iid UBIGINT PRIMARY KEY);
-         CREATE TABLE staff (_iid UBIGINT PRIMARY KEY);
+        "CREATE TABLE person (_id UBIGINT PRIMARY KEY);
+         CREATE TABLE staff (_id UBIGINT PRIMARY KEY);
          COMMENT ON TABLE staff IS '@typedb entity person';
-         CREATE TABLE company (_iid UBIGINT PRIMARY KEY);",
+         CREATE TABLE company (_id UBIGINT PRIMARY KEY);",
     )?;
     let summary = prepare(&dir).map_err(|err| format!("{err:?}"))?.describe_mapping();
     let ids = |table: &str| {
@@ -1180,8 +1174,8 @@ fn references_declared_for_some_columns_are_reported_as_both() -> Result<(), Box
     let dir = scratch(
         "mixed-references",
         "define\n  entity person, plays pair:member;\n  relation pair, relates member;\n",
-        "CREATE TABLE person (_iid UBIGINT PRIMARY KEY);
-         CREATE TABLE pair (_iid UBIGINT PRIMARY KEY, a UBIGINT REFERENCES person(_iid), b UBIGINT);
+        "CREATE TABLE person (_id UBIGINT PRIMARY KEY);
+         CREATE TABLE pair (_id UBIGINT PRIMARY KEY, a UBIGINT REFERENCES person(_id), b UBIGINT);
          COMMENT ON COLUMN pair.b IS '@typedb references person';",
     )?;
     let summary = prepare(&dir).map_err(|err| format!("{err:?}"))?.describe_mapping();
@@ -1197,12 +1191,12 @@ fn views_and_other_schemas_are_reported() -> Result<(), Box<dyn Error>> {
     let dir = scratch(
         "ignored",
         "define\n  entity node;\n",
-        "CREATE TABLE node (_iid UBIGINT PRIMARY KEY);
+        "CREATE TABLE node (_id UBIGINT PRIMARY KEY);
          CREATE VIEW node_view AS SELECT * FROM node;
-         CREATE SCHEMA staging; CREATE TABLE staging.node (_iid UBIGINT PRIMARY KEY);",
+         CREATE SCHEMA staging; CREATE TABLE staging.node (_id UBIGINT PRIMARY KEY);",
     )?;
-    let migration = prepare(&dir).expect("validation passes");
-    let warnings: Vec<&str> = migration.warnings().iter().map(|warning| warning.as_str()).collect();
+    let relational_import = prepare(&dir).expect("validation passes");
+    let warnings: Vec<&str> = relational_import.warnings().iter().map(|warning| warning.as_str()).collect();
     assert!(warnings.iter().any(|warning| warning.contains("view main.node_view is not loaded")), "{warnings:?}");
     assert!(warnings.iter().any(|warning| warning.contains("table staging.node is not loaded")), "{warnings:?}");
     Ok(())
@@ -1211,8 +1205,8 @@ fn views_and_other_schemas_are_reported() -> Result<(), Box<dyn Error>> {
 #[test]
 fn zoned_nanosecond_timestamps_convert_exactly_and_bound_their_attribute() -> Result<(), Box<dyn Error>> {
     let schema = "define\n  attribute moment value datetime-tz;\n  entity event, owns moment;\n";
-    let rows = "CREATE TABLE event (_iid UBIGINT PRIMARY KEY, moment TIMESTAMPTZ_NS);
-         CREATE TABLE old_event (_iid UBIGINT PRIMARY KEY, moment TIMESTAMPTZ);
+    let rows = "CREATE TABLE event (_id UBIGINT PRIMARY KEY, moment TIMESTAMPTZ_NS);
+         CREATE TABLE old_event (_id UBIGINT PRIMARY KEY, moment TIMESTAMPTZ);
          COMMENT ON TABLE old_event IS '@typedb entity event';
          INSERT INTO event VALUES (1, '2020-01-01 00:00:00.000000001+00'), (2, '1969-12-31 23:59:59.999999999+00');
          INSERT INTO old_event VALUES (3, '2020-01-01 00:00:00+00');";
@@ -1253,15 +1247,15 @@ fn timestamps_beside_nanosecond_columns_must_fit_their_range() -> Result<(), Box
     let dir = scratch(
         "mixed-timestamps",
         EVENTS,
-        "CREATE TABLE event (_iid UBIGINT PRIMARY KEY, happened TIMESTAMP_NS);
-         CREATE TABLE old_event (_iid UBIGINT PRIMARY KEY, happened TIMESTAMP);
+        "CREATE TABLE event (_id UBIGINT PRIMARY KEY, happened TIMESTAMP_NS);
+         CREATE TABLE old_event (_id UBIGINT PRIMARY KEY, happened TIMESTAMP);
          COMMENT ON TABLE old_event IS '@typedb entity event';
          INSERT INTO event VALUES (1, '2020-01-01 00:00:00.000000001');
          INSERT INTO old_event VALUES (2, '1500-01-01'), (3, '2020-01-01');",
     )?;
     let errors = validation_errors(&dir);
     let fragment = "table 'old_event': column 'happened': 1 row(s) hold a timestamp outside the nanosecond range";
-    assert_error(&errors, &[fragment, "e.g. _iid 2"]);
+    assert_error(&errors, &[fragment, "e.g. _id 2"]);
     assert_eq!(errors.len(), 1, "{errors:#?}");
     Ok(())
 }
@@ -1272,7 +1266,7 @@ fn values_sql_merges_but_typedb_distinguishes_stay_consistent() -> Result<(), Bo
         "sql-merged-values",
         "define\n  attribute weight value double;\n  attribute span value duration;\n  \
          entity thing, owns weight, owns span @card(0..);\n",
-        "CREATE TABLE thing (_iid UBIGINT PRIMARY KEY, weight DOUBLE, span INTERVAL, spans INTERVAL[]);
+        "CREATE TABLE thing (_id UBIGINT PRIMARY KEY, weight DOUBLE, span INTERVAL, spans INTERVAL[]);
          COMMENT ON COLUMN thing.spans IS '@typedb owns span';
          INSERT INTO thing VALUES (1, '-0.0'::DOUBLE, INTERVAL '1 month', [INTERVAL '30 days', INTERVAL '1 month']),
                                   (2, 0.0, INTERVAL '1 day', NULL), (3, '-0.0'::DOUBLE, INTERVAL '24 hours', []);",
@@ -1299,7 +1293,7 @@ fn equal_values_from_columns_of_different_types_are_one_attribute() -> Result<()
         "define\n  attribute at value datetime;\n  attribute amount value decimal;\n  attribute n value integer;\n  \
          attribute weight value double;\n  \
          entity thing, owns at @card(0..), owns amount @card(0..), owns n @card(0..), owns weight @card(0..);\n",
-        "CREATE TABLE thing (_iid UBIGINT, s TIMESTAMP_S, ms TIMESTAMP_MS, us TIMESTAMP, ns TIMESTAMP_NS,
+        "CREATE TABLE thing (_id UBIGINT, s TIMESTAMP_S, ms TIMESTAMP_MS, us TIMESTAMP, ns TIMESTAMP_NS,
                              d2 DECIMAL(5,2), d10 DECIMAL(20,10), d19 DECIMAL(38,19),
                              a8 BIGINT, i1 TINYINT, i8 BIGINT, i16 HUGEINT, w8 BIGINT, w2 DECIMAL(10,2), wf FLOAT);
          COMMENT ON COLUMN thing.s IS '@typedb owns at'; COMMENT ON COLUMN thing.ms IS '@typedb owns at';
@@ -1334,7 +1328,7 @@ fn intervals_of_hundreds_of_millennia_are_durations() -> Result<(), Box<dyn Erro
     let dir = scratch(
         "long-intervals",
         "define\n  attribute span value duration;\n  entity thing, owns span;\n",
-        "CREATE TABLE thing (_iid UBIGINT, span INTERVAL);
+        "CREATE TABLE thing (_id UBIGINT, span INTERVAL);
          INSERT INTO thing VALUES (1, INTERVAL '500000 years 5 days 25:00:00.5');",
     )?;
     let durations: Vec<_> = convert(&dir)?
@@ -1355,9 +1349,9 @@ fn repeated_values_and_players_are_written_once() -> Result<(), Box<dyn Error>> 
         "repeats",
         "define\n  attribute tag value string;\n  entity node, owns tag @card(0..), plays link:tip;\n  \
          relation link, relates tip @card(0..3);\n",
-        "CREATE TABLE node (_iid UBIGINT PRIMARY KEY, tag VARCHAR, tags VARCHAR[]);
+        "CREATE TABLE node (_id UBIGINT PRIMARY KEY, tag VARCHAR, tags VARCHAR[]);
          COMMENT ON COLUMN node.tags IS '@typedb owns tag';
-         CREATE TABLE link (_iid UBIGINT PRIMARY KEY, a UBIGINT REFERENCES node(_iid), b UBIGINT REFERENCES node(_iid));
+         CREATE TABLE link (_id UBIGINT PRIMARY KEY, a UBIGINT REFERENCES node(_id), b UBIGINT REFERENCES node(_id));
          COMMENT ON TABLE link IS '@typedb relation link (tip = a, tip = b)';
          INSERT INTO node VALUES (1, 'x', ['x', 'y', 'x']);
          INSERT INTO link VALUES (1, 1, 1);",
@@ -1383,11 +1377,11 @@ fn relation_directive_bindings_are_checked() -> Result<(), Box<dyn Error>> {
         "bindings",
         "define\n  attribute name value string;\n  entity node, plays link:a, plays link:b;\n  entity rock;\n  \
          relation link, relates a, relates b, owns name;\n",
-        "CREATE TABLE node (_iid UBIGINT PRIMARY KEY);
-         CREATE TABLE rock (_iid UBIGINT PRIMARY KEY);
-         CREATE TABLE link (_iid UBIGINT PRIMARY KEY, x UBIGINT REFERENCES node(_iid), y UBIGINT REFERENCES node(_iid),
-                            r UBIGINT REFERENCES rock(_iid), o UBIGINT REFERENCES node(_iid));
-         COMMENT ON TABLE link IS '@typedb relation link (a = x, b = x, b = yy, a = r, b = y, a = _iid)';
+        "CREATE TABLE node (_id UBIGINT PRIMARY KEY);
+         CREATE TABLE rock (_id UBIGINT PRIMARY KEY);
+         CREATE TABLE link (_id UBIGINT PRIMARY KEY, x UBIGINT REFERENCES node(_id), y UBIGINT REFERENCES node(_id),
+                            r UBIGINT REFERENCES rock(_id), o UBIGINT REFERENCES node(_id));
+         COMMENT ON TABLE link IS '@typedb relation link (a = x, b = x, b = yy, a = r, b = y, a = _id)';
          COMMENT ON COLUMN link.y IS '@typedb skip';
          COMMENT ON COLUMN link.o IS '@typedb owns name';",
     )?;
@@ -1395,7 +1389,7 @@ fn relation_directive_bindings_are_checked() -> Result<(), Box<dyn Error>> {
     assert_error(&errors, &["binds role 'b' to column 'x', which the directive already binds"]);
     assert_error(&errors, &["binds role 'b' to column 'yy', which the table does not have"]);
     assert_error(&errors, &["binds role 'b' to column 'y', which is marked '@typedb skip'"]);
-    assert_error(&errors, &["binds role 'a' to column '_iid', which holds the relations' own ids"]);
+    assert_error(&errors, &["binds role 'a' to column '_id', which holds the relations' own ids"]);
     assert_error(&errors, &["column 'r' is bound to role 'link:a'", "'rock'", "does not play that role"]);
     assert_error(&errors, &["table 'link': column 'o' holds role players", "cannot own"]);
     Ok(())
@@ -1409,12 +1403,12 @@ fn directive_bindings_may_be_empty_and_spell_columns_in_any_case() -> Result<(),
     let dir = scratch(
         "binding-spelling",
         schema,
-        "CREATE TABLE person (_iid UBIGINT PRIMARY KEY);
-         CREATE TABLE pet (_iid UBIGINT PRIMARY KEY);
-         CREATE TABLE mentorship (_iid UBIGINT PRIMARY KEY, student_id UBIGINT REFERENCES person(_iid),
-                                  Mentor_Id UBIGINT REFERENCES person(_iid));
+        "CREATE TABLE person (_id UBIGINT PRIMARY KEY);
+         CREATE TABLE pet (_id UBIGINT PRIMARY KEY);
+         CREATE TABLE mentorship (_id UBIGINT PRIMARY KEY, student_id UBIGINT REFERENCES person(_id),
+                                  Mentor_Id UBIGINT REFERENCES person(_id));
          COMMENT ON TABLE mentorship IS '@typedb relation mentorship (mentor = MENTOR_ID, student = Student_Id, )';
-         CREATE TABLE ownership (_iid UBIGINT PRIMARY KEY, pet_id UBIGINT REFERENCES pet(_iid));
+         CREATE TABLE ownership (_id UBIGINT PRIMARY KEY, pet_id UBIGINT REFERENCES pet(_id));
          COMMENT ON TABLE ownership IS '@typedb relation ownership ()';
          INSERT INTO person VALUES (1), (2);
          INSERT INTO pet VALUES (1);
@@ -1437,9 +1431,9 @@ fn a_directive_does_not_settle_the_roles_of_columns_it_leaves_out() -> Result<()
     // Several columns may bind one role, so binding `mentor` says nothing about `student_id`: it is ambiguous.
     let schema = "define\n  entity person, plays mentorship:mentor, plays mentorship:student;\n  \
                   relation mentorship, relates mentor @card(0..), relates student @card(0..);\n";
-    let tables = "CREATE TABLE person (_iid UBIGINT PRIMARY KEY);
-         CREATE TABLE mentorship (_iid UBIGINT PRIMARY KEY, student_id UBIGINT REFERENCES person(_iid),
-                                  mentor_id UBIGINT REFERENCES person(_iid));
+    let tables = "CREATE TABLE person (_id UBIGINT PRIMARY KEY);
+         CREATE TABLE mentorship (_id UBIGINT PRIMARY KEY, student_id UBIGINT REFERENCES person(_id),
+                                  mentor_id UBIGINT REFERENCES person(_id));
          INSERT INTO person VALUES (1), (2);
          INSERT INTO mentorship VALUES (3, 1, 2);";
     let partial = scratch(
@@ -1474,11 +1468,11 @@ fn one_role_is_inferred_for_several_player_tables() -> Result<(), Box<dyn Error>
         "role-per-player-table",
         "define\n  entity person, plays ownership:owner;\n  entity company, plays ownership:owner;\n  \
          entity car, plays ownership:owned;\n  relation ownership, relates owner, relates owned;\n",
-        "CREATE TABLE person (_iid UBIGINT PRIMARY KEY);
-         CREATE TABLE company (_iid UBIGINT PRIMARY KEY);
-         CREATE TABLE car (_iid UBIGINT PRIMARY KEY);
-         CREATE TABLE ownership (_iid UBIGINT PRIMARY KEY, person_id UBIGINT REFERENCES person(_iid),
-                                 company_id UBIGINT REFERENCES company(_iid), car_id UBIGINT REFERENCES car(_iid));
+        "CREATE TABLE person (_id UBIGINT PRIMARY KEY);
+         CREATE TABLE company (_id UBIGINT PRIMARY KEY);
+         CREATE TABLE car (_id UBIGINT PRIMARY KEY);
+         CREATE TABLE ownership (_id UBIGINT PRIMARY KEY, person_id UBIGINT REFERENCES person(_id),
+                                 company_id UBIGINT REFERENCES company(_id), car_id UBIGINT REFERENCES car(_id));
          INSERT INTO person VALUES (1); INSERT INTO company VALUES (1); INSERT INTO car VALUES (1), (2);
          INSERT INTO ownership VALUES (1, 1, NULL, 1), (2, NULL, 1, 2);",
     )?;
@@ -1503,9 +1497,9 @@ fn a_column_named_rowid_does_not_disturb_the_scan() -> Result<(), Box<dyn Error>
         "rowid",
         "define\n  attribute rowid value integer;\n  entity node, owns rowid, plays link:tip;\n  \
          relation link, relates tip @card(1..2);\n",
-        "CREATE TABLE node (_iid UBIGINT PRIMARY KEY, rowid INTEGER);
-         CREATE TABLE link (_iid UBIGINT PRIMARY KEY, rowid UBIGINT REFERENCES node(_iid),
-                            b UBIGINT REFERENCES node(_iid));
+        "CREATE TABLE node (_id UBIGINT PRIMARY KEY, rowid INTEGER);
+         CREATE TABLE link (_id UBIGINT PRIMARY KEY, rowid UBIGINT REFERENCES node(_id),
+                            b UBIGINT REFERENCES node(_id));
          COMMENT ON TABLE link IS '@typedb relation link (tip = rowid, tip = b)';
          INSERT INTO node VALUES (1, NULL), (2, -1), (3, 200000);
          INSERT INTO link VALUES (1, 1, 2), (2, NULL, 3), (3, 3, 1);",
@@ -1522,10 +1516,10 @@ fn foreign_keys_are_matched_as_duckdb_resolves_them() -> Result<(), Box<dyn Erro
     let dir = scratch(
         "fk-case",
         "define\n  entity person, plays link:tip;\n  entity company, plays link:tip;\n  relation link, relates tip;\n",
-        "CREATE TABLE person (_iid UBIGINT PRIMARY KEY);
-         CREATE TABLE company (_iid UBIGINT PRIMARY KEY);
-         CREATE TABLE link (_iid UBIGINT PRIMARY KEY, a UBIGINT REFERENCES Person(_IID), b UBIGINT,
-                            FOREIGN KEY (b) REFERENCES person(_iid), FOREIGN KEY (b) REFERENCES company(_iid));
+        "CREATE TABLE person (_id UBIGINT PRIMARY KEY);
+         CREATE TABLE company (_id UBIGINT PRIMARY KEY);
+         CREATE TABLE link (_id UBIGINT PRIMARY KEY, a UBIGINT REFERENCES Person(_ID), b UBIGINT,
+                            FOREIGN KEY (b) REFERENCES person(_id), FOREIGN KEY (b) REFERENCES company(_id));
          INSERT INTO person VALUES (1);",
     )?;
     let errors = validation_errors(&dir);
@@ -1539,8 +1533,8 @@ fn the_id_column_is_spelt_in_any_case() -> Result<(), Box<dyn Error>> {
     let dir = scratch(
         "id-case",
         "define\n  entity person, plays link:tip;\n  relation link, relates tip;\n",
-        "CREATE TABLE person (_IID UBIGINT);
-         CREATE TABLE link (_Iid UBIGINT PRIMARY KEY, a UBIGINT);
+        "CREATE TABLE person (_ID UBIGINT);
+         CREATE TABLE link (_Id UBIGINT PRIMARY KEY, a UBIGINT);
          COMMENT ON COLUMN link.a IS '@typedb references person';
          INSERT INTO person VALUES (1), (2);
          INSERT INTO link VALUES (7, 1), (8, 2);",
@@ -1560,12 +1554,12 @@ fn the_id_column_is_spelt_in_any_case() -> Result<(), Box<dyn Error>> {
 fn role_inference_does_not_depend_on_column_order() -> Result<(), Box<dyn Error>> {
     let schema = "define\n  entity person, plays r:a, plays r:b;\n  entity company, plays r:b;\n  \
                   relation r, relates a, relates b;\n";
-    let tables = "CREATE TABLE person (_iid UBIGINT PRIMARY KEY); CREATE TABLE company (_iid UBIGINT PRIMARY KEY);";
+    let tables = "CREATE TABLE person (_id UBIGINT PRIMARY KEY); CREATE TABLE company (_id UBIGINT PRIMARY KEY);";
     for (name, columns) in [
-        ("order-1", "company_id UBIGINT REFERENCES company(_iid), person_id UBIGINT REFERENCES person(_iid)"),
-        ("order-2", "person_id UBIGINT REFERENCES person(_iid), company_id UBIGINT REFERENCES company(_iid)"),
+        ("order-1", "company_id UBIGINT REFERENCES company(_id), person_id UBIGINT REFERENCES person(_id)"),
+        ("order-2", "person_id UBIGINT REFERENCES person(_id), company_id UBIGINT REFERENCES company(_id)"),
     ] {
-        let dir = scratch(name, schema, &format!("{tables} CREATE TABLE r (_iid UBIGINT PRIMARY KEY, {columns});"))?;
+        let dir = scratch(name, schema, &format!("{tables} CREATE TABLE r (_id UBIGINT PRIMARY KEY, {columns});"))?;
         assert_error(&validation_errors(&dir), &["column 'person_id' is ambiguous", "(a = <column>, b = <column>)"]);
     }
     Ok(())
@@ -1576,7 +1570,7 @@ fn directives_take_any_whitespace_and_keyword_case() -> Result<(), Box<dyn Error
     let dir = scratch(
         "directive-forms",
         "define\n  attribute name value string;\n  entity person, owns name;\n",
-        "CREATE TABLE people (_iid UBIGINT PRIMARY KEY, full_name VARCHAR, extra INTEGER);
+        "CREATE TABLE people (_id UBIGINT PRIMARY KEY, full_name VARCHAR, extra INTEGER);
          COMMENT ON TABLE people IS '@TypeDB\tEntity\tperson';
          COMMENT ON COLUMN people.full_name IS ' @typedb OWNS   name ';
          COMMENT ON COLUMN people.extra IS '@typedb Skip';
@@ -1596,7 +1590,7 @@ fn the_source_database_is_left_untouched() -> Result<(), Box<dyn Error>> {
         "read-only",
         "define\n  entity node;\n",
         "PRAGMA disable_checkpoint_on_shutdown;
-         CREATE TABLE node (_iid UBIGINT PRIMARY KEY); INSERT INTO node VALUES (1);",
+         CREATE TABLE node (_id UBIGINT PRIMARY KEY); INSERT INTO node VALUES (1);",
     )?;
     let db = dir.0.join("fixture.duckdb");
     let wal = dir.0.join("fixture.duckdb.wal");
@@ -1613,8 +1607,8 @@ fn relations_without_players_are_rejected() -> Result<(), Box<dyn Error>> {
     let dir = scratch(
         "no_role_column",
         schema,
-        "CREATE TABLE person (_iid UBIGINT PRIMARY KEY);
-         CREATE TABLE friendship (_iid UBIGINT PRIMARY KEY);
+        "CREATE TABLE person (_id UBIGINT PRIMARY KEY);
+         CREATE TABLE friendship (_id UBIGINT PRIMARY KEY);
          COMMENT ON TABLE friendship IS '@typedb relation friendship';",
     )?;
     assert_error(&validation_errors(&dir), &["relation table 'friendship' fills no role"]);
@@ -1622,8 +1616,8 @@ fn relations_without_players_are_rejected() -> Result<(), Box<dyn Error>> {
     let dir = scratch(
         "skipped_role_column",
         schema,
-        "CREATE TABLE person (_iid UBIGINT PRIMARY KEY);
-         CREATE TABLE friendship (_iid UBIGINT PRIMARY KEY, a UBIGINT REFERENCES person(_iid));
+        "CREATE TABLE person (_id UBIGINT PRIMARY KEY);
+         CREATE TABLE friendship (_id UBIGINT PRIMARY KEY, a UBIGINT REFERENCES person(_id));
          COMMENT ON TABLE friendship IS '@typedb relation friendship';
          COMMENT ON COLUMN friendship.a IS '@typedb skip';",
     )?;
@@ -1632,14 +1626,14 @@ fn relations_without_players_are_rejected() -> Result<(), Box<dyn Error>> {
     let dir = scratch(
         "playerless",
         schema,
-        "CREATE TABLE person (_iid UBIGINT PRIMARY KEY);
-         CREATE TABLE friendship (_iid UBIGINT PRIMARY KEY, a UBIGINT REFERENCES person(_iid),
-                                  b UBIGINT REFERENCES person(_iid));
+        "CREATE TABLE person (_id UBIGINT PRIMARY KEY);
+         CREATE TABLE friendship (_id UBIGINT PRIMARY KEY, a UBIGINT REFERENCES person(_id),
+                                  b UBIGINT REFERENCES person(_id));
          COMMENT ON TABLE friendship IS '@typedb relation friendship (friend = a, friend = b)';
          INSERT INTO person VALUES (1);
          INSERT INTO friendship VALUES (1, 1, NULL), (2, NULL, NULL);",
     )?;
-    assert_error(&validation_errors(&dir), &["relation table 'friendship': 1 row(s) fill no role", "e.g. _iid 2"]);
+    assert_error(&validation_errors(&dir), &["relation table 'friendship': 1 row(s) fill no role", "e.g. _id 2"]);
     Ok(())
 }
 
@@ -1649,7 +1643,7 @@ fn an_output_error_ends_a_large_conversion() -> Result<(), Box<dyn Error>> {
     let dir = scratch(
         "output-error",
         "define\n  attribute name value string;\n  entity person, owns name;\n",
-        "CREATE TABLE person (_iid UBIGINT PRIMARY KEY, name VARCHAR);
+        "CREATE TABLE person (_id UBIGINT PRIMARY KEY, name VARCHAR);
          INSERT INTO person SELECT i, 'p' || i FROM range(1500000) t(i);",
     )?;
     struct Failing;
@@ -1663,8 +1657,8 @@ fn an_output_error_ends_a_large_conversion() -> Result<(), Box<dyn Error>> {
     }
     let (sender, receiver) = mpsc::channel();
     thread::spawn(move || {
-        let result = prepare(&dir).map_err(|err| format!("{err:?}")).and_then(|migration| {
-            migration.convert(Failing, "3.0.0-test", "duckdb:fixture.duckdb", &Silent).map(|_| ())
+        let result = prepare(&dir).map_err(|err| format!("{err:?}")).and_then(|relational_import| {
+            relational_import.convert(Failing, "3.0.0-test", "duckdb:fixture.duckdb", &Silent).map(|_| ())
         });
         let _ = sender.send(result);
     });
@@ -1680,7 +1674,7 @@ fn the_data_file_is_a_checksummed_zstd_stream_of_the_export_format() -> Result<(
     let dir = scratch(
         "zstd-stream",
         "define\n  attribute name value string;\n  entity person, owns name;\n",
-        "CREATE TABLE person (_iid UBIGINT PRIMARY KEY, name VARCHAR);
+        "CREATE TABLE person (_id UBIGINT PRIMARY KEY, name VARCHAR);
          INSERT INTO person SELECT i, 'p' || i FROM range(100000) t(i);",
     )?;
     let data = run(&dir)?;
@@ -1710,13 +1704,13 @@ fn the_data_file_is_a_checksummed_zstd_stream_of_the_export_format() -> Result<(
 }
 
 const KEY_FREE_FIXTURE: &str = r#"
-    CREATE TABLE person (_iid UBIGINT, name VARCHAR NOT NULL, age INTEGER, tags VARCHAR[]);
+    CREATE TABLE person (_id UBIGINT, name VARCHAR NOT NULL, age INTEGER, tags VARCHAR[]);
     COMMENT ON COLUMN person.tags IS '@typedb owns tag';
-    CREATE TABLE company (_iid UBIGINT, name VARCHAR NOT NULL);
-    CREATE TABLE employment (_iid UBIGINT, person_id UBIGINT, company_id UBIGINT, salary DECIMAL(12,2));
+    CREATE TABLE company (_id UBIGINT, name VARCHAR NOT NULL);
+    CREATE TABLE employment (_id UBIGINT, person_id UBIGINT, company_id UBIGINT, salary DECIMAL(12,2));
     COMMENT ON COLUMN employment.person_id IS '@typedb references person';
     COMMENT ON COLUMN employment.company_id IS '@typedb references company';
-    CREATE TABLE mentorship (_iid UBIGINT, mentor_id UBIGINT, student_id UBIGINT);
+    CREATE TABLE mentorship (_id UBIGINT, mentor_id UBIGINT, student_id UBIGINT);
     COMMENT ON TABLE mentorship IS '@typedb relation mentorship (mentor = mentor_id, student = student_id)';
     COMMENT ON COLUMN mentorship.mentor_id IS '@typedb references person';
     COMMENT ON COLUMN mentorship.student_id IS '@typedb REFERENCES  Person';
@@ -1753,8 +1747,8 @@ fn undeclared_references_need_dense_ids_in_row_order() -> Result<(), Box<dyn Err
     let schema = "define\n  entity person, plays knows:friend;\n  relation knows, relates friend @card(0..);\n";
     let knows = |people: &str, values: &str| {
         format!(
-            "CREATE TABLE person (_iid UBIGINT); {people}
-             CREATE TABLE knows (_iid UBIGINT, a UBIGINT); COMMENT ON COLUMN knows.a IS '@typedb references person';
+            "CREATE TABLE person (_id UBIGINT); {people}
+             CREATE TABLE knows (_id UBIGINT, a UBIGINT); COMMENT ON COLUMN knows.a IS '@typedb references person';
              INSERT INTO knows VALUES {values};"
         )
     };
@@ -1763,19 +1757,19 @@ fn undeclared_references_need_dense_ids_in_row_order() -> Result<(), Box<dyn Err
     let dir = scratch("dense-outside", schema, &knows(dense, "(1, 4), (2, 6), (3, 1005), (4, 0)"))?;
     assert_error(
         &validation_errors(&dir),
-        &["column 'a' (references 'person'): 3 row(s) hold a value that is no _iid", "e.g. value 0, 4, 1005"],
+        &["column 'a' (references 'person'): 3 row(s) hold a value that is no _id", "e.g. value 0, 4, 1005"],
     );
-    let deleted_last = format!("{dense} DELETE FROM person WHERE _iid = 1004;");
+    let deleted_last = format!("{dense} DELETE FROM person WHERE _id = 1004;");
     let dir = scratch("dense-shorter", schema, &knows(&deleted_last, "(1, 5), (2, 1004)"))?;
     assert_error(&validation_errors(&dir), &["column 'a' (references 'person'): 1 row(s)", "e.g. value 1004"]);
     let dir = scratch("dense-empty", schema, &knows("", "(1, 0)"))?;
     assert_error(&validation_errors(&dir), &["column 'a' (references 'person'): 1 row(s)", "e.g. value 0"]);
 
-    let not_dense = "the _iids of 'person' are not dense in row order, so the references cannot be checked; \
-                     declare the column a FOREIGN KEY to 'person'(_iid), or number the rows of 'person' in order";
+    let not_dense = "the _ids of 'person' are not dense in row order, so the references cannot be checked; \
+                     declare the column a FOREIGN KEY to 'person'(_id), or number the rows of 'person' in order";
     for (case, people) in [
         ("sparse", "INSERT INTO person SELECT 5 + 3 * i FROM range(1000) t(i);".to_owned()),
-        ("gap", format!("{dense} DELETE FROM person WHERE _iid = 500;")),
+        ("gap", format!("{dense} DELETE FROM person WHERE _id = 500;")),
         ("shuffled", "INSERT INTO person VALUES (2), (0), (1);".to_owned()),
         ("repeated", "INSERT INTO person VALUES (0), (1), (1), (3);".to_owned()),
         ("null", "INSERT INTO person VALUES (0), (NULL), (1);".to_owned()),
@@ -1798,15 +1792,15 @@ fn undeclared_references_need_dense_ids_in_row_order() -> Result<(), Box<dyn Err
 
 #[test]
 fn staging_with_row_number_numbers_the_rows_densely() -> Result<(), Box<dyn Error>> {
-    let csv = std::env::temp_dir().join(format!("typedb-migration-people-{}.csv", std::process::id()));
+    let csv = std::env::temp_dir().join(format!("typedb-relational-import-people-{}.csv", std::process::id()));
     let csv = csv.to_string_lossy();
     let dir = scratch(
         "row-number",
         "define\n  entity person, plays knows:friend;\n  relation knows, relates friend;\n",
         &format!(
             "COPY (SELECT i FROM range(2000000) t(i)) TO '{csv}';
-             CREATE TABLE person (_iid UBIGINT); INSERT INTO person SELECT row_number() OVER () FROM '{csv}';
-             CREATE TABLE knows (_iid UBIGINT, a UBIGINT); COMMENT ON COLUMN knows.a IS '@typedb references person';
+             CREATE TABLE person (_id UBIGINT); INSERT INTO person SELECT row_number() OVER () FROM '{csv}';
+             CREATE TABLE knows (_id UBIGINT, a UBIGINT); COMMENT ON COLUMN knows.a IS '@typedb references person';
              INSERT INTO knows VALUES (1, 1), (2, 2000000);"
         ),
     )?;
@@ -1821,21 +1815,21 @@ fn repeated_ids_are_found_whatever_their_row_order() -> Result<(), Box<dyn Error
     let dir = scratch(
         "repeated-ids",
         "define\n  entity person;\n",
-        "CREATE TABLE person (_iid UBIGINT); INSERT INTO person VALUES (0), (1), (1), (3);",
+        "CREATE TABLE person (_id UBIGINT); INSERT INTO person VALUES (0), (1), (1), (3);",
     )?;
     assert_error(
         &validation_errors(&dir),
-        &["table 'person': 1 _iid value(s) appear in more than one row", "e.g. _iid 1"],
+        &["table 'person': 1 _id value(s) appear in more than one row", "e.g. _id 1"],
     );
     // A column named rowid hides DuckDB's: read in its place, it would make these ids dense.
     let dir = scratch(
         "repeated-ids-rowid",
         "define\n  attribute rowid, value integer;\n  entity person, owns rowid;\n",
-        "CREATE TABLE person (_iid UBIGINT, rowid BIGINT); INSERT INTO person VALUES (0, 0), (1, 1), (1, 1), (3, 3);",
+        "CREATE TABLE person (_id UBIGINT, rowid BIGINT); INSERT INTO person VALUES (0, 0), (1, 1), (1, 1), (3, 3);",
     )?;
     assert_error(
         &validation_errors(&dir),
-        &["table 'person': 1 _iid value(s) appear in more than one row", "e.g. _iid 1"],
+        &["table 'person': 1 _id value(s) appear in more than one row", "e.g. _id 1"],
     );
     Ok(())
 }
@@ -1849,85 +1843,85 @@ fn references_without_declared_keys_are_checked() -> Result<(), Box<dyn Error>> 
             "references",
             schema,
             &format!(
-                "CREATE TABLE person (_iid UBIGINT); INSERT INTO person VALUES (1), (2);
-                 CREATE TABLE robot (_iid UBIGINT PRIMARY KEY); {sql}"
+                "CREATE TABLE person (_id UBIGINT); INSERT INTO person VALUES (1), (2);
+                 CREATE TABLE robot (_id UBIGINT PRIMARY KEY); {sql}"
             ),
         )?;
         assert_error(&validation_errors(&dir), fragments);
         Ok(())
     };
     check(
-        "CREATE TABLE knows (_iid UBIGINT, a UBIGINT, b UBIGINT);
+        "CREATE TABLE knows (_id UBIGINT, a UBIGINT, b UBIGINT);
          COMMENT ON COLUMN knows.a IS '@typedb references person';
          COMMENT ON COLUMN knows.b IS '@typedb references person';
          INSERT INTO knows VALUES (5, 1, 2), (6, 1, 9), (7, 8, NULL), (8, NULL, 2);",
-        &["table 'knows': column 'a' (references 'person'): 1 row(s) hold a value that is no _iid of the referenced \
+        &["table 'knows': column 'a' (references 'person'): 1 row(s) hold a value that is no _id of the referenced \
            table, e.g. value 8"],
     )?;
     check(
-        "CREATE TABLE knows (_iid UBIGINT, a UBIGINT, b UBIGINT);
+        "CREATE TABLE knows (_id UBIGINT, a UBIGINT, b UBIGINT);
          COMMENT ON COLUMN knows.a IS '@typedb references person';
          COMMENT ON COLUMN knows.b IS '@typedb references person';
          INSERT INTO knows VALUES (5, 1, 2), (6, 1, 9);",
-        &["table 'knows': column 'b' (references 'person'): 1 row(s) hold a value that is no _iid of the referenced \
+        &["table 'knows': column 'b' (references 'person'): 1 row(s) hold a value that is no _id of the referenced \
            table, e.g. value 9"],
     )?;
     check(
-        "CREATE TABLE knows (_iid UBIGINT, a BIGINT); COMMENT ON COLUMN knows.a IS '@typedb references person';",
-        &["column 'a' references 'person' and must hold its _iid values, so it must be UBIGINT; found BIGINT"],
+        "CREATE TABLE knows (_id UBIGINT, a BIGINT); COMMENT ON COLUMN knows.a IS '@typedb references person';",
+        &["column 'a' references 'person' and must hold its _id values, so it must be UBIGINT; found BIGINT"],
     )?;
     check(
-        "CREATE TABLE knows (_iid UBIGINT, a UBIGINT); COMMENT ON COLUMN knows.a IS '@typedb references people';",
+        "CREATE TABLE knows (_id UBIGINT, a UBIGINT); COMMENT ON COLUMN knows.a IS '@typedb references people';",
         &["column 'a' references table 'people', which is not mapped"],
     )?;
     check(
-        "CREATE TABLE knows (_iid UBIGINT, a UBIGINT REFERENCES robot(_iid));
+        "CREATE TABLE knows (_id UBIGINT, a UBIGINT REFERENCES robot(_id));
          COMMENT ON COLUMN knows.a IS '@typedb references person';",
         &["column 'a' is marked '@typedb references person', but its FOREIGN KEY references 'robot'"],
     )?;
     check(
-        "CREATE TABLE knows (_iid UBIGINT, a UBIGINT);
+        "CREATE TABLE knows (_id UBIGINT, a UBIGINT);
          COMMENT ON TABLE knows IS '@typedb relation knows (friend = a)';",
         &["column 'a' is bound to role 'friend' but names no players' table", "'@typedb references <table>'"],
     )?;
     check(
-        "CREATE TABLE knows (_iid UBIGINT, a UBIGINT); COMMENT ON COLUMN knows.a IS '@typedb references robot';",
+        "CREATE TABLE knows (_id UBIGINT, a UBIGINT); COMMENT ON COLUMN knows.a IS '@typedb references robot';",
         &["column 'a' references 'robot', whose type 'robot' plays no role of relation 'knows'"],
     )?;
     check(
-        "CREATE TABLE knows (_iid UBIGINT, a UBIGINT); COMMENT ON COLUMN robot._iid IS '@typedb references person';
+        "CREATE TABLE knows (_id UBIGINT, a UBIGINT); COMMENT ON COLUMN robot._id IS '@typedb references person';
          COMMENT ON COLUMN knows.a IS '@typedb references person';",
-        &["table 'robot': _iid holds the instances' ids and takes no directive"],
+        &["table 'robot': _id holds the instances' ids and takes no directive"],
     )?;
     check(
-        "CREATE TABLE knows (_iid UBIGINT); COMMENT ON TABLE knows IS '@typedb entity knows';",
+        "CREATE TABLE knows (_id UBIGINT); COMMENT ON TABLE knows IS '@typedb entity knows';",
         &["table 'knows' is mapped to 'knows', which is not an entity type in the TypeDB schema"],
     )?;
     check(
-        "CREATE TABLE knows (_iid UBIGINT); COMMENT ON TABLE robot IS '@typedb relation robot';",
+        "CREATE TABLE knows (_id UBIGINT); COMMENT ON TABLE robot IS '@typedb relation robot';",
         &["table 'robot' is mapped to 'robot', which is not a relation type in the TypeDB schema"],
     )?;
     let dir = scratch(
         "references-without-ids",
         schema,
-        "CREATE TABLE person (_iid UBIGINT); INSERT INTO person VALUES (1); CREATE TABLE robot (_iid UBIGINT);
-         CREATE TABLE knows (_iid UBIGINT, a UBIGINT); COMMENT ON COLUMN knows.a IS '@typedb references person';
+        "CREATE TABLE person (_id UBIGINT); INSERT INTO person VALUES (1); CREATE TABLE robot (_id UBIGINT);
+         CREATE TABLE knows (_id UBIGINT, a UBIGINT); COMMENT ON COLUMN knows.a IS '@typedb references person';
          INSERT INTO knows VALUES (NULL, NULL), (NULL, 7);",
     )?;
     let errors = validation_errors(&dir);
-    assert_error(&errors, &["table 'knows': 2 row(s) have no _iid"]);
-    assert_error(&errors, &["relation table 'knows': 1 row(s) fill no role", "e.g. _iid NULL"]);
+    assert_error(&errors, &["table 'knows': 2 row(s) have no _id"]);
+    assert_error(&errors, &["relation table 'knows': 1 row(s) fill no role", "e.g. _id NULL"]);
     assert_error(&errors, &["column 'a' (references 'person'): 1 row(s)", "e.g. value 7"]);
     assert!(errors.iter().all(|error| !error.contains("could not be checked")), "{errors:#?}");
     check(
-        "CREATE TABLE knows (_iid UBIGINT, a UBIGINT); COMMENT ON COLUMN knows.a IS '@typedb references';",
+        "CREATE TABLE knows (_id UBIGINT, a UBIGINT); COMMENT ON COLUMN knows.a IS '@typedb references';",
         &["column 'a': unrecognised directive '@typedb references' \
              (expected: skip | owns <label> | references <table>)"],
     )?;
     let dir = scratch(
         "references-on-entity",
         "define\n  entity person;\n  entity pet;\n",
-        "CREATE TABLE person (_iid UBIGINT); CREATE TABLE pet (_iid UBIGINT, owner UBIGINT);
+        "CREATE TABLE person (_id UBIGINT); CREATE TABLE pet (_id UBIGINT, owner UBIGINT);
          COMMENT ON COLUMN pet.owner IS '@typedb references person';",
     )?;
     assert_error(&validation_errors(&dir), &["column 'owner' references table 'person', which on an entity table"]);
@@ -1936,9 +1930,9 @@ fn references_without_declared_keys_are_checked() -> Result<(), Box<dyn Error>> 
     let dir = scratch(
         "references-agree",
         schema,
-        "CREATE TABLE person (_iid UBIGINT PRIMARY KEY); INSERT INTO person VALUES (1);
-         CREATE TABLE robot (_iid UBIGINT);
-         CREATE TABLE knows (_iid UBIGINT, a UBIGINT REFERENCES person(_iid));
+        "CREATE TABLE person (_id UBIGINT PRIMARY KEY); INSERT INTO person VALUES (1);
+         CREATE TABLE robot (_id UBIGINT);
+         CREATE TABLE knows (_id UBIGINT, a UBIGINT REFERENCES person(_id));
          COMMENT ON COLUMN knows.a IS '@typedb references person'; INSERT INTO knows VALUES (5, 1);",
     )?;
     convert(&dir)?;
@@ -1991,7 +1985,7 @@ fn cancelling_stops_the_checks_and_reports_cancelled() -> Result<(), Box<dyn Err
     let dir = scratch(
         "cancel",
         "define\n  entity a;\n  entity b;\n  entity c;\n",
-        "CREATE TABLE a AS SELECT (i * 7919 % 10000019)::UBIGINT AS _iid FROM range(10000000) t(i);
+        "CREATE TABLE a AS SELECT (i * 7919 % 10000019)::UBIGINT AS _id FROM range(10000000) t(i);
          CREATE TABLE b AS FROM a;
          CREATE TABLE c AS FROM a;",
     )?;
@@ -2001,12 +1995,12 @@ fn cancelling_stops_the_checks_and_reports_cancelled() -> Result<(), Box<dyn Err
 
     let cancelled = Arc::new(Cancellation::default());
     cancelled.cancel();
-    let outcome = Migration::prepare(&source, &schema, &spill_dir, None, cancelled);
+    let outcome = RelationalImport::prepare(&source, &schema, &spill_dir, None, cancelled);
     assert!(matches!(outcome, Err(PrepareError::Cancelled)), "cancelled before it began");
 
     // Machines differ too much for a fixed bound: a cancelled run is measured against an undisturbed one.
     let started = Instant::now();
-    let undisturbed = Migration::prepare(&source, &schema, &spill_dir, None, Arc::new(Cancellation::default()));
+    let undisturbed = RelationalImport::prepare(&source, &schema, &spill_dir, None, Arc::new(Cancellation::default()));
     assert!(undisturbed.is_ok(), "the fixture passes the checks");
     drop(undisturbed);
     let undisturbed = started.elapsed();
@@ -2020,7 +2014,7 @@ fn cancelling_stops_the_checks_and_reports_cancelled() -> Result<(), Box<dyn Err
             Instant::now()
         })
     };
-    let outcome = Migration::prepare(&source, &schema, &spill_dir, None, cancellation);
+    let outcome = RelationalImport::prepare(&source, &schema, &spill_dir, None, cancellation);
     let cancelled_at = canceller.join().expect("the canceller does not panic");
     assert!(matches!(outcome, Err(PrepareError::Cancelled)), "cancelled during the checks");
     let stopped_in = cancelled_at.elapsed();

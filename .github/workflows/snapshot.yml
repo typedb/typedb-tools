@@ -3,10 +3,9 @@
 # file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 name: Snapshot deploy
-# TODO: Remove duckdb-converter before merging
 on:
   push:
-    branches: [master, duckdb-converter]
+    branches: [master]
 
 permissions:
   contents: read

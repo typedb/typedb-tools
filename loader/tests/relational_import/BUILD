@@ -8,8 +8,8 @@ load("@typedb_dependencies//tool/checkstyle:rules.bzl", "checkstyle_test")
 load("@rules_rust//rust:defs.bzl", "rust_test")
 
 rust_test(
-    name = "test-migration-cli",
-    srcs = ["test_migration_cli.rs"],
+    name = "test-relational-import-cli",
+    srcs = ["test_relational_import_cli.rs"],
     deps = [
         "@typedb_protocol//grpc/rust:typedb_protocol",
 

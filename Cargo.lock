@@ -3813,21 +3813,9 @@ dependencies = [
  "sha2 0.10.9",
  "tokio",
  "typedb-driver",
- "typedb-migration",
  "typedb-protocol",
+ "typedb-relational-import",
  "typedb_binary_runner",
- "typedb_cli_common",
- "typeql",
- "zstd",
-]
-
-[[package]]
-name = "typedb-migration"
-version = "0.0.0"
-dependencies = [
- "duckdb",
- "prost",
- "typedb-protocol",
  "typedb_cli_common",
  "typeql",
  "zstd",
@@ -3841,6 +3829,18 @@ dependencies = [
  "prost",
  "tonic",
  "tonic-build",
+]
+
+[[package]]
+name = "typedb-relational-import"
+version = "0.0.0"
+dependencies = [
+ "duckdb",
+ "prost",
+ "typedb-protocol",
+ "typedb_cli_common",
+ "typeql",
+ "zstd",
 ]
 
 [[package]]

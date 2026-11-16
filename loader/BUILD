@@ -19,7 +19,7 @@ rust_binary(
     srcs = glob(["*.rs"]),
     deps = [
         "//common:typedb_cli_common",
-        "//loader/migration:typedb_migration",
+        "//loader/relational_import:typedb_relational_import",
         "@typedb_driver//rust:typedb_driver",
         "@typeql//rust:typeql",
 

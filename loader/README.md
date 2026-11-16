@@ -2,7 +2,7 @@
 
 TypeDB Loader puts data into TypeDB in one of two ways:
 
-| | Loading CSV files (`--data`) | Migrating DuckDB databases (`--duckdb`) |
+| | Loading CSV files (`--data`) | Relational import from DuckDB (`--duckdb`) |
 |---|---|---|
 | Input | one CSV file | a DuckDB database file |
 | How data gets in | a TypeQL `given` insert pipeline runs for every row, in batches of write transactions | the tables are converted to TypeDB's export format, and one `database import` loads the file |
@@ -11,8 +11,12 @@ TypeDB Loader puts data into TypeDB in one of two ways:
 | Bad data | rejected rows go to `rejects.csv` and the load goes on | any error stops the run before anything is written |
 | Interrupted runs | resume from the checkpoint with `--resume` | run again. A data file whose import failed is kept, to import without converting again |
 
-The rest of this document covers loading CSV files. Migrating a DuckDB database is described in
-[migration/README.md](migration/README.md).
+Relational import needs the tables in a specific shape, a table per type with numbered rows, which data usually has
+to be staged into first. In return, on very large data it loads up to 20x faster than a plain TypeDB export and
+import of the same data.
+
+The rest of this document covers loading CSV files. Relational import is described in
+[relational_import/README.md](relational_import/README.md).
 
 ## Running TypeDB Loader
 

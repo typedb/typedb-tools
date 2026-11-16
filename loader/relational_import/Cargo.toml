@@ -3,7 +3,7 @@
 
 [package]
 	edition = "2024"
-	name = "typedb-migration"
+	name = "typedb-relational-import"
 	version = "0.0.0"
 
 [lib]
@@ -31,5 +31,5 @@
 		workspace = true
 
 [[test]]
-	name = "test-migration"
-	path = "tests/migration.rs"
+	name = "test-relational-import"
+	path = "tests/relational_import.rs"

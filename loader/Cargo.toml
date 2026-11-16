@@ -41,7 +41,7 @@
 	[dependencies.typedb-driver]
 		workspace = true
 
-	[dependencies.typedb-migration]
+	[dependencies.typedb-relational-import]
 		workspace = true
 
 	[dependencies.typedb_cli_common]
@@ -76,5 +76,5 @@
 	path = "tests/assembly/test_loader.rs"
 
 [[test]]
-	name = "test-migration-cli"
-	path = "tests/migration/test_migration_cli.rs"
+	name = "test-relational-import-cli"
+	path = "tests/relational_import/test_relational_import_cli.rs"

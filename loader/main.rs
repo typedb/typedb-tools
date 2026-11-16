@@ -23,8 +23,8 @@ mod checkpoint;
 mod cli;
 mod csv_reader;
 mod import_command;
+mod import_relational;
 mod load;
-mod migrate;
 mod output;
 mod params;
 mod progress;
@@ -40,7 +40,7 @@ pub(crate) const VERSION: &str = include_str!("../VERSION");
 async fn main() {
     let args = Args::parse();
     if args.duckdb.is_some() {
-        migrate::run_migration(&args).await;
+        import_relational::run_relational_import(&args).await;
     } else {
         run_load_command(args).await;
     }
@@ -90,7 +90,7 @@ pub(crate) enum ExitCode {
     GeneralError = 1,
     UserInputError = 2,
     ConnectionError = 3,
-    MigrationError = 4,
+    RelationalImportError = 4,
 }
 
 pub(crate) fn fatal(message: impl AsRef<str>) -> ! {

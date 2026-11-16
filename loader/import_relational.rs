@@ -16,7 +16,9 @@ use std::{
 
 use typedb_cli_common::{build_tls_config, parse_addresses, println_error, println_warning, try_println};
 use typedb_driver::{Addresses, Credentials, DriverOptions, TypeDBDriver};
-use typedb_migration::{Cancellation, Checksums, Migration, PrepareError, ProgressListener, ScanProgress};
+use typedb_relational_import::{
+    Cancellation, Checksums, PrepareError, ProgressListener, RelationalImport, ScanProgress,
+};
 
 use crate::{
     ExitCode, VERSION,
@@ -36,16 +38,16 @@ const DUCKDB_SPILL_LIMIT_SETTING: &str = "max_temp_directory_size";
 const DUCKDB_OUT_OF_MEMORY: &str = "Out of Memory Error";
 const CURRENT_DIRECTORY: &str = ".";
 
-pub(crate) async fn run_migration(args: &Args) -> ! {
-    let exit_code = match migrate(args).await {
+pub(crate) async fn run_relational_import(args: &Args) -> ! {
+    let exit_code = match import_relational(args).await {
         Ok(()) => 0,
         Err(failure) => failure.report(),
     };
     process::exit(exit_code)
 }
 
-async fn migrate(args: &Args) -> Result<(), Failure> {
-    let input = &MigrationInput::read(args)?;
+async fn import_relational(args: &Args) -> Result<(), Failure> {
+    let input = &RelationalImportInput::read(args)?;
     let server = if args.dry_run || args.files_only { None } else { Some(ServerArgs::parse(args)?) };
     let output = Output::prepare(args, input)?;
     let server = match server {
@@ -53,11 +55,11 @@ async fn migrate(args: &Args) -> Result<(), Failure> {
         None => None,
     };
     let mut interruption = Interruption::listen();
-    try_println!("Migrating from DuckDB file '{}'", input.duckdb_path.display());
+    try_println!("Importing the tables of DuckDB file '{}'", input.duckdb_path.display());
     let progress = Progress::new();
     let _heartbeat = progress.keep_reporting();
-    let migration = prepare(args, input, &output, &mut interruption).await?;
-    let (checksums, elapsed) = convert(migration, input, &output, &progress, &mut interruption).await?;
+    let relational_import = prepare(args, input, &output, &mut interruption).await?;
+    let (checksums, elapsed) = convert(relational_import, input, &output, &progress, &mut interruption).await?;
     print_conversion_counts(&checksums, elapsed);
 
     let Output::DataFile(data_file) = output else {
@@ -72,7 +74,7 @@ async fn migrate(args: &Args) -> Result<(), Failure> {
     import_data_file(server, input, &data_file, &mut interruption).await
 }
 
-struct MigrationInput {
+struct RelationalImportInput {
     duckdb_path: PathBuf,
     schema_path: String,
     schema_text: String,
@@ -80,8 +82,8 @@ struct MigrationInput {
     original_database: String,
 }
 
-impl MigrationInput {
-    fn read(args: &Args) -> Result<MigrationInput, Failure> {
+impl RelationalImportInput {
+    fn read(args: &Args) -> Result<RelationalImportInput, Failure> {
         let duckdb_path = PathBuf::from(args.duckdb.as_deref().expect("dispatched on --duckdb"));
         check_source_file(&duckdb_path)?;
         let Some(schema_path) = args.schema_file.clone() else {
@@ -92,7 +94,7 @@ impl MigrationInput {
         })?;
         let database = database_name(args, &duckdb_path)?;
         let original_database = format!("duckdb:{}", duckdb_path.file_name().unwrap_or_default().to_string_lossy());
-        Ok(MigrationInput { duckdb_path, schema_path, schema_text, database, original_database })
+        Ok(RelationalImportInput { duckdb_path, schema_path, schema_text, database, original_database })
     }
 }
 
@@ -141,7 +143,7 @@ impl DataFileOutput {
 }
 
 impl Output {
-    fn prepare(args: &Args, input: &MigrationInput) -> Result<Output, Failure> {
+    fn prepare(args: &Args, input: &RelationalImportInput) -> Result<Output, Failure> {
         let output_dir = match args.output_dir.as_deref() {
             Some(dir) => PathBuf::from(if dir.is_empty() { CURRENT_DIRECTORY } else { dir }),
             None => default_output_dir(&input.duckdb_path),
@@ -462,30 +464,30 @@ fn joined<T>(outcome: Result<T, tokio::task::JoinError>) -> T {
 
 async fn prepare(
     args: &Args,
-    input: &MigrationInput,
+    input: &RelationalImportInput,
     output: &Output,
     interruption: &mut Interruption,
-) -> Result<Migration, Failure> {
+) -> Result<RelationalImport, Failure> {
     let (source, schema_text) = (input.duckdb_path.clone(), input.schema_text.clone());
     let (spill_dir, memory_limit, cancellation) =
         (output.spill_dir().to_path_buf(), args.memory_limit.clone(), interruption.cancellation());
     let started = Instant::now();
     let prepared = interruption
         .run_cancellable(move || {
-            Migration::prepare(&source, &schema_text, &spill_dir, memory_limit.as_deref(), cancellation)
+            RelationalImport::prepare(&source, &schema_text, &spill_dir, memory_limit.as_deref(), cancellation)
         })
         .await
         .map_err(|interrupted| Failure::interrupted(interrupted.exit_code))?;
     match prepared {
-        Ok(migration) => {
-            print_mapping(&migration.describe_mapping());
-            print_warnings(migration.warnings());
+        Ok(relational_import) => {
+            print_mapping(&relational_import.describe_mapping());
+            print_warnings(relational_import.warnings());
             try_println!(
                 "Checked in {} (source DB memory limit {}).",
                 format_duration(started.elapsed()),
-                migration.memory_limit()
+                relational_import.memory_limit()
             );
-            Ok(migration)
+            Ok(relational_import)
         }
         Err(PrepareError::Setup(message)) => Err(Failure::new(ExitCode::UserInputError, message)),
         Err(PrepareError::Invalid { errors, warnings, mapping_description }) => {
@@ -502,10 +504,10 @@ async fn prepare(
     }
 }
 
-// The migration is consumed, so that DuckDB is closed and its spill directory removed before the caller goes on.
+// The relational import is consumed, so that DuckDB is closed and its spill directory removed before the caller goes on.
 async fn convert(
-    migration: Migration,
-    input: &MigrationInput,
+    relational_import: RelationalImport,
+    input: &RelationalImportInput,
     output: &Output,
     progress: &Progress,
     interruption: &mut Interruption,
@@ -516,17 +518,17 @@ async fn convert(
         .run_cancellable(move || {
             let started = Instant::now();
             let checksums = match &data_path {
-                None => migration.convert(io::sink(), VERSION.trim(), &original_database, &progress),
-                Some(path) => write_data_file(&migration, path, &original_database, &progress),
+                None => relational_import.convert(io::sink(), VERSION.trim(), &original_database, &progress),
+                Some(path) => write_data_file(&relational_import, path, &original_database, &progress),
             };
-            drop(migration);
+            drop(relational_import);
             checksums.map(|checksums| (checksums, started.elapsed()))
         })
         .await;
     match (converted, output.data_file()) {
         (Ok(converted), _) => converted.map_err(|message| {
             let hint = output.resource_hint(&message);
-            Failure::new(ExitCode::MigrationError, message).hinting(hint)
+            Failure::new(ExitCode::RelationalImportError, message).hinting(hint)
         }),
         (Err(Interrupted { exit_code, outcome: Ok(_) }), Some(data_file)) => {
             Err(Failure::interrupted_after_conversion(exit_code).keeping(data_file))
@@ -536,7 +538,7 @@ async fn convert(
 }
 
 fn write_data_file(
-    migration: &Migration,
+    relational_import: &RelationalImport,
     path: &Path,
     original_database: &str,
     progress: &Progress,
@@ -549,7 +551,7 @@ fn write_data_file(
         .open(&partial_path)
         .map_err(|err| format!("failed to create '{}': {err}", partial_path.display()))?;
     let partial = PartialFile(partial_path);
-    let checksums = migration.convert(&mut file, VERSION.trim(), original_database, progress)?;
+    let checksums = relational_import.convert(&mut file, VERSION.trim(), original_database, progress)?;
     file.sync_all().map_err(|err| format!("failed to write '{}': {err}", partial.0.display()))?;
     fs::rename(&partial.0, path)
         .map_err(|err| format!("failed to move the data file into '{}': {err}", path.display()))?;
@@ -622,7 +624,7 @@ impl Drop for Heartbeat {
 
 async fn import_data_file(
     server: ConnectionSettings,
-    input: &MigrationInput,
+    input: &RelationalImportInput,
     data_file: &DataFileOutput,
     interruption: &mut Interruption,
 ) -> Result<(), Failure> {

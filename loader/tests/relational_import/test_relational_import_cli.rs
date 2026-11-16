@@ -32,12 +32,12 @@ fn loader_binary() -> PathBuf {
 }
 
 fn setup(test_name: &str) -> Result<std::path::PathBuf, Box<dyn Error>> {
-    let dir = std::env::temp_dir().join(format!("typedb-migration-cli-{test_name}-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("typedb-relational-import-cli-{test_name}-{}", std::process::id()));
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir)?;
     let connection = Connection::open(dir.join("fixture.duckdb"))?;
     connection.execute_batch(
-        "CREATE TABLE person (_iid UBIGINT PRIMARY KEY, name VARCHAR NOT NULL);
+        "CREATE TABLE person (_id UBIGINT PRIMARY KEY, name VARCHAR NOT NULL);
          INSERT INTO person VALUES (1, 'Alice'), (2, 'Bob');",
     )?;
     fs::write(dir.join("schema.tql"), SCHEMA)?;
@@ -249,7 +249,7 @@ fn checks_spill_into_an_output_directory_that_does_not_exist_yet() -> Result<(),
     // Shuffled ids take the GROUP BY check, which spills about 250 MB at this size.
     Connection::open(dir.join("fixture.duckdb"))?.execute_batch(
         "DROP TABLE person;
-         CREATE TABLE person AS SELECT (i * 7919 % 20000003)::UBIGINT AS _iid FROM range(20000000) t(i);",
+         CREATE TABLE person AS SELECT (i * 7919 % 20000003)::UBIGINT AS _id FROM range(20000000) t(i);",
     )?;
     fs::write(dir.join("schema.tql"), "define\n  entity person;\n")?;
     let out = dir.join("out/nested").to_string_lossy().into_owned();
@@ -323,7 +323,7 @@ mod signals_and_concurrency {
         let dir = setup("sigterm-checks")?;
         Connection::open(dir.join("fixture.duckdb"))?.execute_batch(
             "DROP TABLE person;
-             CREATE TABLE person AS SELECT (i * 7919 % 20000003)::UBIGINT AS _iid, 'name' || i AS name
+             CREATE TABLE person AS SELECT (i * 7919 % 20000003)::UBIGINT AS _id, 'name' || i AS name
              FROM range(20000000) t(i);",
         )?;
         let out = dir.join("out");
@@ -333,7 +333,7 @@ mod signals_and_concurrency {
             .spawn()?;
         let mut stdout = BufReader::new(loader.stdout.take().expect("piped"));
         let mut line = String::new();
-        while !line.starts_with("Migrating from") {
+        while !line.starts_with("Importing the tables of") {
             line.clear();
             assert!(stdout.read_line(&mut line)? > 0, "the loader ended before the checks began");
         }

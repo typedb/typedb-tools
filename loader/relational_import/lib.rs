@@ -39,7 +39,7 @@ const MEMORY_FLOOR: u64 = 512 * MB;
 const MEMORY_PER_THREAD: u64 = 64 * MB;
 const INTERRUPT_REPEAT: Duration = Duration::from_millis(100);
 
-pub struct Migration {
+pub struct RelationalImport {
     connection: Connection,
     plan: MappingPlan,
     warnings: Vec<String>,
@@ -50,14 +50,14 @@ pub struct Migration {
     _spill_dir: SpillDir,
 }
 
-impl Migration {
+impl RelationalImport {
     pub fn prepare(
         source: &Path,
         schema_text: &str,
         spill_dir: &Path,
         memory_limit: Option<&str>,
         cancellation: Arc<Cancellation>,
-    ) -> Result<Migration, PrepareError> {
+    ) -> Result<RelationalImport, PrepareError> {
         let prepared = Self::map_and_check(source, schema_text, spill_dir, memory_limit, cancellation.clone());
         if cancellation.is_cancelled() { Err(PrepareError::Cancelled) } else { prepared }
     }
@@ -91,7 +91,7 @@ impl Migration {
         spill_dir: &Path,
         memory_limit: Option<&str>,
         cancellation: Arc<Cancellation>,
-    ) -> Result<Migration, PrepareError> {
+    ) -> Result<RelationalImport, PrepareError> {
         let schema = schema::Schema::parse(schema_text).map_err(PrepareError::Setup)?;
         create_private_dir(spill_dir).map_err(|err| {
             PrepareError::Setup(format!("failed to create the spill directory '{}': {err}", spill_dir.display()))
@@ -112,7 +112,15 @@ impl Migration {
         if !errors.is_empty() {
             return Err(PrepareError::Invalid { errors, warnings, mapping_description: plan.describe() });
         }
-        Ok(Migration { connection, plan, warnings, memory_limit, threads, cancellation, _spill_dir: spill_dir_guard })
+        Ok(RelationalImport {
+            connection,
+            plan,
+            warnings,
+            memory_limit,
+            threads,
+            cancellation,
+            _spill_dir: spill_dir_guard,
+        })
     }
 }
 
@@ -162,7 +170,7 @@ impl Cancellation {
     fn watch(&self, connection: &Connection) {
         let interrupt = Arc::downgrade(&connection.interrupt_handle());
         let previous = self.interrupt.lock().expect("nothing panics holding the lock").replace(interrupt);
-        assert!(previous.is_none(), "a cancellation serves one migration");
+        assert!(previous.is_none(), "a cancellation serves one relational import");
         if self.is_cancelled() {
             self.interrupt_until_closed();
         }
@@ -334,7 +342,8 @@ mod test {
 
     #[test]
     fn the_source_is_read_without_extensions() {
-        let path = std::env::temp_dir().join(format!("typedb-migration-extensions-{}.duckdb", std::process::id()));
+        let path =
+            std::env::temp_dir().join(format!("typedb-relational-import-extensions-{}.duckdb", std::process::id()));
         drop(Connection::open(&path).unwrap());
         let connection = open_duckdb(&path, &std::env::temp_dir()).unwrap();
         for setting in ["autoinstall_known_extensions", "autoload_known_extensions"] {

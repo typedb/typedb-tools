@@ -1,8 +1,20 @@
-# Migrating DuckDB databases into TypeDB
+# Relational import from DuckDB
 
-`typedb loader --duckdb` maps the tables of a DuckDB file onto a TypeDB schema that you write, checks the data,
-converts it to the server's import format and imports it. The DuckDB file is opened read-only. The server enforces
-the schema's constraints at import.
+`typedb loader --duckdb` bulk-loads the tables of a DuckDB file into a new TypeDB database. It maps the tables onto
+a TypeDB schema that you write, checks the data, converts it to the server's import format and imports it. The
+DuckDB file is opened read-only.
+
+- **The tables need a specific shape**: a table per entity or relation type, an `_id` column that numbers its rows,
+  and relation tables whose role columns hold the players' `_id`s ([Mapping](#mapping)). Few databases are stored
+  this way, so the data is first staged into this shape with SQL ([Staging](#staging-other-sources)).
+- **It is the fast way in.** On very large data, relational import loads up to 20x faster than a plain TypeDB
+  export and import of the same data, so staging the data into this shape is worth it.
+- **The data is validated before anything is loaded.** The loader checks that it conforms to what TypeDB requires
+  (ids, references, value ranges) and reports every violation ([What is checked](#what-is-checked)). The schema's
+  constraints are enforced by the server at import.
+- **No keys are needed.** A role column says which table it points at with a comment, and the loader checks the
+  references itself. `PRIMARY KEY` and `FOREIGN KEY` constraints are an alternative for smaller data
+  ([References and ids](#references-and-ids)).
 
 ```bash
 # convert and import. The database must not exist yet, and --database defaults to the file's stem
@@ -16,22 +28,124 @@ typedb loader --duckdb data.duckdb --schema-file schema.tql --database mydb --fi
 typedb console --command="database import mydb schema.tql out/mydb.data.typedb"
 ```
 
+## Mapping
+
+The schema is a single `define` query. The loader matches by name and does not guess:
+
+- A table maps to the entity or relation type of its name, a column to the attribute of its name. Names match
+  exactly, or with `_` read as `-` (`country_code` matches `country-code`), as DuckDB takes `-` only in quoted names.
+- A table or column without a counterpart in the schema is an error. `@typedb skip` leaves it out. A schema type
+  without a source is a warning.
+- Only tables of DuckDB's `main` schema are read. Views and other schemas are reported and left out.
+- Labels that are TypeQL keywords (`from`, `end`, `in`, ...) are refused, as the server refuses them.
+
+Every mapped table has a column `_id UBIGINT`: the row's id, unique within its type, present, and below 2^63. It is
+how rows refer to each other, and it is not data: it cannot be queried after the import. Keep the ids you query by
+as ordinary columns, such as `owns id @key`.
+
+- **An entity type is a table.** Its columns are the attributes it owns, and `NULL` is no ownership. A `LIST` column
+  is a multi-valued attribute: repeated elements are one ownership, `NULL` elements none.
+- **A relation type is a table** with one column per role, holding the players' `_id`s. The comment
+  `@typedb references <table>` on the column names the players' table, and the role is the one that the player's
+  type plays in the relation. The other columns are the relation's attributes.
+- **A column references one table.** A role played by instances of several tables takes a column per table, and a
+  row fills the ones it has players for: its players are the distinct non-`NULL` values. When a player's type plays
+  several roles of the relation, the table directive binds the columns.
+- **A relation playing a role** is a column referencing the relation table.
+- **Subtypes take tables of their own**, abstract types none. An instance belongs to one table, so a role open to
+  subtypes takes a column per table.
+- **Several tables may map to one type** with a directive, such as a table per year or per source. Their `_id`s
+  must differ, which the loader checks across the tables.
+- **A link stored on an entity table**, such as `person.company_id`, is a relation in TypeDB. Stage it as a relation
+  table of its own, with an `_id` and a column per role player, and skip this column on the entity table.
+
+```sql
+CREATE TABLE person (_id UBIGINT, name VARCHAR, nickname VARCHAR[]);
+CREATE TABLE company (_id UBIGINT, name VARCHAR);
+
+CREATE TABLE mentorship (_id UBIGINT, mentor_id UBIGINT, student_id UBIGINT);
+COMMENT ON TABLE mentorship IS '@typedb relation mentorship (mentor = mentor_id, student = student_id)';
+COMMENT ON COLUMN mentorship.mentor_id IS '@typedb references person';
+COMMENT ON COLUMN mentorship.student_id IS '@typedb references person';
+
+-- the employer is a company or a person: a column for each, and a row fills one of them
+CREATE TABLE employment (_id UBIGINT, employee_id UBIGINT, company_id UBIGINT, person_id UBIGINT, salary DECIMAL(12,2));
+COMMENT ON TABLE employment IS '@typedb relation employment (employee = employee_id, employer = company_id, employer = person_id)';
+COMMENT ON COLUMN employment.employee_id IS '@typedb references person';
+COMMENT ON COLUMN employment.company_id IS '@typedb references company';
+COMMENT ON COLUMN employment.person_id IS '@typedb references person';
+```
+
+```typeql
+define
+  attribute name, value string;
+  attribute nickname, value string;
+  attribute salary, value decimal;
+  entity person, owns name @card(1), owns nickname @card(0..),
+    plays employment:employee, plays employment:employer, plays mentorship:mentor, plays mentorship:student;
+  entity company, owns name, plays employment:employer;
+  relation employment, relates employee, relates employer, owns salary;
+  relation mentorship, relates mentor, relates student;
+```
+
+Directives are DuckDB comments, kept in the file. A directive is the whole comment. A role that takes several columns
+is listed once per column, as `employer` above.
+
+| Directive | On | Effect |
+|---|---|---|
+| `@typedb skip` | table, column | not loaded |
+| `@typedb entity <label>` | table | maps the table to that entity type |
+| `@typedb relation <label> (<role> = <column>, ...)` | table | maps the table to that relation type and binds the listed columns. The bindings are optional |
+| `@typedb owns <label>` | column | maps the column to that attribute |
+| `@typedb references <table>` | column | the column holds that table's `_id`s |
+
+## References and ids
+
+The loader needs to know that each `_id` is unique within its type and present, and that each role value is an
+`_id` of the referenced table. It checks this itself, under one rule: **the `_id`s of a referenced table number its
+rows in order**, `first, first + 1, ...`, as `row_number() OVER ()` numbers them while DuckDB preserves insertion
+order (its default). One scan then proves the ids unique, and every reference is checked against their range.
+Other ids of a referenced table are refused, and so is a table that had rows deleted or updated, which leaves gaps
+or moves rows: copy it with `CREATE TABLE ... AS SELECT`.
+
+The ids of a table that nothing references may be anything below 2^63, which leaves TypeDB room for instances
+created later. Their uniqueness takes a GROUP BY, which spills to disk on large data. Renumber larger ids, such as
+hashes.
+
+### Declared keys instead
+
+Keys declared in DuckDB (`PRIMARY KEY`, `UNIQUE` with `NOT NULL`, `FOREIGN KEY`) make DuckDB guarantee the same,
+and the loader then skips its own check. A `FOREIGN KEY` to a table's `_id` names the players' table as
+`@typedb references` does, and the ids it points at need not be dense or start at 0:
+
+```sql
+CREATE TABLE person (_id UBIGINT PRIMARY KEY, name VARCHAR NOT NULL);
+CREATE TABLE friendship (_id UBIGINT PRIMARY KEY, friend_id UBIGINT NOT NULL REFERENCES person(_id));
+```
+
+Both ways give the same data file, and they can be mixed by table and by column. The mapping summary says which
+references and ids are declared and which are checked. DuckDB keeps the index of every declared key in memory while
+rows are inserted, and cannot spill it: for data of hundreds of millions of rows and more, stage without keys.
+
+A `FOREIGN KEY` to any other column, or of several columns, constrains values and names no instances. Its columns
+are ordinary columns: `country_code VARCHAR REFERENCES country(code)` loads as the attribute.
+
 ## Staging other sources
 
 The loader reads DuckDB files only, and DuckDB reads most other formats:
 
 ```sql
-CREATE TABLE person (_iid UBIGINT, name VARCHAR, age INTEGER);
+CREATE TABLE person (_id UBIGINT, name VARCHAR, age INTEGER);
 INSERT INTO person SELECT row_number() OVER (), name, age FROM 'people.csv';  -- or read_parquet(), read_json()
 
 ATTACH 'app.db' AS src (TYPE sqlite);                                          -- or postgres, mysql
-CREATE TABLE company AS SELECT id::UBIGINT AS _iid, name FROM src.company;
+CREATE TABLE company AS SELECT id::UBIGINT AS _id, name FROM src.company;
 ```
 
-Copied tables carry no keys. Either create the tables with their keys and insert into them, or mark each role column
-`@typedb references <table>` and number the referenced table's rows with `row_number() OVER ()`
-([Keys](#keys-are-optional)). A non-negative integer primary key can serve as `_iid` once it and the
-columns referencing it are cast to `UBIGINT`.
+Copied tables carry no keys, so mark each role column `@typedb references <table>` and number the referenced
+table's rows with `row_number() OVER ()`. A non-negative integer primary key can serve as `_id` once it and the
+columns referencing it are cast to `UBIGINT`, when it numbers the rows in order or the tables are created with
+their keys.
 
 ## DuckDB versions
 
@@ -47,77 +161,6 @@ COPY FROM DATABASE src TO dst;
 
 The loader loads no DuckDB extension. Generated columns are refused, as DuckDB computes them anew on every read.
 Materialise them when staging.
-
-## Mapping
-
-The schema is a single `define` query. The loader matches by name and does not guess:
-
-- A table maps to the entity or relation type of its name, a column to the attribute of its name. Names match
-  exactly, or with `_` read as `-` (`country_code` matches `country-code`).
-- A table or column without a counterpart in the schema is an error. `@typedb skip` leaves it out. A schema type
-  without a source is a warning.
-- Only tables of DuckDB's `main` schema are read. Views and other schemas are reported and left out.
-- Labels that are TypeQL keywords (`from`, `end`, `in`, ...) are refused, as the server refuses them.
-
-Every mapped table has a column `_iid UBIGINT`: the row's instance id, unique within its type, present, and below
-2^63 ([Ids](#ids)).
-
-- **An entity type is a table.** Its columns are the attributes it owns, and `NULL` is no ownership. A `LIST` column
-  is a multi-valued attribute: repeated elements are one ownership, `NULL` elements none.
-- **A relation type is a table** with one column per role, holding the players' `_iid`s. A `FOREIGN KEY` to the
-  player table's `_iid`, or `@typedb references <table>`, names the player table, and the role is the one that the
-  player's type plays in the relation. The other columns are the relation's attributes.
-- **Several columns may bind one role**, one per player table for instance. A row's players are the distinct
-  non-`NULL` values. When a player's type plays several roles of the relation, the table directive binds the columns.
-- **A relation playing a role** is a column referencing the relation table's `_iid`.
-- **Subtypes take tables of their own**, abstract types none. An instance belongs to one table, and a reference names
-  one table, so a role open to subtypes takes a column per table. Subtypes inherit ownerships and roles.
-- **Several tables may map to one type** with a directive. Their `_iid`s must differ.
-- **A reference on an entity table** has no TypeDB form. Stage the relation as its own table and skip the column.
-- **A `FOREIGN KEY` to any other column**, or of several columns, constrains values and names no instances. Its
-  columns are ordinary columns: `country_code VARCHAR REFERENCES country(code)` loads as the attribute.
-- **Ordered ownerships and roles (`owns tag[]`, `relates member[]`) and struct-valued attributes** are not loaded.
-  The schema may declare them, and a column that maps to one is refused: skip it.
-- **`_iid` is not data.** It is not queryable after the import. Keep the ids you query by as ordinary columns, such
-  as `owns id @key`.
-
-```sql
-CREATE TABLE person (_iid UBIGINT PRIMARY KEY, name VARCHAR NOT NULL, nickname VARCHAR[]);
-CREATE TABLE company (_iid UBIGINT PRIMARY KEY, name VARCHAR);
-CREATE TABLE employment (
-    _iid UBIGINT PRIMARY KEY,
-    person_id UBIGINT NOT NULL REFERENCES person(_iid),
-    company_id UBIGINT NOT NULL REFERENCES company(_iid),
-    salary DECIMAL(12,2)
-);
-CREATE TABLE mentorship (_iid UBIGINT, mentor_id UBIGINT, student_id UBIGINT);  -- without keys
-COMMENT ON TABLE mentorship IS '@typedb relation mentorship (mentor = mentor_id, student = student_id)';
-COMMENT ON COLUMN mentorship.mentor_id IS '@typedb references person';
-COMMENT ON COLUMN mentorship.student_id IS '@typedb references person';
-```
-
-```typeql
-define
-  attribute name, value string;
-  attribute nickname, value string;
-  attribute salary, value decimal;
-  entity person, owns name @card(1), owns nickname @card(0..),
-    plays employment:employee, plays mentorship:mentor, plays mentorship:student;
-  entity company, owns name, plays employment:employer;
-  relation employment, relates employee, relates employer, owns salary;
-  relation mentorship, relates mentor, relates student;
-```
-
-Directives are DuckDB comments, kept in the file. A directive is the whole comment. A role that takes several columns
-is listed once per column: `(signer = org_id, signer = charity_id)`.
-
-| Directive | On | Effect |
-|---|---|---|
-| `@typedb skip` | table, column | not loaded |
-| `@typedb entity <label>` | table | maps the table to that entity type |
-| `@typedb relation <label> (<role> = <column>, ...)` | table | maps the table to that relation type and binds the listed columns. The bindings are optional |
-| `@typedb owns <label>` | column | maps the column to that attribute |
-| `@typedb references <table>` | column | the column holds that table's `_iid`s, instead of a `FOREIGN KEY` |
 
 ## Type conversions
 
@@ -138,46 +181,27 @@ An attribute fed by a nanosecond column reads all its columns in nanoseconds, so
 1677 to 2262. Text is never parsed into values: a column of an incompatible type is refused, naming the DuckDB type
 to stage it as.
 
-## Keys are optional
-
-The loader needs to know that each `_iid` is unique within its type and present, and that each role value is an
-`_iid` of the referenced table. Declared keys (`PRIMARY KEY`, `UNIQUE` with `NOT NULL`, `FOREIGN KEY`) make DuckDB
-guarantee this. Without them, the loader checks the data, and a role column names its table with
-`@typedb references <table>`. Both give the same data file, and they can be mixed by table and by column. The
-mapping summary says which are declared and which are checked.
-
-Without a `FOREIGN KEY`, the `_iid`s of the referenced table must be dense in row order, `first, first + 1, ...`, as
-`row_number() OVER ()` numbers the rows while DuckDB preserves insertion order (its default). One scan then proves
-them unique, and every reference is checked against their range. Other ids of a referenced table are refused, and
-so is a table that had rows deleted or updated, which leaves gaps or moves rows: copy it with
-`CREATE TABLE ... AS SELECT`. The
-ids of a table that no such column references may be anything: their uniqueness takes a GROUP BY, which spills to
-disk on large data.
-
-DuckDB keeps the index of every declared key in memory while rows are inserted, and cannot spill it. For data of
-hundreds of millions of rows and more, stage without keys.
-
 ## What is checked
 
 Before converting anything, the loader checks the source in three steps. Any error stops the run with nothing
 written, and every error is reported, each data violation with a count and a few examples.
 
-1. **Structure.** Every mapped table has an `_iid UBIGINT` column that is neither generated, a `FOREIGN KEY` to
-   another `_iid`, nor under a directive. Every mapped column has a supported type (see
+1. **Structure.** Every mapped table has an `_id UBIGINT` column that is neither generated, a `FOREIGN KEY` to
+   another `_id`, nor under a directive. Every mapped column has a supported type (see
    [Type conversions](#type-conversions)) and is not generated. Directives are well-formed and name columns and
    tables that exist.
 2. **Mapping.** Every table and column has a counterpart in the schema, or is skipped; every role column names its
    players' table, and the role is unambiguous; value types are compatible; abstract types and roles have no tables
-   or columns, and no column maps to an ordered ownership or role or to a struct-valued attribute.
+   or columns.
 3. **Data**, with one DuckDB query per check:
 
 | Check | Runs on | Unless |
 |---|---|---|
-| `_iid` unique within a type, across all of its tables | every type | its one table declares `PRIMARY KEY` or `UNIQUE` on `_iid`, or its ids are dense in row order |
-| `_iid` below 2^63 | every table | |
-| `_iid` present | every table | `_iid` is `PRIMARY KEY` or `NOT NULL` |
+| `_id` unique within a type, across all of its tables | every type | its one table declares `PRIMARY KEY` or `UNIQUE` on `_id`, or its ids are dense in row order |
+| `_id` below 2^63 | every table | |
+| `_id` present | every table | `_id` is `PRIMARY KEY` or `NOT NULL` |
 | every row fills a role | every relation table | |
-| a role value is an `_iid` of the referenced table, whose ids are dense in row order | every role column | the column is a `FOREIGN KEY` |
+| a role value is an `_id` of the referenced table, whose ids are dense in row order | every role column | the column is a `FOREIGN KEY` |
 | an integer fits 64 bits | `HUGEINT`, `UBIGINT` columns | |
 | a decimal's integer part fits 64 bits | `DECIMAL` columns with over 18 integer digits | the attribute is `double` |
 | a double holds the value exactly | into `double`: integers wider than 53 bits, decimals of over 15 digits | |
@@ -191,15 +215,8 @@ written, and every error is reported, each data violation with a count and a few
 
 The schema's constraints (`@card`, `@key`, `@unique`, `@regex`, `@values`, `@range`) are the server's to enforce at
 import, and so is the schema itself: `--dry-run` reads it but does not prove that the server accepts it. A violation
-names the instance by its iid, whose last eight bytes are the row's `_iid`. Equal values are one attribute, and a
+names the instance by its iid, whose last eight bytes are the row's `_id`. Equal values are one attribute, and a
 player named twice in a role is one player.
-
-## Ids
-
-The server creates each instance with its `_iid` as its number within its type, and resolves players by type and
-number, so ids need not start at 0 or be dense, unless undeclared references point at them. Values must be below
-2^63, which leaves TypeDB room for instances created later. Renumber larger ones, such as hashes, and the columns
-referencing them.
 
 ## Memory and disk
 

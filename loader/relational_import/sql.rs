@@ -4,7 +4,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 
-pub(crate) const IID_COLUMN: &str = "_iid";
+pub(crate) const ID_COLUMN: &str = "_id";
 pub(crate) const ROWID_COLUMN: &str = "rowid";
 const TABLE_ALIAS: &str = "t";
 const ELEMENT: &str = "e";
@@ -95,7 +95,7 @@ pub(crate) mod scan {
 }
 
 pub(crate) mod check {
-    use super::{ELEMENT, IID_COLUMN, ROWID_COLUMN, UNION_ALL, number_text, quoted};
+    use super::{ELEMENT, ID_COLUMN, ROWID_COLUMN, UNION_ALL, number_text, quoted};
 
     pub(crate) fn count_and_examples(violations: &str, examples: usize) -> String {
         format!(
@@ -105,28 +105,28 @@ pub(crate) mod check {
     }
 
     pub(crate) fn ids_at_or_above(table: &str, bound: u64) -> String {
-        let iid = quoted(IID_COLUMN);
-        format!("SELECT {iid} AS example FROM {} WHERE {iid} >= {bound}", quoted(table))
+        let id = quoted(ID_COLUMN);
+        format!("SELECT {id} AS example FROM {} WHERE {id} >= {bound}", quoted(table))
     }
 
     pub(crate) fn rows_without_id(table: &str) -> String {
-        format!("SELECT {ROWID_COLUMN} AS example FROM {} WHERE {} IS NULL", quoted(table), quoted(IID_COLUMN))
+        format!("SELECT {ROWID_COLUMN} AS example FROM {} WHERE {} IS NULL", quoted(table), quoted(ID_COLUMN))
     }
 
     pub(crate) fn repeated_ids(tables: &[&str]) -> String {
-        let iid = quoted(IID_COLUMN);
-        let ids: Vec<String> = tables.iter().map(|table| format!("SELECT {iid} FROM {}", quoted(table))).collect();
+        let id = quoted(ID_COLUMN);
+        let ids: Vec<String> = tables.iter().map(|table| format!("SELECT {id} FROM {}", quoted(table))).collect();
         format!(
-            "SELECT {iid} AS example FROM ({}) WHERE {iid} IS NOT NULL GROUP BY {iid} HAVING count(*) > 1",
+            "SELECT {id} AS example FROM ({}) WHERE {id} IS NOT NULL GROUP BY {id} HAVING count(*) > 1",
             ids.join(UNION_ALL)
         )
     }
 
     pub(crate) fn id_order(table: &str) -> String {
-        let iid = quoted(IID_COLUMN);
+        let id = quoted(ID_COLUMN);
         format!(
-            "SELECT count(*)::UBIGINT, count({iid})::UBIGINT, min({iid}), max({iid}), \
-             min({iid}::HUGEINT - {ROWID_COLUMN}) = max({iid}::HUGEINT - {ROWID_COLUMN}) FROM {}",
+            "SELECT count(*)::UBIGINT, count({id})::UBIGINT, min({id}), max({id}), \
+             min({id}::HUGEINT - {ROWID_COLUMN}) = max({id}::HUGEINT - {ROWID_COLUMN}) FROM {}",
             quoted(table)
         )
     }
@@ -146,7 +146,7 @@ pub(crate) mod check {
 
     pub(crate) fn rows_without_players(table: &str, role_columns: &[&str]) -> String {
         let all_null: Vec<String> = role_columns.iter().map(|column| format!("{} IS NULL", quoted(column))).collect();
-        format!("SELECT {} AS example FROM {} WHERE {}", quoted(IID_COLUMN), quoted(table), all_null.join(" AND "))
+        format!("SELECT {} AS example FROM {} WHERE {}", quoted(ID_COLUMN), quoted(table), all_null.join(" AND "))
     }
 
     // Decimals are compared as text without trailing fractional zeros, so that 0.1 and 0.10 are one value.
@@ -173,7 +173,7 @@ pub(crate) mod check {
     pub(crate) fn rows_with_values_where(table: &str, element: &str, condition: &str) -> String {
         format!(
             "SELECT DISTINCT example FROM (SELECT {} AS example, {element} AS {ELEMENT} FROM {}) WHERE {condition}",
-            quoted(IID_COLUMN),
+            quoted(ID_COLUMN),
             quoted(table)
         )
     }

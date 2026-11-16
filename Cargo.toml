@@ -2,7 +2,7 @@
 # Do not modify this file.
 
 [workspace]
-	members = ["common", "console", "loader", "loader/migration", "tool/runner", "typeql-check"]
+	members = ["common", "console", "loader", "loader/relational_import", "tool/runner", "typeql-check"]
 	resolver = "2"
 
 	[workspace.dependencies]
@@ -103,10 +103,10 @@
 			git = "https://github.com/typedb/typedb-driver"
 			tag = "3.15.0-rc3"
 
-		[workspace.dependencies.typedb-migration]
+		[workspace.dependencies.typedb-relational-import]
 			default-features = false
 			features = []
-			path = "loader/migration"
+			path = "loader/relational_import"
 
 		[workspace.dependencies.typedb-protocol]
 			default-features = false
