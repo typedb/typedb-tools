@@ -6,8 +6,12 @@
 
 use std::collections::HashSet;
 
-use clap::builder::styling::{AnsiColor, Color, Style};
+use clap::builder::styling::Style;
 use itertools::Itertools;
+use typedb_cli_common::{
+    format_colored,
+    printer::{STYLE_GREEN, STYLE_RED},
+};
 use typedb_driver::{
     IID, Replica, ReplicationRole, Server,
     answer::{ConceptDocument, ConceptRow},
@@ -17,56 +21,6 @@ use typedb_driver::{
 const TABLE_INDENT: &'static str = "   ";
 const CONTENT_INDENT: &'static str = "    ";
 const TABLE_DASHES: usize = 7;
-
-pub const STYLE_RED: Style = Style::new().fg_color(Some(Color::Ansi(AnsiColor::Red)));
-pub const STYLE_GREEN: Style = Style::new().fg_color(Some(Color::Ansi(AnsiColor::Green)));
-pub const STYLE_ERROR: Style = Style::new().fg_color(Some(Color::Ansi(AnsiColor::Red))).bold();
-pub const STYLE_WARNING: Style = Style::new().fg_color(Some(Color::Ansi(AnsiColor::Yellow))).bold();
-pub const STYLE_ARGUMENT: Style = Style::new().fg_color(Some(Color::Ansi(AnsiColor::Yellow)));
-
-#[macro_export]
-macro_rules! format_error {
-    ($($arg:tt)*) => {
-        $crate::format_colored!($crate::printer::STYLE_ERROR, $($arg)*)
-    };
-}
-
-#[macro_export]
-macro_rules! format_warning {
-    ($($arg:tt)*) => {
-        $crate::format_colored!($crate::printer::STYLE_WARNING, $($arg)*)
-    };
-}
-
-#[macro_export]
-macro_rules! format_argument {
-    ($($arg:tt)*) => {
-        $crate::format_colored!($crate::printer::STYLE_ARGUMENT, $($arg)*)
-    };
-}
-
-#[macro_export]
-macro_rules! format_colored {
-    ($style:expr, $($arg:tt)*) => {
-        format!(
-            "{}{}{}",
-            $style.render(),
-            format!($($arg)*),
-            $style.render_reset()
-        )
-    };
-}
-
-#[macro_export]
-macro_rules! println_error {
-    ($($arg:tt)*) => {
-        eprintln!(
-            "{} {}",
-            $crate::format_error!("error:"),
-            format!($($arg)*)
-        );
-    }
-}
 
 fn println(string: &str) {
     println!("{}", string)

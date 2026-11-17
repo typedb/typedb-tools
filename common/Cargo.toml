@@ -12,5 +12,8 @@
 
 [dependencies]
 
+	[dependencies.clap]
+		workspace = true
+
 	[dependencies.typedb-driver]
 		workspace = true

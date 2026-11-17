@@ -41,6 +41,9 @@
 	[dependencies.typedb-driver]
 		workspace = true
 
+	[dependencies.typedb-relational-import]
+		workspace = true
+
 	[dependencies.typedb_cli_common]
 		workspace = true
 
@@ -49,7 +52,19 @@
 
 [dev-dependencies]
 
+	[dev-dependencies.duckdb]
+		workspace = true
+
+	[dev-dependencies.prost]
+		workspace = true
+
+	[dev-dependencies.typedb-protocol]
+		workspace = true
+
 	[dev-dependencies.typedb_binary_runner]
+		workspace = true
+
+	[dev-dependencies.zstd]
 		workspace = true
 
 [[bin]]
@@ -59,3 +74,7 @@
 [[test]]
 	name = "test-loader"
 	path = "tests/assembly/test_loader.rs"
+
+[[test]]
+	name = "test-relational-import-cli"
+	path = "tests/relational_import/test_relational_import_cli.rs"
