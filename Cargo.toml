@@ -101,13 +101,13 @@
 			default-features = false
 			features = []
 			git = "https://github.com/typedb/typedb-driver"
-			rev = "c7107753213f1d89e0f837bbe02e45df2988a06f"
+			rev = "f66ddf06fbd81418ca045eb49a05fb9512823f12"
 
 		[workspace.dependencies.typedb-protocol]
 			default-features = false
 			features = []
 			git = "https://github.com/typedb/typedb-protocol"
-			tag = "3.15.0"
+			rev = "ec6fb5e721425a0c08e7afb31bb57fe979659bc5"
 
 		[workspace.dependencies.typedb-relational-import]
 			default-features = false
@@ -128,7 +128,7 @@
 			default-features = false
 			features = []
 			git = "https://github.com/typedb/typeql"
-			tag = "3.15.0"
+			rev = "4c4a2d571cc7fb6b1e69eb3508d612cf854eeca9"
 
 		[workspace.dependencies.ureq]
 			default-features = false
