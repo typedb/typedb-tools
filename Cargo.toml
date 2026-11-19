@@ -20,7 +20,7 @@
 		[workspace.dependencies.clap]
 			default-features = false
 			features = ["color", "default", "derive", "error-context", "help", "std", "suggestions", "usage", "wrap_help"]
-			version = "4.6.7"
+			version = "4.6.8"
 
 		[workspace.dependencies.csv]
 			default-features = false
@@ -60,7 +60,7 @@
 		[workspace.dependencies.rpassword]
 			default-features = false
 			features = []
-			version = "7.5.4"
+			version = "7.5.5"
 
 		[workspace.dependencies.rustyline]
 			default-features = false
@@ -101,7 +101,7 @@
 			default-features = false
 			features = []
 			git = "https://github.com/typedb/typedb-driver"
-			rev = "a3ce9fc6d959accf1e56c446a4e803ce7a165cdd"
+			rev = "782cd43177bc6df7184421cc83eee86ecb11d093"
 
 		[workspace.dependencies.typedb-protocol]
 			default-features = false
@@ -138,4 +138,4 @@
 		[workspace.dependencies.zstd]
 			default-features = false
 			features = []
-			version = "0.14.3"
+			version = "0.14.4"
