@@ -3773,7 +3773,7 @@ dependencies = [
 [[package]]
 name = "typedb-driver"
 version = "0.0.0"
-source = "git+https://github.com/typedb/typedb-driver?rev=782cd43177bc6df7184421cc83eee86ecb11d093#782cd43177bc6df7184421cc83eee86ecb11d093"
+source = "git+https://github.com/typedb/typedb-driver?rev=caace60d68b420262069eb8091a96a6502b0db47#caace60d68b420262069eb8091a96a6502b0db47"
 dependencies = [
  "async-std",
  "chrono",
