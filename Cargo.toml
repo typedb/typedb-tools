@@ -101,7 +101,7 @@
 			default-features = false
 			features = []
 			git = "https://github.com/typedb/typedb-driver"
-			rev = "a3ce9fc6d959accf1e56c446a4e803ce7a165cdd"
+			rev = "caace60d68b420262069eb8091a96a6502b0db47"
 
 		[workspace.dependencies.typedb-protocol]
 			default-features = false

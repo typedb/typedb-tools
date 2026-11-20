@@ -46,9 +46,11 @@ end;
 close
 
 database export test-script-db exported_schema.tql exported_data.typedb
+database export test-script-db exported_schema_zstd.tql exported_data_zstd.typedb zstd
 database delete test-script-db
 
 database import test-script-db2 exported_schema.tql exported_data.typedb
+database import test-script-db3 exported_schema_zstd.tql exported_data_zstd.typedb
 
 database create-init example-bookstore https://github.com/typedb/typedb-examples/releases/download/3.5.2/bookstore-schema.tql https://github.com/typedb/typedb-examples/releases/download/3.5.2/bookstore-data.tql 
 database delete example-bookstore
