@@ -117,11 +117,13 @@ fn trim_to_short_backtrace(frames: Vec<Value>) -> Vec<Value> {
         return frames;
     };
     let end = frames.iter().position(|f| function(f).contains("__rust_begin_short_backtrace")).unwrap_or(frames.len());
-    frames[start + 1..end]
+    frames[start + 1..end.max(start + 1)]
         .iter()
         .skip_while(|f| {
             let name = function(f);
-            name.contains("core::panicking::") || name.contains("rust_begin_unwind")
+            name.starts_with("std::panicking::")
+                || name.starts_with("core::panicking::")
+                || name.contains("rust_begin_unwind")
         })
         .cloned()
         .collect()
