@@ -11,7 +11,7 @@ use std::{
     fmt::{Debug, Display, Formatter},
     fs::File,
     io,
-    io::{BufRead, IsTerminal},
+    io::BufRead,
     path::{Path, PathBuf},
     process::exit,
     rc::Rc,
@@ -26,7 +26,7 @@ use typedb_driver::{Credentials, DriverOptions, Transaction, TransactionType, Ty
 
 use crate::{
     cli::{Args, USERNAME_VALUE_NAME},
-    completions::{database_name_completer_fn, file_completer, file_compression_completer, force_flag_completer},
+    completions::{database_name_completer_fn, file_completer, file_compression_completer},
     constants::DEFAULT_REQUEST_TIMEOUT,
     operations::{
         database_create, database_create_init, database_delete, database_export, database_import, database_list,
@@ -95,7 +95,6 @@ struct ConsoleContext {
     driver: Arc<TypeDBDriver>,
     transaction: Option<(Transaction, bool)>,
     script_dir: Option<String>,
-    interactive: bool,
 }
 
 impl ConsoleContext {
@@ -109,11 +108,6 @@ impl ConsoleContext {
         } else {
             path.to_path_buf()
         }
-    }
-
-    // only prompt when a human is actually at the keyboard: scripts, --command and piped stdin must not block
-    fn can_prompt(&self) -> bool {
-        self.interactive && self.script_dir.is_none() && io::stdin().is_terminal()
     }
 
     fn has_changes(&self) -> bool {
@@ -183,7 +177,6 @@ fn main() {
         driver,
         transaction: None,
         script_dir: None,
-        interactive: false,
     };
 
     if !args.command.is_empty() && !args.script.is_empty() {
@@ -198,7 +191,6 @@ fn main() {
             exit_with_error(&*err);
         }
     } else {
-        context.interactive = true;
         execute_interactive(&mut context);
     }
 }
@@ -370,17 +362,10 @@ fn entry_repl(driver: Arc<TypeDBDriver>, runtime: BackgroundRuntime) -> Repl<Con
             ],
             database_create_init,
         ))
-        .add(CommandLeaf::new_with_inputs(
+        .add(CommandLeaf::new_with_input(
             "delete",
-            "Delete the database with the given name. In interactive mode, asks for the database name to be re-typed as confirmation, unless '--force' is given.",
-            vec![
-                CommandInput::new_required(
-                    "db",
-                    get_word,
-                    Some(database_name_completer_fn(driver.clone(), runtime.clone())),
-                ),
-                CommandInput::new_optional("--force", get_word, Some(Box::new(force_flag_completer))),
-            ],
+            "Delete the database with the given name.",
+            CommandInput::new_required("db", get_word, Some(database_name_completer_fn(driver.clone(), runtime.clone()))),
             database_delete,
         ))
         .add(CommandLeaf::new_with_input(

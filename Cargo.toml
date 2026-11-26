@@ -67,11 +67,6 @@
 			features = ["custom-bindings", "fd-lock", "radix_trie", "with-file-history"]
 			version = "15.0.0"
 
-		[workspace.dependencies.sentry]
-			default-features = false
-			features = ["backtrace", "contexts", "httpdate", "panic", "rustls", "sentry-backtrace", "sentry-contexts", "sentry-panic", "ureq", "webpki-roots"]
-			version = "0.36.0"
-
 		[workspace.dependencies.serde]
 			default-features = false
 			features = ["alloc", "default", "derive", "rc", "serde_derive", "std"]

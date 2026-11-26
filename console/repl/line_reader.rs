@@ -6,7 +6,6 @@
 
 use std::{
     borrow::Cow,
-    io::{self, Write},
     path::PathBuf,
     sync::{Arc, Mutex},
 };
@@ -244,21 +243,5 @@ impl LineReaderHidden {
 
     pub(crate) fn readline(&self, prompt: &str) -> String {
         rpassword::prompt_password(prompt).unwrap()
-    }
-}
-
-pub(crate) struct LineReaderVisible {}
-
-impl LineReaderVisible {
-    pub(crate) fn new() -> Self {
-        Self {}
-    }
-
-    pub(crate) fn readline(&self, prompt: &str) -> io::Result<String> {
-        print!("{}", prompt);
-        io::stdout().flush()?;
-        let mut line = String::new();
-        io::stdin().read_line(&mut line)?;
-        Ok(line.trim().to_owned())
     }
 }
