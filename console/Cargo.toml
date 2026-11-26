@@ -29,9 +29,6 @@
 	[dependencies.rustyline]
 		workspace = true
 
-	[dependencies.sentry]
-		workspace = true
-
 	[dependencies.serde_json]
 		workspace = true
 

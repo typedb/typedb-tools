@@ -30,7 +30,6 @@ rust_binary(
         "@crates//:itertools",
         "@crates//:rpassword",
         "@crates//:rustyline",
-        "@crates//:sentry",
         "@crates//:serde_json",
         "@crates//:sha2",
         "@crates//:ureq",

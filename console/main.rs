@@ -21,7 +21,6 @@ use std::{
 use clap::Parser;
 use home::home_dir;
 use rustyline::error::ReadlineError;
-use sentry::ClientOptions;
 use typedb_cli_common::{build_tls_config, format_argument, parse_address_translation, parse_addresses, println_error};
 use typedb_driver::{Credentials, DriverOptions, Transaction, TransactionType, TypeDBDriver};
 
@@ -47,6 +46,7 @@ use crate::{
 mod cli;
 mod completions;
 mod constants;
+mod diagnostics;
 mod operations;
 mod printer;
 mod repl;
@@ -57,8 +57,6 @@ pub const VERSION: &str = include_str!("../VERSION");
 const PROMPT: &'static str = ">> ";
 const ENTRY_REPL_HISTORY: &'static str = ".typedb_console_repl_history";
 const TRANSACTION_REPL_HISTORY: &'static str = "typedb_console_transaction_repl_history";
-const DIAGNOSTICS_REPORTING_URI: &'static str =
-    "https://7f0ccb67b03abfccbacd7369d1f4ac6b@o4506315929812992.ingest.sentry.io/4506355433537536";
 
 #[derive(Debug, Copy, Clone)]
 enum ExitCode {
@@ -144,7 +142,7 @@ fn main() {
         args.password = Some(LineReaderHidden::new().readline(&format!("password for '{username}': ")));
     }
     if !args.diagnostics_disabled {
-        init_diagnostics()
+        diagnostics::init(VERSION);
     }
     let tls_root_ca_path = args.tls_root_ca.as_ref().map(|value| Path::new(value));
     let runtime = BackgroundRuntime::new();
@@ -544,13 +542,6 @@ fn parse_addresses_from_args(args: &Args) -> typedb_driver::Addresses {
             exit(ExitCode::UserInputError as i32);
         }
     }
-}
-
-fn init_diagnostics() {
-    let _ = sentry::init((
-        DIAGNOSTICS_REPORTING_URI,
-        ClientOptions { release: Some(VERSION.into()), ..Default::default() },
-    ));
 }
 
 struct CommandError {
