@@ -89,7 +89,6 @@ fn panic_message(info: &PanicHookInfo<'_>) -> String {
     }
 }
 
-// std backtrace text: "  N: function\n             at file:line:col"; innermost frame first
 fn parse_frames(backtrace: &str) -> Vec<Value> {
     let mut frames: Vec<Value> = Vec::new();
     for line in backtrace.lines() {
@@ -110,7 +109,7 @@ fn parse_frames(backtrace: &str) -> Vec<Value> {
     trim_to_short_backtrace(frames)
 }
 
-// same window RUST_BACKTRACE=1 shows: between std's end/begin short-backtrace markers, minus the panic machinery
+// Snip common frames so unrelated errors don't get grouped together in the error tracker
 fn trim_to_short_backtrace(frames: Vec<Value>) -> Vec<Value> {
     let function = |frame: &Value| frame["function"].as_str().unwrap_or("").to_owned();
     let Some(start) = frames.iter().position(|f| function(f).contains("__rust_end_short_backtrace")) else {
@@ -129,12 +128,10 @@ fn trim_to_short_backtrace(frames: Vec<Value>) -> Vec<Value> {
         .collect()
 }
 
-// crate name differs between cargo and bazel builds
 fn crate_name() -> &'static str {
     module_path!().split("::").next().unwrap_or("")
 }
 
-// "file:line:col" or "file:line"
 fn split_location(location: &str) -> (&str, Option<u64>) {
     let is_number = |s: &str| !s.is_empty() && s.chars().all(|c| c.is_ascii_digit());
     let mut file = location;
@@ -151,7 +148,6 @@ fn split_location(location: &str) -> (&str, Option<u64>) {
     (file, line)
 }
 
-// stable anonymous id per machine user; no raw username or path leaves the machine
 fn install_id() -> String {
     let user = env::var("USER").or_else(|_| env::var("USERNAME")).unwrap_or_default();
     let home = home_dir().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
