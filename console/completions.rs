@@ -11,6 +11,7 @@ use typedb_driver::TypeDBDriver;
 
 use crate::{
     BackgroundRuntime,
+    constants::FORCE_FLAG,
     repl::{command::InputCompleterFn, parser::FILE_COMPRESSIONS},
 };
 
@@ -42,4 +43,8 @@ pub(crate) fn file_completer(input: &str) -> Vec<String> {
 
 pub(crate) fn file_compression_completer(input: &str) -> Vec<String> {
     FILE_COMPRESSIONS.iter().map(|(name, _)| name.to_string()).filter(|name| name.starts_with(input)).collect()
+}
+
+pub(crate) fn force_flag_completer(input: &str) -> Vec<String> {
+    if FORCE_FLAG.starts_with(input) { vec![FORCE_FLAG.to_owned()] } else { Vec::with_capacity(0) }
 }
