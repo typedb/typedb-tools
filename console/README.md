@@ -67,9 +67,13 @@ will also be autocompleted, while others, such as queries, will not.
   > database list
   my-typedb-database
   ```
-- `database delete <db>` : Delete a database with name `<db>` on the server.
+- `database delete <db> [--force]` : Delete a database with name `<db>` on the server. In the interactive REPL,
+  this asks for the database name to be re-typed as confirmation; pass `--force` (or `-f`) to skip it. Scripts
+  (`--script`), inline commands (`--command`) and piped input never prompt, so automation is unaffected.
   ```
   > database delete my-typedb-database
+  Deleting database 'my-typedb-database' permanently removes all of its schema and data. This cannot be undone.
+    Type the database name to confirm: my-typedb-database
   Successfully deleted database.
   ```
 - `transaction read|write|schema <db>` : Start a `read`, `write`, or `schema` transaction to database `<db>`.
