@@ -47,14 +47,6 @@ Alternatively, you may securely connect by managing your own certificates for bo
 and provide your certificate to the console with:
 `--tls-root-ca=<path>`
 
-## Diagnostics
-
-Console reports crashes (panics) to TypeDB's diagnostics relay at `https://typedb.com/api/diagnostics/v1/report`, which forwards them to our error tracker, unless `--diagnostics-disabled` is given. Only the panic message, a stack trace, Console version, OS and architecture are sent, with an anonymous hashed machine ID. The following environment variables override the defaults, for development and testing:
-
-- `TYPEDB_CONSOLE_DIAGNOSTICS_URL`: report endpoint, default the relay above
-- `TYPEDB_CONSOLE_DIAGNOSTICS_DEBUG`: when set, prints the payload and send result to stderr
-- `TYPEDB_CONSOLE_DIAGNOSTICS_TEST_PANIC`: when set, panics immediately after start-up to exercise the reporting path
-
 ## Console commands
 
 TypeDB Console provides two levels of interaction: server-level commands and transaction-level commands.
