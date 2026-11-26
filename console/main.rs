@@ -21,12 +21,12 @@ use std::{
 use clap::Parser;
 use home::home_dir;
 use rustyline::error::ReadlineError;
-use typedb_cli_common::{build_tls_config, parse_address_translation, parse_addresses};
+use typedb_cli_common::{build_tls_config, format_argument, parse_address_translation, parse_addresses, println_error};
 use typedb_driver::{Credentials, DriverOptions, Transaction, TransactionType, TypeDBDriver};
 
 use crate::{
     cli::{Args, USERNAME_VALUE_NAME},
-    completions::{database_name_completer_fn, file_completer, force_flag_completer},
+    completions::{database_name_completer_fn, file_completer, file_compression_completer, force_flag_completer},
     constants::DEFAULT_REQUEST_TIMEOUT,
     operations::{
         database_create, database_create_init, database_delete, database_export, database_import, database_list,
@@ -401,7 +401,7 @@ fn entry_repl(driver: Arc<TypeDBDriver>, runtime: BackgroundRuntime) -> Repl<Con
         ))
         .add(CommandLeaf::new_with_inputs(
             "export",
-            "Export a database into a schema definition and a data files.",
+            "Export a database into a schema definition and a data file. The data file is uncompressed by default, or compressed with zstd at level 3 if 'zstd' is given. Imports detect compressed data files automatically. File paths must be absolute or relative paths on the local machine.",
             vec![
                 CommandInput::new_required(
                     "db",
@@ -410,6 +410,11 @@ fn entry_repl(driver: Arc<TypeDBDriver>, runtime: BackgroundRuntime) -> Repl<Con
                 ),
                 CommandInput::new_required("schema file path", get_word, None),
                 CommandInput::new_required("data file path", get_word, None),
+                CommandInput::new_optional(
+                    "data file compression (uncompressed or zstd)",
+                    get_word,
+                    Some(Box::new(file_compression_completer)),
+                ),
             ],
             database_export,
         ));

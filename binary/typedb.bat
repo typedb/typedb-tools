@@ -21,16 +21,13 @@ goto print_usage
 
 :startconsole
 for /f "tokens=1,* delims= " %%a in ("%*") do set ARGS=%%b
-%TYPEDB_HOME%\console\typedb_console_bin.exe %ARGS%
-goto exit
+"%TYPEDB_HOME%\console\typedb_console_bin.exe" %ARGS%
+exit /b %ERRORLEVEL%
 
 :startloader
 for /f "tokens=1,* delims= " %%a in ("%*") do set ARGS=%%b
-%TYPEDB_HOME%\loader\typedb_loader_bin.exe %ARGS%
-goto exit
-
-:exit
-exit /b 0
+"%TYPEDB_HOME%\loader\typedb_loader_bin.exe" %ARGS%
+exit /b %ERRORLEVEL%
 
 :print_usage
 echo   Console:         typedb console [--help]

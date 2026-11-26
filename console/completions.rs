@@ -9,7 +9,11 @@ use std::sync::Arc;
 use glob::glob;
 use typedb_driver::TypeDBDriver;
 
-use crate::{BackgroundRuntime, constants::FORCE_FLAG, repl::command::InputCompleterFn};
+use crate::{
+    BackgroundRuntime,
+    constants::FORCE_FLAG,
+    repl::{command::InputCompleterFn, parser::FILE_COMPRESSIONS},
+};
 
 pub(crate) fn database_name_completer_fn(
     driver: Arc<TypeDBDriver>,
@@ -35,6 +39,10 @@ pub(crate) fn file_completer(input: &str) -> Vec<String> {
         Ok(paths) => paths.filter_map(Result::ok).map(|path| path.to_string_lossy().into_owned()).collect(),
         Err(_) => Vec::new(),
     }
+}
+
+pub(crate) fn file_compression_completer(input: &str) -> Vec<String> {
+    FILE_COMPRESSIONS.iter().map(|(name, _)| name.to_string()).filter(|name| name.starts_with(input)).collect()
 }
 
 pub(crate) fn force_flag_completer(input: &str) -> Vec<String> {

@@ -6,10 +6,13 @@
 
 use std::error::Error;
 
-use typedb_driver::{Address, ServerRouting};
+use typedb_driver::{Address, FileCompression, ServerRouting};
 use typeql::common::error::TypeQLError;
 
-use crate::repl::command::CommandResult;
+use crate::repl::command::{CommandResult, ReplError};
+
+pub(crate) const FILE_COMPRESSIONS: [(&str, FileCompression); 2] =
+    [("uncompressed", FileCompression::Uncompressed), ("zstd", FileCompression::Zstd)];
 
 pub(crate) fn get_word(input: &str) -> Option<usize> {
     if input.trim().is_empty() {
@@ -97,6 +100,18 @@ pub(crate) fn parse_server_routing(input: &[String]) -> CommandResult<ServerRout
             Ok(ServerRouting::Direct { address })
         }
         None => Ok(ServerRouting::Auto),
+    }
+}
+
+pub(crate) fn parse_file_compression(input: Option<&String>) -> CommandResult<FileCompression> {
+    let Some(input) = input else {
+        return Ok(FileCompression::Uncompressed);
+    };
+    match FILE_COMPRESSIONS.iter().find(|(name, _)| name == input) {
+        Some((_, compression)) => Ok(*compression),
+        None => Err(Box::new(ReplError {
+            message: format!("Unrecognised compression '{input}', expected 'uncompressed' or 'zstd'."),
+        })),
     }
 }
 

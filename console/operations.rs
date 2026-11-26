@@ -10,7 +10,8 @@ use futures::stream::StreamExt;
 use itertools::Itertools;
 use sha2::Digest;
 use typedb_driver::{
-    AvailableServer, Database, Server, ServerRouting, ServerVersion, TransactionOptions, TransactionType, TypeDBDriver,
+    AvailableServer, Database, FileCompression, Server, ServerRouting, ServerVersion, TransactionOptions,
+    TransactionType, TypeDBDriver,
     answer::{QueryAnswer, QueryType},
 };
 use ureq;
@@ -22,7 +23,7 @@ use crate::{
     repl::{
         command::{CommandResult, ReplError},
         line_reader::LineReaderVisible,
-        parser::{parse_one_query, parse_server_routing},
+        parser::{parse_file_compression, parse_one_query, parse_server_routing},
     },
     transaction_repl,
 };
@@ -124,9 +125,10 @@ pub(crate) fn database_export(context: &mut ConsoleContext, input: &[String]) ->
     let db_name = input[0].clone();
     let schema_file_path: PathBuf = context.convert_path(&input[1]);
     let data_file_path: PathBuf = context.convert_path(&input[2]);
-    context
-        .background_runtime
-        .run(async move { execute_database_export(&driver, db_name, schema_file_path, data_file_path).await })?;
+    let compression = parse_file_compression(input.get(3))?;
+    context.background_runtime.run(async move {
+        execute_database_export(&driver, db_name, schema_file_path, data_file_path, compression).await
+    })?;
     println!("Successfully exported database.");
     Ok(())
 }
@@ -427,9 +429,12 @@ async fn execute_database_export(
     db_name: String,
     schema_file_path: PathBuf,
     data_file_path: PathBuf,
+    compression: FileCompression,
 ) -> CommandResult {
     let db = execute_databases_get(driver, db_name).await?;
-    db.export_to_file(schema_file_path, data_file_path).await.map_err(|err| Box::new(err) as Box<dyn Error + Send>)
+    db.export_to_file_with_compression(schema_file_path, data_file_path, compression)
+        .await
+        .map_err(|err| Box::new(err) as Box<dyn Error + Send>)
 }
 
 async fn execute_databases_import(
