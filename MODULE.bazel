@@ -39,21 +39,21 @@ bazel_dep(name = "typeql", version = "0.0.0")
 git_override(
     module_name = "typeql",
     remote = "https://github.com/typedb/typeql",
-    commit = "2306d3f7d0f11fcca2a68c28033cb9313f69bd2a",
+    tag = "3.16.0-rc0",
 )
 
 bazel_dep(name = "typedb_driver", version = "0.0.0")
 git_override(
     module_name = "typedb_driver",
     remote = "https://github.com/typedb/typedb-driver",
-    commit = "4a6f33173a3f34f0b256cc7658bd398c61368283",
+    commit = "b10ed72a97f4663c4d149c2bbe3984f15230fe7e",
 )
 
 bazel_dep(name = "typedb_protocol", version = "0.0.0")
 git_override(
     module_name = "typedb_protocol",
     remote = "https://github.com/typedb/typedb-protocol",
-    commit = "df8475883a2e40e1648ec464963435ca818ba9f1",
+    tag = "3.16.0-rc0",
 )
 
 bazel_dep(name = "typedb_behaviour", version = "0.0.0")
