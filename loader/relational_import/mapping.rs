@@ -606,6 +606,13 @@ impl<'a, 'f> TableMapper<'a, 'f> {
                     column.name
                 ));
             }
+            Some(AttributeValueType::Vector(vector)) => {
+                return self.findings.error(format!(
+                    "table '{table_name}': column '{}' maps to attribute '{attribute_label}', whose value type is \
+                     '{vector}', which the loader cannot write; mark the column '@typedb skip'",
+                    column.name
+                ));
+            }
             None => {
                 return self.findings.error(format!(
                     "table '{table_name}': column '{}' maps to attribute '{attribute_label}', which has no value type in \

@@ -200,6 +200,7 @@ impl AttributeType {
 pub(crate) enum AttributeValueType {
     Builtin(ValueType),
     Struct(String),
+    Vector(String),
 }
 
 #[derive(Debug)]
@@ -376,5 +377,6 @@ fn parse_value_type(named: &NamedType) -> AttributeValueType {
             token::ValueType::Duration => ValueType::Duration,
         }),
         NamedType::Label(label) => AttributeValueType::Struct(label.ident.to_string()),
+        NamedType::Vector(vector) => AttributeValueType::Vector(vector.to_string()),
     }
 }

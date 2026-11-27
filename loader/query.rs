@@ -80,9 +80,9 @@ fn into_given_input(arg: Argument) -> Result<GivenSpec, String> {
     };
     let token = match named_type {
         NamedType::BuiltinValueType(t) => t.token,
-        NamedType::Label(label) => {
+        other @ (NamedType::Label(_) | NamedType::Vector(_)) => {
             return Err(format!(
-                "`given` input '${name}' has type '{label}'; only built-in value types can be loaded from CSV"
+                "`given` input '${name}' has type '{other}'; only built-in value types can be loaded from CSV"
             ));
         }
     };

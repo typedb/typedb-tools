@@ -34,25 +34,26 @@ git_override(
     commit = "5655182f0d6ac9e7b1a6e767df7f48c511692ce2",
 )
 
+# TODO(vector-search): repoint to master commits once the vector-search branches merge
 bazel_dep(name = "typeql", version = "0.0.0")
 git_override(
     module_name = "typeql",
     remote = "https://github.com/typedb/typeql",
-    commit = "4c37fe7d62a59e54623e5b554f0e11f9d45aa610",
+    commit = "2306d3f7d0f11fcca2a68c28033cb9313f69bd2a",
 )
 
 bazel_dep(name = "typedb_driver", version = "0.0.0")
 git_override(
     module_name = "typedb_driver",
     remote = "https://github.com/typedb/typedb-driver",
-    commit = "caace60d68b420262069eb8091a96a6502b0db47",
+    commit = "4a6f33173a3f34f0b256cc7658bd398c61368283",
 )
 
 bazel_dep(name = "typedb_protocol", version = "0.0.0")
 git_override(
     module_name = "typedb_protocol",
     remote = "https://github.com/typedb/typedb-protocol",
-    commit = "dd606e1063d7c83781b5e04c1d348b824d3a7428",
+    commit = "df8475883a2e40e1648ec464963435ca818ba9f1",
 )
 
 bazel_dep(name = "typedb_behaviour", version = "0.0.0")

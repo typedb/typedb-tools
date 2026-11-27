@@ -701,7 +701,9 @@ fn foreign_keys_to_other_columns_are_ordinary_columns() -> Result<(), Box<dyn Er
 fn ordered_capabilities_and_structs_are_refused_where_a_column_maps_to_them() -> Result<(), Box<dyn Error>> {
     let schema = "define\n  struct point: x value integer;\n  attribute location value point;\n  \
                   attribute tag value string;\n  attribute name value string;\n  \
-                  entity person, owns name, owns tag[], owns location, plays queue:member, plays team:member;\n  \
+                  attribute embedding value vector(3, \"float32\");\n  \
+                  entity person, owns name, owns tag[], owns location, owns embedding, plays queue:member, \
+                  plays team:member;\n  \
                   relation queue, relates member[];\n  relation team, relates member;\n";
     let dir = scratch(
         "ordered-unused",
@@ -718,12 +720,17 @@ fn ordered_capabilities_and_structs_are_refused_where_a_column_maps_to_them() ->
     let dir = scratch(
         "ordered-used",
         schema,
-        "CREATE TABLE person (_id UBIGINT PRIMARY KEY, name VARCHAR, tag VARCHAR[], location VARCHAR);
+        "CREATE TABLE person (_id UBIGINT PRIMARY KEY, name VARCHAR, tag VARCHAR[], location VARCHAR,
+                              embedding VARCHAR);
          CREATE TABLE queue (_id UBIGINT PRIMARY KEY, member UBIGINT REFERENCES person(_id));",
     )?;
     let errors = validation_errors(&dir);
     assert_error(&errors, &["column 'tag' maps to attribute 'tag', which type 'person' owns ordered ('owns tag[]')"]);
     assert_error(&errors, &["column 'location' maps to attribute 'location', whose value type is the struct 'point'"]);
+    assert_error(
+        &errors,
+        &["column 'embedding' maps to attribute 'embedding', whose value type is 'vector(3, \"float32\")'"],
+    );
     assert_error(&errors, &["table 'queue': column 'member' fills role 'queue:member', which is ordered"]);
     Ok(())
 }
