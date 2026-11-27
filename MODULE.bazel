@@ -46,7 +46,7 @@ bazel_dep(name = "typedb_driver", version = "0.0.0")
 git_override(
     module_name = "typedb_driver",
     remote = "https://github.com/typedb/typedb-driver",
-    commit = "b10ed72a97f4663c4d149c2bbe3984f15230fe7e",
+    tag = "3.16.0-rc0",
 )
 
 bazel_dep(name = "typedb_protocol", version = "0.0.0")
